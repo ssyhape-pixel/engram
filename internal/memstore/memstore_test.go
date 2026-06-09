@@ -68,15 +68,32 @@ func TestCommitWithStaleParentConflicts(t *testing.T) {
 	head, _ := s.CreateAgent(ctx, "a1", map[string]string{"system/x.md": "x"})
 
 	dir := t.TempDir()
-	s.Materialize(ctx, "a1", head, dir)
-	os.WriteFile(filepath.Join(dir, "a.md"), []byte("a"), 0o644)
+	if err := s.Materialize(ctx, "a1", head, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.CommitWithCAS(ctx, "a1", head, dir, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Stale parent -> conflict.
-	os.WriteFile(filepath.Join(dir, "b.md"), []byte("b"), 0o644)
+	if err := os.WriteFile(filepath.Join(dir, "b.md"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	_, err := s.CommitWithCAS(ctx, "a1", head, dir, nil)
 	if !errors.Is(err, ErrCASConflict) {
 		t.Fatalf("err = %v want ErrCASConflict", err)
+	}
+}
+
+func TestCreateAgentDuplicate(t *testing.T) {
+	s, ctx := newStore(t)
+	if _, err := s.CreateAgent(ctx, "a1", map[string]string{"system/x.md": "x"}); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	_, err := s.CreateAgent(ctx, "a1", map[string]string{"system/x.md": "x"})
+	if !errors.Is(err, ErrAgentAlreadyExists) {
+		t.Fatalf("err = %v want ErrAgentAlreadyExists", err)
 	}
 }

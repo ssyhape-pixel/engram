@@ -5,6 +5,7 @@ package memstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,12 @@ type Job = refs.Job
 
 // ErrCASConflict is returned when HEAD moved under a commit.
 var ErrCASConflict = refs.ErrCASConflict
+
+// ErrAgentNotFound is returned when an agent has never been bootstrapped.
+var ErrAgentNotFound = refs.ErrAgentNotFound
+
+// ErrAgentAlreadyExists is returned by CreateAgent when the agent already has a HEAD.
+var ErrAgentAlreadyExists = errors.New("memstore: agent already exists")
 
 // MemStore is the authoritative store interface (see docs/architecture.md §11).
 type MemStore interface {
@@ -63,6 +70,14 @@ func (s *Store) CommitWithCAS(ctx context.Context, agentID string, parent Commit
 // CreateAgent seeds an agent's initial commit from `seed` (path->content) and
 // registers its HEAD. Returns the initial commit hash.
 func (s *Store) CreateAgent(ctx context.Context, agentID string, seed map[string]string) (CommitHash, error) {
+	// Best-effort duplicate check. Under single-writer-per-agent the TOCTOU
+	// window between this check and Bootstrap is not a concern.
+	if _, err := s.refs.ResolveHead(ctx, agentID); err == nil {
+		return "", ErrAgentAlreadyExists
+	} else if !errors.Is(err, refs.ErrAgentNotFound) {
+		return "", fmt.Errorf("memstore: check agent %s: %w", agentID, err)
+	}
+
 	dir, err := os.MkdirTemp("", "engram-seed-*")
 	if err != nil {
 		return "", fmt.Errorf("memstore: seed dir: %w", err)
@@ -71,10 +86,10 @@ func (s *Store) CreateAgent(ctx context.Context, agentID string, seed map[string
 	for p, content := range seed {
 		full := filepath.Join(dir, p)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return "", err
+			return "", fmt.Errorf("memstore: seed write %s: %w", p, err)
 		}
 		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
-			return "", err
+			return "", fmt.Errorf("memstore: seed write %s: %w", p, err)
 		}
 	}
 	h, err := gitfs.Commit(ctx, s.objs, "", dir, "init")
