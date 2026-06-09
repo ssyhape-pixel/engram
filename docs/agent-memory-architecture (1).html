@@ -1,0 +1,417 @@
+<!-- 云端 Agent 记忆系统 · 后端架构设计文档 -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>云端 Agent 记忆系统 · 后端架构设计</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#FBFAF7; --paper-2:#F4F1EA; --ink:#211F1B; --ink-soft:#5C5950;
+    --ink-faint:#8A867A; --accent:#0F6E56; --accent-soft:#1D9E75;
+    --line:rgba(33,31,27,.12); --line-2:rgba(33,31,27,.2);
+    --code-bg:#F1EDE4; --rule:#211F1B;
+    --font-body:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+    --font-head:"Newsreader",Georgia,"Songti SC","Noto Serif CJK SC",serif;
+    --font-mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#15130F; --paper-2:#1E1B16; --ink:#E7E3D8; --ink-soft:#B0AB9C;
+      --ink-faint:#827D70; --accent:#5DCAA5; --accent-soft:#9FE1CB;
+      --line:rgba(231,227,216,.14); --line-2:rgba(231,227,216,.24);
+      --code-bg:#221F19; --rule:#E7E3D8;
+    }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--font-body); font-size:16.5px; line-height:1.75;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  }
+  .wrap{max-width:780px; margin:0 auto; padding:0 24px 120px}
+
+  /* Masthead */
+  header.mast{padding:72px 0 40px; border-bottom:2px solid var(--rule); margin-bottom:8px}
+  .kicker{font-family:var(--font-mono); font-size:12px; letter-spacing:.18em; text-transform:uppercase;
+    color:var(--accent); margin:0 0 18px}
+  h1{font-family:var(--font-head); font-weight:600; font-size:clamp(34px,6vw,52px); line-height:1.08;
+    letter-spacing:-.01em; margin:0 0 18px}
+  .lede{font-size:18px; color:var(--ink-soft); margin:0; max-width:60ch}
+  .meta{font-family:var(--font-mono); font-size:12.5px; color:var(--ink-faint); margin-top:26px;
+    display:flex; gap:20px; flex-wrap:wrap}
+
+  /* TOC */
+  nav.toc{margin:36px 0 8px; padding:22px 26px; background:var(--paper-2); border:1px solid var(--line);
+    border-radius:14px}
+  nav.toc h2{font-family:var(--font-mono); font-size:11.5px; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--ink-faint); margin:0 0 14px; border:0; padding:0}
+  nav.toc ol{margin:0; padding:0; list-style:none; counter-reset:toc; columns:2; column-gap:34px}
+  nav.toc li{counter-increment:toc; margin:0 0 9px; break-inside:avoid; font-size:15px}
+  nav.toc li::before{content:counter(toc,decimal-leading-zero); font-family:var(--font-mono);
+    font-size:11px; color:var(--accent); margin-right:10px}
+  nav.toc a{color:var(--ink); text-decoration:none; border-bottom:1px solid transparent}
+  nav.toc a:hover{border-bottom-color:var(--accent)}
+
+  /* Headings */
+  h2{font-family:var(--font-head); font-weight:600; font-size:28px; line-height:1.2; letter-spacing:-.01em;
+    margin:64px 0 6px; padding-top:20px; border-top:1px solid var(--line)}
+  .sec-no{font-family:var(--font-mono); font-size:13px; font-weight:500; color:var(--accent);
+    letter-spacing:.04em; display:block; margin-bottom:8px}
+  h3{font-family:var(--font-head); font-weight:600; font-size:21px; line-height:1.25; margin:42px 0 4px}
+  h4{font-family:var(--font-mono); font-size:13px; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--ink-soft); margin:30px 0 6px}
+  p{margin:14px 0}
+  a{color:var(--accent)}
+  strong{font-weight:600; color:var(--ink)}
+  em{font-style:normal; background:linear-gradient(transparent 62%, color-mix(in srgb,var(--accent) 22%, transparent) 0);
+    padding:0 1px}
+
+  code{font-family:var(--font-mono); font-size:.86em; background:var(--code-bg); padding:.12em .4em;
+    border-radius:5px; color:var(--ink)}
+  pre{background:var(--paper-2); border:1px solid var(--line); border-radius:12px; padding:18px 20px;
+    overflow-x:auto; margin:18px 0; line-height:1.6}
+  pre code{background:none; padding:0; font-size:13px}
+
+  ul,ol{margin:14px 0; padding-left:2px}
+  li{margin:9px 0; padding-left:26px; position:relative; list-style:none}
+  ul li::before{content:""; position:absolute; left:4px; top:.72em; width:6px; height:6px;
+    background:var(--accent); border-radius:50%}
+  ol{counter-reset:ol}
+  ol li{counter-increment:ol}
+  ol li::before{content:counter(ol); position:absolute; left:0; top:0; font-family:var(--font-mono);
+    font-size:12px; font-weight:500; color:var(--accent); width:18px; text-align:right}
+
+  /* Figures */
+  figure{margin:30px 0; padding:22px 18px 14px; background:var(--paper-2); border:1px solid var(--line);
+    border-radius:16px}
+  figure svg{display:block; width:100%; height:auto}
+  figcaption{font-family:var(--font-mono); font-size:12px; color:var(--ink-faint); text-align:center;
+    margin-top:10px; padding-top:10px; border-top:1px solid var(--line); letter-spacing:.02em}
+
+  /* Callouts */
+  .callout{margin:26px 0; padding:20px 24px; border:1px solid var(--line); border-left:3px solid var(--accent);
+    border-radius:0 12px 12px 0; background:var(--paper-2)}
+  .callout .tag{font-family:var(--font-mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent); display:block; margin-bottom:8px}
+  .callout p:first-of-type{margin-top:0}
+  .callout p:last-child{margin-bottom:0}
+
+  .invariants{margin:28px 0; padding:0; border:1px solid var(--line-2); border-radius:16px; overflow:hidden}
+  .invariants .ihead{font-family:var(--font-mono); font-size:11.5px; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--paper); background:var(--rule); padding:11px 24px}
+  .invariants .irow{padding:18px 24px; border-top:1px solid var(--line)}
+  .invariants .irow:first-of-type{border-top:0}
+  .invariants .iname{font-family:var(--font-head); font-weight:600; font-size:18px; margin:0 0 4px}
+  .invariants .idesc{margin:0; color:var(--ink-soft); font-size:15px}
+
+  table{width:100%; border-collapse:collapse; margin:22px 0; font-size:14.5px}
+  th,td{text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top}
+  th{font-family:var(--font-mono); font-size:11.5px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--ink-faint); font-weight:500}
+  td code{font-size:.9em}
+
+  hr.end{border:0; border-top:2px solid var(--rule); margin:70px 0 24px}
+  .foot{font-family:var(--font-mono); font-size:12px; color:var(--ink-faint); line-height:1.8}
+
+  /* ---- SVG design tokens (so embedded diagrams render standalone) ---- */
+  svg{--color-border-secondary:rgba(33,31,27,.30); --color-border-tertiary:rgba(33,31,27,.14)}
+  svg .t{font-size:14px; fill:var(--ink)}
+  svg .th{font-size:14px; font-weight:500; fill:var(--ink)}
+  svg .ts{font-size:12px; fill:var(--ink-soft)}
+  svg .arr{stroke:var(--ink-soft); stroke-width:1.5; fill:none}
+  svg .node{cursor:default}
+  .c-gray rect,rect.c-gray{fill:#F1EFE8; stroke:#5F5E5A} .c-gray text{fill:#444441}
+  .c-teal rect,rect.c-teal{fill:#E1F5EE; stroke:#0F6E56} .c-teal text{fill:#085041}
+  .c-purple rect,rect.c-purple{fill:#EEEDFE; stroke:#534AB7} .c-purple text{fill:#3C3489}
+  .c-coral rect,rect.c-coral{fill:#FAECE7; stroke:#993C1D} .c-coral text{fill:#712B13}
+  @media (prefers-color-scheme: dark){
+    svg{--color-border-secondary:rgba(231,227,216,.30); --color-border-tertiary:rgba(231,227,216,.14)}
+    .c-gray rect,rect.c-gray{fill:#444441; stroke:#B4B2A9} .c-gray text{fill:#D3D1C7}
+    .c-teal rect,rect.c-teal{fill:#085041; stroke:#5DCAA5} .c-teal text{fill:#9FE1CB}
+    .c-purple rect,rect.c-purple{fill:#3C3489; stroke:#AFA9EC} .c-purple text{fill:#CECBF6}
+    .c-coral rect,rect.c-coral{fill:#712B13; stroke:#F0997B} .c-coral text{fill:#F5C4B3}
+  }
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <p class="kicker">Backend Design · v1</p>
+  <h1>云端 Agent 记忆系统<br>后端架构设计</h1>
+  <p class="lede">把 MemFS（git-backed 记忆文件系统）的设计搬到服务端、多租户的云环境。核心是一套刻意保持轻量的架构：无状态计算 + 内容寻址存储 + 单一 Postgres 协调中枢，刻意不引入 Temporal、Kafka 这类重型基础设施。</p>
+  <div class="meta"><span>scope · 服务端 / 多租户</span><span>stack · Go · Postgres · 对象存储</span><span>status · 设计稿</span></div>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#goals">设计目标与不变量</a></li>
+    <li><a href="#overview">总览架构</a></li>
+    <li><a href="#zone1">① 请求路径</a></li>
+    <li><a href="#zone2">② 读加速层</a></li>
+    <li><a href="#recall">召回问题与 grep 复刻</a></li>
+    <li><a href="#zone3">③ 权威存储</a></li>
+    <li><a href="#zone4">④ 维护层</a></li>
+    <li><a href="#flows">三条数据流</a></li>
+    <li><a href="#why-light">为什么不用 Temporal / Kafka</a></li>
+    <li><a href="#rollout">落地路线</a></li>
+  </ol>
+</nav>
+
+<h2 id="goals"><span class="sec-no">00</span>设计目标与不变量</h2>
+<p>目标是让一个 agent 在云端长期、跨 session 地拥有可自我编辑的记忆，同时满足多租户隔离、水平扩展、可审计、可控成本。整套设计反复复用同一组心智模型——把它们当作贯穿全文的不变量，后面每个环节都是它的推论。</p>
+
+<div class="invariants">
+  <div class="ihead">三条不变量 · 整套设计的脊椎</div>
+  <div class="irow">
+    <p class="iname">objects 不可变</p>
+    <p class="idesc">记忆的文件内容、目录树、提交都按自身 hash 做内容寻址。不可变意味着：能当缓存键、能跨租户去重、能做 mark-sweep GC、同一 hash 永不映射到不同内容。</p>
+  </div>
+  <div class="irow">
+    <p class="iname">refs 可变且强一致</p>
+    <p class="idesc">唯一可变的是指针 <code>agent_id → HEAD</code>。所有并发、顺序、一致性全部收口在对它的原子 CAS 上。它住在 Postgres 里，并顺手兼任任务队列。</p>
+  </div>
+  <div class="irow">
+    <p class="iname">其余皆为可重建的派生视图</p>
+    <p class="idesc">缓存、trigram 索引、worker 本地工作副本——丢了都能从权威 objects 重算。所以它们全部无状态、可随意扩缩与重启。</p>
+  </div>
+</div>
+
+<h2 id="overview"><span class="sec-no">01</span>总览架构</h2>
+<p>系统分四个区：① 请求路径处理用户回合，② 读加速层降低延迟与 token 成本，③ 权威存储是唯一有状态、保证持久与一致的层，④ 维护层在后台做记忆整理。三类流向在图中用样式区分——<strong>实线 = 数据读取</strong>，<strong>粗青线 = 写入（commit）</strong>，<strong>虚线 = 派生更新（reindex）</strong>。</p>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 560" role="img">
+<title>云端 Agent 记忆系统总览</title>
+<desc>四个区：请求路径、读加速层、权威存储（对象存储 + Postgres）、维护层（一个 Go worker）。</desc>
+<defs><marker id="arrowA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="30" y="64" width="620" height="92" rx="16" fill="none" stroke="var(--color-border-secondary)" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text class="th" x="42" y="80" text-anchor="start" dominant-baseline="central">① request path</text>
+<rect x="30" y="180" width="620" height="86" rx="16" fill="none" stroke="var(--color-border-secondary)" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text class="th" x="42" y="196" text-anchor="start" dominant-baseline="central">② read accelerators</text>
+<rect x="30" y="296" width="620" height="86" rx="16" fill="none" stroke="var(--color-border-secondary)" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text class="th" x="42" y="312" text-anchor="start" dominant-baseline="central">③ canonical store (authoritative)</text>
+<rect x="30" y="412" width="620" height="86" rx="16" fill="none" stroke="var(--color-border-secondary)" stroke-width="0.5" stroke-dasharray="4 4"/>
+<text class="th" x="42" y="428" text-anchor="start" dominant-baseline="central">④ maintenance — one Go worker</text>
+<g class="node c-teal"><rect x="60" y="92" width="160" height="50" rx="8" stroke-width="0.5"/><text class="th" x="140" y="111" text-anchor="middle" dominant-baseline="central">Session router</text><text class="ts" x="140" y="127" text-anchor="middle" dominant-baseline="central">serialize per agent</text></g>
+<g class="node c-teal"><rect x="260" y="92" width="160" height="50" rx="8" stroke-width="0.5"/><text class="th" x="340" y="111" text-anchor="middle" dominant-baseline="central">Agent worker</text><text class="ts" x="340" y="127" text-anchor="middle" dominant-baseline="central">stateless pod</text></g>
+<g class="node c-gray"><rect x="460" y="92" width="160" height="50" rx="8" stroke-width="0.5"/><text class="th" x="540" y="111" text-anchor="middle" dominant-baseline="central">LLM provider</text><text class="ts" x="540" y="127" text-anchor="middle" dominant-baseline="central">inference</text></g>
+<g class="node c-teal"><rect x="120" y="205" width="200" height="50" rx="8" stroke-width="0.5"/><text class="th" x="220" y="224" text-anchor="middle" dominant-baseline="central">Memory cache</text><text class="ts" x="220" y="240" text-anchor="middle" dominant-baseline="central">keyed by commit SHA</text></g>
+<g class="node c-teal"><rect x="360" y="205" width="200" height="50" rx="8" stroke-width="0.5"/><text class="th" x="460" y="224" text-anchor="middle" dominant-baseline="central">Search service</text><text class="ts" x="460" y="240" text-anchor="middle" dominant-baseline="central">trigram index (local)</text></g>
+<g class="node c-purple"><rect x="120" y="321" width="200" height="50" rx="8" stroke-width="0.5"/><text class="th" x="220" y="340" text-anchor="middle" dominant-baseline="central">Object storage</text><text class="ts" x="220" y="356" text-anchor="middle" dominant-baseline="central">content-addressed objects</text></g>
+<g class="node c-purple"><rect x="360" y="321" width="200" height="50" rx="8" stroke-width="0.5"/><text class="th" x="460" y="340" text-anchor="middle" dominant-baseline="central">Postgres</text><text class="ts" x="460" y="356" text-anchor="middle" dominant-baseline="central">refs (HEAD·CAS) + job queue</text></g>
+<g class="node c-coral"><rect x="150" y="437" width="380" height="50" rx="8" stroke-width="0.5"/><text class="th" x="340" y="456" text-anchor="middle" dominant-baseline="central">Maintenance worker (Go)</text><text class="ts" x="340" y="472" text-anchor="middle" dominant-baseline="central">reconcile loop · reflection · defrag · GC</text></g>
+<line x1="140" y1="46" x2="140" y2="90" class="arr" marker-end="url(#arrowA)"/>
+<text class="ts" x="140" y="36" text-anchor="middle" dominant-baseline="central">agent message</text>
+<line x1="220" y1="117" x2="258" y2="117" class="arr" marker-end="url(#arrowA)"/>
+<line x1="420" y1="117" x2="458" y2="117" class="arr" marker-end="url(#arrowA)"/>
+<path d="M320 142 L320 168 L220 168 L220 203" fill="none" class="arr" marker-end="url(#arrowA)"/>
+<path d="M360 142 L360 168 L460 168 L460 203" fill="none" class="arr" marker-end="url(#arrowA)"/>
+<text class="ts" x="255" y="160" text-anchor="middle" dominant-baseline="central">system/</text>
+<text class="ts" x="425" y="160" text-anchor="middle" dominant-baseline="central">recall</text>
+<line x1="220" y1="255" x2="220" y2="319" class="arr" marker-end="url(#arrowA)"/>
+<text class="ts" x="228" y="285" text-anchor="start" dominant-baseline="central">materialize</text>
+<path d="M340 142 L340 308" fill="none" stroke="#0F6E56" stroke-width="2"/>
+<line x1="340" y1="308" x2="315" y2="320" stroke="#0F6E56" stroke-width="2" marker-end="url(#arrowA)"/>
+<line x1="340" y1="308" x2="365" y2="320" stroke="#0F6E56" stroke-width="2" marker-end="url(#arrowA)"/>
+<text class="ts" x="340" y="176" text-anchor="middle" dominant-baseline="central">commit</text>
+<line x1="220" y1="435" x2="220" y2="373" class="arr" marker-end="url(#arrowA)"/>
+<text class="ts" x="228" y="403" text-anchor="start" dominant-baseline="central">worktree · GC</text>
+<line x1="460" y1="435" x2="460" y2="373" class="arr" marker-end="url(#arrowA)"/>
+<text class="ts" x="468" y="403" text-anchor="start" dominant-baseline="central">poll / dequeue</text>
+<path d="M510 437 L625 437 L625 230 L562 230" fill="none" class="arr" stroke="#888780" stroke-dasharray="4 4" marker-end="url(#arrowA)"/>
+<text class="ts" x="618" y="360" text-anchor="end" dominant-baseline="central">reindex</text>
+<rect class="c-teal" x="40" y="528" width="12" height="12" rx="3"/><text class="ts" x="56" y="534" text-anchor="start" dominant-baseline="central">foreground</text>
+<rect class="c-purple" x="160" y="528" width="12" height="12" rx="3"/><text class="ts" x="176" y="534" text-anchor="start" dominant-baseline="central">store</text>
+<rect class="c-coral" x="250" y="528" width="12" height="12" rx="3"/><text class="ts" x="266" y="534" text-anchor="start" dominant-baseline="central">maintenance</text>
+<rect class="c-gray" x="380" y="528" width="12" height="12" rx="3"/><text class="ts" x="396" y="534" text-anchor="start" dominant-baseline="central">external</text>
+</svg>
+<figcaption>图 1 · 总览。Postgres 一身兼两职（refs + 任务队列），后台只剩一个 Go worker。</figcaption>
+</figure>
+
+<h2 id="zone1"><span class="sec-no">02</span>① 请求路径</h2>
+
+<h3>Session router — 按 agent 串行化</h3>
+<p>消息进来的第一站。它做的最重要的事是<em>把同一 agent 的写串行化</em>：保证任意时刻一个 agent 只有一个写者。这是整个系统唯一需要串行的点——因为客户端模式下「一个人一次一个 session」这个隐式串行器在云端没有了，必须显式地重建它。</p>
+<p>实现可以很轻：把同一 <code>agent_id</code> 的请求路由到固定 worker（session 亲和），或者用一把 per-agent 锁（Redis 锁 / 数据库行锁）。默认选「单写者」而非「乐观并发」，因为记忆是散文 markdown，多写者并发的 git 自动 merge 是有损的。</p>
+
+<h3>Agent worker — 无状态 pod</h3>
+<p>真正跑 agent loop 的地方。它是<em>无状态</em>的：session 开始时从权威存储 checkout 该 agent 的记忆到本地临时盘，结束时提交回去；本地盘只是个可丢弃的缓存。这让它可以随 k8s 任意扩缩、被回收、重启。worker 持有 bash / 文件 / git 工具（指向本地工作副本），agent 直接编辑记忆文件。</p>
+
+<h3>LLM provider — 推理</h3>
+<p>纯外部依赖，只负责推理。worker 把组装好的 context（含 <code>system/</code> 常驻记忆与召回片段）发给它。它不持有任何状态。</p>
+
+<h2 id="zone2"><span class="sec-no">03</span>② 读加速层</h2>
+
+<h3>Memory cache — 按 commit SHA 做键</h3>
+<p>缓存的是<em>物化好的 <code>system/</code></em>（每轮必进 context 的常驻记忆）与 memory tree 索引，省掉每轮回源对象存储的开销。关键的设计决定是用 commit SHA 当键，因为这把「缓存失效」这个最难的问题直接消解掉了。</p>
+
+<div class="callout">
+  <span class="tag">为什么按 SHA</span>
+  <p>git 的 commit SHA 是内容寻址的——一个 SHA 唯一且不可变地对应整棵树的一个快照。于是 <code>sha → 物化内容</code> 是<strong>不可变映射</strong>：内容变了就是另一个 SHA、另一个键。所以缓存<strong>永不失效</strong>，传统的 invalidation 退化成纯粹为回收内存的 LRU/TTL 淘汰。它还顺带是个 ETag（比较版本只需比 SHA）、让多 worker 共享同一份字节、并保证后台改写记忆时前台仍读到一致快照。</p>
+</div>
+
+<p>真正需要保鲜的不是这份内容缓存，而是可变指针 <code>agent_id → HEAD</code>——那住在 Postgres 里（见 ③）。新内容 = 新 SHA = 缓存 miss = 重新物化回填，旧条目自然淘汰。</p>
+
+<h3>Search service — 本地 trigram 索引</h3>
+<p>负责语义/关键词召回。它持有一个 trigram 倒排索引（zoekt / bleve / tantivy 一类），这是「grep at scale」的成熟技术。<em>变体 A</em>（推荐）：索引里连文件内容一起存，查询完全在本地 shard 内完成、不碰对象存储——因为记忆是小文本，内容重复一份可忽略。<em>变体 B</em>：索引只存 <code>(object hash, 字节 offset, 长度)</code> 指针，查询时再对对象存储发一个很小的 Range GET 取命中字节，offset 因内容寻址而永远稳定。</p>
+
+<h2 id="recall"><span class="sec-no">04</span>召回问题与 grep 复刻</h2>
+<p>客户端 agent 的 grep 之所以高效，本质是<em>计算紧贴数据</em>：在本地盘上扫、返回子文件的命中行、只有命中的几行进 context。云端把计算和数据分到两地后，「全量召回整个文件」会同时带来两笔成本——跨平台 egress（文件越大、跨 region 越疼）与更天天疼的 context 膨胀 + 二次扫描负担。</p>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 306" role="img">
+<title>旧召回路径：全量物化</title><desc>整个文件跨过平台边界进入 context。</desc>
+<defs><marker id="arrowB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<line x1="350" y1="66" x2="350" y2="288" stroke="var(--color-border-secondary)" stroke-width="1" stroke-dasharray="6 5"/>
+<text class="ts" x="60" y="52" text-anchor="start" dominant-baseline="central">compute side (agent)</text>
+<text class="ts" x="350" y="52" text-anchor="middle" dominant-baseline="central">platform / region boundary</text>
+<text class="ts" x="620" y="52" text-anchor="end" dominant-baseline="central">data side</text>
+<g class="node c-gray"><rect x="60" y="90" width="180" height="56" rx="8" stroke-width="0.5"/><text class="th" x="150" y="108" text-anchor="middle" dominant-baseline="central">Agent</text><text class="ts" x="150" y="126" text-anchor="middle" dominant-baseline="central">context window</text></g>
+<g class="node c-purple"><rect x="420" y="90" width="200" height="80" rx="12" stroke-width="0.5"/><text class="th" x="520" y="116" text-anchor="middle" dominant-baseline="central">Object storage</text><text class="ts" x="520" y="136" text-anchor="middle" dominant-baseline="central">memory files (whole)</text></g>
+<g class="node c-coral"><rect x="40" y="210" width="270" height="66" rx="8" stroke-width="0.5"/><text class="th" x="175" y="232" text-anchor="middle" dominant-baseline="central">Whole file in context</text><text class="ts" x="175" y="254" text-anchor="middle" dominant-baseline="central">then re-scans for the relevant bit</text></g>
+<line x1="240" y1="110" x2="418" y2="110" class="arr" marker-end="url(#arrowB)"/>
+<text class="ts" x="328" y="101" text-anchor="middle" dominant-baseline="central">recall X</text>
+<path d="M420 160 L175 160 L175 208" fill="none" stroke="#D85A30" stroke-width="3.5" marker-end="url(#arrowB)"/>
+<text class="ts" x="300" y="151" text-anchor="middle" dominant-baseline="central">whole file · $ egress</text>
+</svg>
+<figcaption>图 2 · 旧路径。粗箭头 = 整个文件跨过收费边界并塞满 context。</figcaption>
+</figure>
+
+<p>修法是<em>把搜索搬到数据那边，只让命中区域跨线回来</em>——也就是把过滤下推到存储（与 ClickHouse 的谓词下推同形）。query 出去很小，重活（扫描）留在数据侧，回来的只有命中行。</p>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 300" role="img">
+<title>新召回路径：搜索下推 + Range 读取</title><desc>扫描留在数据侧，只有命中区域跨回。</desc>
+<defs><marker id="arrowC" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<line x1="350" y1="66" x2="350" y2="282" stroke="var(--color-border-secondary)" stroke-width="1" stroke-dasharray="6 5"/>
+<text class="ts" x="60" y="52" text-anchor="start" dominant-baseline="central">compute side (agent)</text>
+<text class="ts" x="350" y="52" text-anchor="middle" dominant-baseline="central">platform / region boundary</text>
+<text class="ts" x="620" y="52" text-anchor="end" dominant-baseline="central">data side</text>
+<g class="node c-gray"><rect x="60" y="80" width="180" height="56" rx="8" stroke-width="0.5"/><text class="th" x="150" y="98" text-anchor="middle" dominant-baseline="central">Agent</text><text class="ts" x="150" y="116" text-anchor="middle" dominant-baseline="central">context window</text></g>
+<g class="node c-teal"><rect x="400" y="70" width="240" height="56" rx="8" stroke-width="0.5"/><text class="th" x="520" y="88" text-anchor="middle" dominant-baseline="central">Search service</text><text class="ts" x="520" y="106" text-anchor="middle" dominant-baseline="central">trigram index · in-region</text></g>
+<g class="node c-purple"><rect x="400" y="180" width="240" height="56" rx="8" stroke-width="0.5"/><text class="th" x="520" y="198" text-anchor="middle" dominant-baseline="central">Object storage</text><text class="ts" x="520" y="216" text-anchor="middle" dominant-baseline="central">memory files</text></g>
+<g class="node c-teal"><rect x="60" y="210" width="210" height="56" rx="8" stroke-width="0.5"/><text class="th" x="165" y="228" text-anchor="middle" dominant-baseline="central">Only the region</text><text class="ts" x="165" y="246" text-anchor="middle" dominant-baseline="central">matched lines in context</text></g>
+<line x1="240" y1="98" x2="398" y2="98" class="arr" marker-end="url(#arrowC)"/>
+<text class="ts" x="320" y="89" text-anchor="middle" dominant-baseline="central">grep query</text>
+<line x1="520" y1="126" x2="520" y2="178" stroke="#534AB7" stroke-width="3" marker-end="url(#arrowC)"/>
+<text class="ts" x="530" y="152" text-anchor="start" dominant-baseline="central">local scan</text>
+<line x1="400" y1="220" x2="272" y2="220" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arrowC)"/>
+<text class="ts" x="318" y="210" text-anchor="middle" dominant-baseline="central">only matched region</text>
+</svg>
+<figcaption>图 3 · 新路径。跨边界的都很细；重的 local scan 留在数据侧。</figcaption>
+</figure>
+
+<div class="callout">
+  <span class="tag">诚实的残留成本</span>
+  <p>grep 的<strong>行为</strong>可以完全复刻（lexical、子文件、查询廉价、regex 都行），复刻不了的是它的<strong>零基础设施</strong>属性——客户端就是文件 + grep 二进制，云上你要花一个索引 + 一个搜索服务 + commit 时的增量更新来买回同样体验。代价不在 egress（可解）也不在处理压力（可解），而在多出来的活动部件。务实做法：先把召回粒度从「文件」降到「行范围」（这步几乎不加组件、收益最大），trigram 索引按规模再上。</p>
+</div>
+
+<h3>Search 与 Object storage 怎么交互</h3>
+<p>核心：它俩<em>主要在构建时耦合，在查询时几乎不耦合</em>。</p>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 400" role="img">
+<title>Search 与 Object storage 的两阶段交互</title><desc>构建时读变更对象并增量重建索引；查询时本地作答。</desc>
+<defs><marker id="arrowD" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-teal"><rect x="100" y="40" width="160" height="44" rx="8" stroke-width="0.5"/><text class="th" x="180" y="62" text-anchor="middle" dominant-baseline="central">Search service</text></g>
+<g class="c-purple"><rect x="440" y="40" width="160" height="44" rx="8" stroke-width="0.5"/><text class="th" x="520" y="62" text-anchor="middle" dominant-baseline="central">Object storage</text></g>
+<line x1="180" y1="84" x2="180" y2="384" stroke="var(--color-border-secondary)" stroke-width="1" stroke-dasharray="5 5"/>
+<line x1="520" y1="84" x2="520" y2="384" stroke="var(--color-border-secondary)" stroke-width="1" stroke-dasharray="5 5"/>
+<text class="th" x="44" y="106" text-anchor="start" dominant-baseline="central">① on commit — build time</text>
+<line x1="44" y1="130" x2="178" y2="130" class="arr" marker-end="url(#arrowD)"/>
+<text class="ts" x="111" y="121" text-anchor="middle" dominant-baseline="central">commit event</text>
+<line x1="184" y1="158" x2="516" y2="158" class="arr" marker-end="url(#arrowD)"/>
+<text class="ts" x="350" y="149" text-anchor="middle" dominant-baseline="central">read changed objects (git diff)</text>
+<line x1="516" y1="184" x2="184" y2="184" class="arr" stroke-dasharray="4 4" marker-end="url(#arrowD)"/>
+<text class="ts" x="350" y="175" text-anchor="middle" dominant-baseline="central">object bytes</text>
+<path d="M182 206 L228 206 L228 220 L184 220" fill="none" class="arr" marker-end="url(#arrowD)"/>
+<text class="ts" x="236" y="213" text-anchor="start" dominant-baseline="central">incremental re-index</text>
+<line x1="40" y1="242" x2="640" y2="242" stroke="var(--color-border-tertiary)" stroke-width="0.5"/>
+<text class="th" x="44" y="264" text-anchor="start" dominant-baseline="central">② on query — read time</text>
+<line x1="44" y1="288" x2="178" y2="288" class="arr" marker-end="url(#arrowD)"/>
+<text class="ts" x="111" y="279" text-anchor="middle" dominant-baseline="central">agent query</text>
+<path d="M182 308 L228 308 L228 322 L184 322" fill="none" class="arr" marker-end="url(#arrowD)"/>
+<text class="ts" x="236" y="315" text-anchor="start" dominant-baseline="central">index lookup (local)</text>
+<line x1="184" y1="344" x2="516" y2="344" class="arr" stroke-dasharray="4 4" marker-end="url(#arrowD)"/>
+<text class="ts" x="350" y="335" text-anchor="middle" dominant-baseline="central">range GET — variant B only</text>
+<line x1="178" y1="368" x2="44" y2="368" class="arr" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#arrowD)"/>
+<text class="ts" x="111" y="359" text-anchor="middle" dominant-baseline="central">region out</text>
+</svg>
+<figcaption>图 4 · 两阶段交互。构建时按 git diff 只重建变更文件；查询时本地作答。</figcaption>
+</figure>
+
+<p><strong>构建时</strong>：一次 commit 后，search 拿到「HEAD 从 old 走到 new」，做 <code>git diff old..new</code> 得到精确的变更文件清单，只取这几个对象、增量更新 trigram postings——没变的文件因内容寻址而 postings 照旧有效。<strong>查询时</strong>：变体 A 完全本地作答、不碰对象存储；变体 B 多一个很小的 Range GET。索引是派生视图，丢了能从对象重建，按 <code>agent_id</code> 分片、冷 agent 按需加载。它最终一致——刚写的记忆有几秒搜不到，但你召回的多是旧记忆，通常无所谓。</p>
+
+<h2 id="zone3"><span class="sec-no">05</span>③ 权威存储</h2>
+<p>这是唯一有状态、保证持久与一致的层。它把两个性质对立的东西分开放：不可变的内容、可变的指针。</p>
+
+<h3>Object storage — 内容寻址的对象</h3>
+<p>每个文件内容、目录树、提交都按自身 hash 存为 <code>objects/&lt;hash&gt;</code>，幂等写（已存在就跳过）。内容寻址天然是对象存储的甜区：海量、廉价、高耐久（11 个 9）、可去重。严格租户隔离时按 per-tenant 前缀放，放弃跨租户去重以免泄漏「某文件是否存在」。它在查询关键路径上几乎不出现——读由缓存与索引挡住，写是幂等 PUT。</p>
+
+<h3>Postgres — refs（HEAD·CAS）+ 任务队列</h3>
+<p>可变指针 <code>agent_id → HEAD</code> 住在这里，因为我们需要对它做<em>原子 CAS</em>（<code>HEAD: old → new</code>，失败说明有人动过 HEAD）。整个系统的并发与顺序就收口在这一个点上。它还顺手兼任任务队列——这正是轻量化的关键（见 ④ 与 ⑦）。</p>
+
+<div class="callout">
+  <span class="tag">写顺序</span>
+  <p>永远<strong>先写 objects，后动 Postgres</strong>。即便 CAS 前崩了，落下的 object 只是暂时不可达的垃圾（等 GC 收），绝不会出现 ref 指向一个没写全的 commit 的撕裂状态。</p>
+</div>
+
+<h2 id="zone4"><span class="sec-no">06</span>④ 维护层</h2>
+<p>后台只有<em>一个独立的 Go worker</em>（与前台 worker 分开部署）。它把记忆维护的三件事做掉：reflection（反思近期对话、固化记忆）、defrag（整理记忆文件、拆大合重、重建层级）、GC（清理不可达对象、打包小对象）。reindex（更新 search 索引）也是它的一项任务。</p>
+
+<h4>拿活的两种姿势</h4>
+<ul>
+  <li><strong>对账循环（最轻）</strong>：死循环 poll Postgres——「哪些 agent 的 HEAD 比我记录的 <code>processed_sha</code> 新？」refs 表本身就是工作清单，处理完更新游标。崩了重启从状态重新推导，天然崩溃安全。就是 k8s controller 的 reconcile 模式。</li>
+  <li><strong>River 队列（要真队列时）</strong>：直接 dequeue commit 事务里入队的 job。重试退避、周期任务、per-agent unique（单例）都现成，且就跑在同一个 Postgres 里，没有额外集群。</li>
+</ul>
+
+<div class="callout">
+  <span class="tag">不阻塞前台</span>
+  <p>维护任务改记忆时用 <strong>git worktree</strong>——在另开的工作目录里改、commit、merge 回主分支。前台 worker 同时仍读自己 SHA-pin 住的快照，互不干扰，只在最后 merge / CAS 时对账一次。per-agent 单例靠一把锁或 River 的 unique job 保证，别让两个 defrag 同时上同一个 agent。</p>
+</div>
+
+<h2 id="flows"><span class="sec-no">07</span>三条数据流</h2>
+
+<h3>读（前台，实线）</h3>
+<p>router 按 agent 串行 → worker 组装 context：<code>system/</code> 走 SHA-keyed cache，历史召回走 search service（本地作答），仅 miss 时回源对象存储 materialize → LLM 推理。全程无状态、可水平扩。</p>
+
+<h3>写（commit，粗青线）— 轻量化最漂亮的一处</h3>
+<p>worker 提交分两步：(1) 把内容寻址的新 object 幂等写进对象存储；(2) 在 <em>Postgres 的同一个事务里</em> 做 ref 的 CAS <strong>外加</strong> 把维护任务入队。</p>
+<div class="callout">
+  <span class="tag">一事务 = 干掉 Kafka + outbox</span>
+  <p>CAS 与 enqueue 在同一事务里原子完成，等价于「任务入队 ⟺ commit 成功」。这一下把整套 Kafka + outbox + event bus 全消解了——因为根本没有第二个系统要写，「双写不一致」这个问题不存在。worker 一提交就立刻返回，不等任何下游。</p>
+</div>
+
+<h3>维护（后台，虚线 / 派生）</h3>
+<p>Go worker 通过对账循环或 River 拿到活，在 worktree 里跑 reflection / defrag / GC，并按 <code>git diff</code> 增量更新 search 索引。它读写对象存储、读 Postgres 拿工作，全部异步、不在用户回合的关键路径上。</p>
+
+<h2 id="why-light"><span class="sec-no">08</span>为什么不用 Temporal / Kafka</h2>
+<p>它俩回答的是两个正交问题：<strong>Temporal = 谁来跑长任务且抗崩溃</strong>（执行）；<strong>Kafka = 下游怎么知道发生了 commit 且不拖累前台</strong>（通知）。本设计两个都不用，原因如下。</p>
+
+<table>
+  <thead><tr><th>组件</th><th>它解决什么</th><th>为什么这里不需要</th></tr></thead>
+  <tbody>
+    <tr><td>Temporal</td><td>多步、长命、需中途断点续跑的复杂 workflow</td><td>记忆维护任务幂等、可从状态重推、不算长；接受「失败整段重跑」即可丢掉 durable resume，于是只需 队列/轮询 + 重试 + 单例 + 调度——全是轻量货</td></tr>
+    <tr><td>Kafka</td><td>解耦写路径、多消费者扇出、持久重放</td><td>下游消费者就一个（维护 worker）；用 Postgres 同事务入队即可，省掉 dual-write 一致性难题</td></tr>
+  </tbody>
+</table>
+
+<p>判断标准很简单：任务的「重跑成本」和「中间状态」大不大——大才上 Temporal；消费者多不多、是否要重放——多才上 Kafka。本场景两者都不达标，所以用「Postgres 里几张表 + 一个 Go 进程」就够，透明、可控、无黑盒集群。</p>
+
+<h2 id="rollout"><span class="sec-no">09</span>落地路线</h2>
+<p>不要一开始就把四个区全建齐。按压力增量演进：</p>
+<ol>
+  <li><strong>最小可跑</strong>：无状态 worker + 对象存储 + Postgres(refs) + 一个跑对账循环的 Go worker，GC 用 cron 兜底。没有队列、没有 Kafka、没有 Temporal。</li>
+  <li><strong>读加速</strong>：加 SHA-keyed cache（先 per-pod 内存即可），降低回源。</li>
+  <li><strong>召回升级</strong>：召回先从「整文件」降到「行范围」（search 工具返回区间 + Range GET）；有规模/延迟压力再上独立的 trigram search service。</li>
+  <li><strong>队列升级</strong>：需要事务性入队与更体面的重试/调度时，把对账循环换成 River——还是同一个 Postgres，不引入新集群。</li>
+  <li><strong>就近 grep</strong>：grep 保真度要求高时，引入 warm per-agent sidecar 持有工作树、本地索引/grep。</li>
+</ol>
+
+<hr class="end">
+<p class="foot">云端 Agent 记忆系统 · 后端架构设计 · v1<br>设计原则：objects 不可变 / refs 强一致 / 其余皆可重建 · 轻量优先，按压力演进。</p>
+
+</div>
