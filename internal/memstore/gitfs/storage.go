@@ -79,6 +79,9 @@ func (s *Storage) SetEncodedObject(o plumbing.EncodedObject) (plumbing.Hash, err
 		return plumbing.ZeroHash, plumbing.ErrInvalidType
 	}
 	h := o.Hash()
+	if h == plumbing.ZeroHash {
+		return plumbing.ZeroHash, plumbing.ErrInvalidType
+	}
 	data, err := frame(o)
 	if err != nil {
 		return plumbing.ZeroHash, fmt.Errorf("gitfs: frame %s: %w", h, err)
@@ -130,6 +133,7 @@ func (s *Storage) HasEncodedObject(h plumbing.Hash) error {
 
 // EncodedObjectSize returns the size of the object content (not including the
 // frame header).
+// TODO(M5): parse size from header without fetching full body
 func (s *Storage) EncodedObjectSize(h plumbing.Hash) (int64, error) {
 	data, err := s.objs.Get(s.ctx, h.String())
 	if errors.Is(err, objstore.ErrNotFound) {

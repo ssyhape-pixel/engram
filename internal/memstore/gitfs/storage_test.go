@@ -2,6 +2,7 @@ package gitfs
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -39,11 +40,17 @@ func TestStorageBlobRoundTrip(t *testing.T) {
 	if got.Type() != plumbing.BlobObject {
 		t.Fatalf("type = %v", got.Type())
 	}
-	r, _ := got.Reader()
-	buf := make([]byte, len(content))
-	r.Read(buf)
-	if string(buf) != string(content) {
-		t.Fatalf("content = %q want %q", buf, content)
+	r, err := got.Reader()
+	if err != nil {
+		t.Fatalf("Reader: %v", err)
+	}
+	defer r.Close()
+	gotContent, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(gotContent) != string(content) {
+		t.Fatalf("content = %q want %q", gotContent, content)
 	}
 	if got.Hash() != h {
 		t.Fatalf("hash mismatch: %v vs %v", got.Hash(), h)
