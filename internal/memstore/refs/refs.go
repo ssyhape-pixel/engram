@@ -56,7 +56,9 @@ func (r *Refs) Bootstrap(ctx context.Context, agentID, head string) error {
 }
 
 // CommitRef atomically advances HEAD parent->next and enqueues jobs in ONE tx.
-// Returns ErrCASConflict if HEAD != parent (0 rows updated).
+// Returns ErrCASConflict if HEAD != parent (0 rows updated). Note that a
+// nonexistent agent also matches 0 rows and thus returns ErrCASConflict, so
+// callers must Bootstrap the agent before the first CommitRef.
 func (r *Refs) CommitRef(ctx context.Context, agentID, parent, next string, jobs []Job) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {

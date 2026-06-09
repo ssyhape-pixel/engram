@@ -24,10 +24,14 @@ func testPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("pool: %v", err)
 	}
 	t.Cleanup(func() {
-		pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor")
+		if _, err := pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor"); err != nil {
+			t.Fatalf("truncate: %v", err)
+		}
 		pool.Close()
 	})
-	pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor")
+	if _, err := pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
 	return pool
 }
 
