@@ -44,7 +44,9 @@ func TestLocalHas(t *testing.T) {
 	if err != nil || ok {
 		t.Fatalf("Has(missing) = %v,%v want false,nil", ok, err)
 	}
-	_ = s.Put(ctx, "present", []byte("x"))
+	if err := s.Put(ctx, "present", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
 	ok, err = s.Has(ctx, "present")
 	if err != nil || !ok {
 		t.Fatalf("Has(present) = %v,%v want true,nil", ok, err)
@@ -63,8 +65,12 @@ func TestLocalGetNotFound(t *testing.T) {
 func TestLocalIter(t *testing.T) {
 	ctx := context.Background()
 	s := newLocal(t)
-	_ = s.Put(ctx, "aa", []byte("1"))
-	_ = s.Put(ctx, "bb", []byte("2"))
+	if err := s.Put(ctx, "aa", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, "bb", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
 	seen := map[string]bool{}
 	err := s.Iter(ctx, func(key string) error { seen[key] = true; return nil })
 	if err != nil {

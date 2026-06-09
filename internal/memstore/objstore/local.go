@@ -51,6 +51,9 @@ func (l *Local) Get(ctx context.Context, key string) ([]byte, error) {
 // bytes). Writes go to a temp file then rename for atomic visibility.
 func (l *Local) Put(ctx context.Context, key string, data []byte) error {
 	p := l.path(key)
+	// Check-then-write race is safe: objects are content-addressed and
+	// immutable, so an identical key implies identical bytes; the last atomic
+	// rename always wins with the correct contents.
 	if _, err := os.Stat(p); err == nil {
 		return nil
 	}
@@ -83,11 +86,12 @@ func (l *Local) Iter(ctx context.Context, fn func(key string) error) error {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
-			return err
+			return fmt.Errorf("objstore: walk: %w", err)
 		}
 		if d.IsDir() {
 			return nil
 		}
+		// With the <key[:2]>/<key> layout the file basename equals the key.
 		return fn(d.Name())
 	})
 }
