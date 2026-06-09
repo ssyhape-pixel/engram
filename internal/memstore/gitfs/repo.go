@@ -14,6 +14,8 @@ import (
 
 const branchRef = plumbing.ReferenceName("refs/heads/main")
 
+// author uses time.Now(), so commit hashes are not reproducible across runs
+// (intended for real commits; tests must not assert a fixed SHA).
 func author() *object.Signature {
 	return &object.Signature{Name: "engram-agent", Email: "agent@engram", When: time.Now()}
 }
@@ -23,9 +25,12 @@ func author() *object.Signature {
 func seedRefs(st *Storage, parent string) error {
 	h := plumbing.NewHash(parent)
 	if err := st.SetReference(plumbing.NewHashReference(branchRef, h)); err != nil {
-		return err
+		return fmt.Errorf("gitfs: set branch ref: %w", err)
 	}
-	return st.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, branchRef))
+	if err := st.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, branchRef)); err != nil {
+		return fmt.Errorf("gitfs: set HEAD: %w", err)
+	}
+	return nil
 }
 
 // Materialize checks out the tree at `at` into dir. `at` empty means an empty
