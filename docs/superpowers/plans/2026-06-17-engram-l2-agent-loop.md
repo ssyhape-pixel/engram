@@ -494,7 +494,8 @@ func TestReadFullAndRange(t *testing.T) {
 	if full.IsError || !strings.Contains(full.Content, "buy milk") {
 		t.Fatalf("read full = %+v", full)
 	}
-	rng := ts.Dispatch(context.Background(), ToolCall{Name: "read", Input: map[string]any{"path": "notes/todo.md", "start": float64(4), "end": float64(4)}})
+	// 1-based inclusive: line 5 == "find needle" (matches recall's 1-based line numbers).
+	rng := ts.Dispatch(context.Background(), ToolCall{Name: "read", Input: map[string]any{"path": "notes/todo.md", "start": float64(5), "end": float64(5)}})
 	if rng.IsError || strings.Contains(rng.Content, "buy milk") || !strings.Contains(rng.Content, "find needle") {
 		t.Fatalf("read range = %+v", rng)
 	}
