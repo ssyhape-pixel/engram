@@ -87,3 +87,26 @@ func TestRouterCloseRemovesWorkdir(t *testing.T) {
 		t.Fatalf("workdir should be removed after Close, stat err = %v", err)
 	}
 }
+
+func TestRouterDoubleCloseIsSafe(t *testing.T) {
+	ctx := context.Background()
+	r, _ := routerFixture(t)
+	s1, err := r.Open(ctx, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A second Open must succeed (slot freed)...
+	s2, err := r.Open(ctx, "a1")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	// ...and a stale double-Close of s1 must NOT free s2's claim.
+	_ = s1.Close()
+	if _, err := r.Open(ctx, "a1"); !errors.Is(err, ErrAgentBusy) {
+		t.Fatalf("stale double-Close freed the live session's claim: got %v want ErrAgentBusy", err)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/ssy/engram/internal/memstore"
@@ -60,7 +61,12 @@ func (r *Router) Open(ctx context.Context, agentID string) (*Session, error) {
 		r.free(agentID)
 		return nil, fmt.Errorf("agent: resolve head: %w", err)
 	}
-	workdir, err := os.MkdirTemp(r.scratch, agentID+"-*")
+	// MkdirTemp rejects patterns containing a path separator, so a hierarchical
+	// id like "tenant/alice" must be sanitized for the dir name only — the claim
+	// map keeps the real agentID.
+	safeID := strings.ReplaceAll(agentID, string(os.PathSeparator), "_")
+	safeID = strings.ReplaceAll(safeID, "/", "_")
+	workdir, err := os.MkdirTemp(r.scratch, safeID+"-*")
 	if err != nil {
 		r.free(agentID)
 		return nil, fmt.Errorf("agent: scratch dir: %w", err)
@@ -71,9 +77,14 @@ func (r *Router) Open(ctx context.Context, agentID string) (*Session, error) {
 		return nil, fmt.Errorf("agent: materialize: %w", err)
 	}
 	tools := NewToolset(workdir, agentID, search.NewGrep(workdir))
+	// sync.Once makes release idempotent: a double Close (e.g. defer + explicit)
+	// must not free a claim a *different* session may have re-acquired in between.
+	var once sync.Once
 	release := func() {
-		os.RemoveAll(workdir)
-		r.free(agentID)
+		once.Do(func() {
+			os.RemoveAll(workdir)
+			r.free(agentID)
+		})
 	}
 	return NewSession(r.store, r.prov, tools, agentID, head, workdir, release), nil
 }
