@@ -47,7 +47,14 @@ func NewSession(store memstore.MemStore, prov LLMProvider, tools *Toolset, agent
 }
 
 func (s *Session) Head() memstore.CommitHash { return s.head }
-func (s *Session) History() []Message        { return s.history }
+
+// History returns a defensive copy of the conversation so callers cannot
+// mutate the session's internal slice.
+func (s *Session) History() []Message {
+	out := make([]Message, len(s.history))
+	copy(out, s.history)
+	return out
+}
 
 // Close frees the workdir and (if set) the writer lock.
 func (s *Session) Close() error {
@@ -60,16 +67,19 @@ func (s *Session) Close() error {
 // Send runs one turn: the model may call tools (recall/read/edit) until it
 // returns final text; a turn that edited memory is committed.
 func (s *Session) Send(ctx context.Context, userMessage string) (string, error) {
+	base := len(s.history)
 	s.history = append(s.history, Message{Role: RoleUser, Text: userMessage})
 
 	final := ""
 	for step := 0; step < s.maxSteps; step++ {
 		sys, err := s.assembleSystem()
 		if err != nil {
+			s.history = s.history[:base]
 			return "", fmt.Errorf("agent: assemble system: %w", err)
 		}
 		resp, err := s.prov.Generate(ctx, Request{System: sys, Messages: s.history, Tools: s.tools.Defs()})
 		if err != nil {
+			s.history = s.history[:base]
 			return "", fmt.Errorf("agent: generate: %w", err)
 		}
 		if len(resp.ToolCalls) == 0 {
@@ -87,7 +97,9 @@ func (s *Session) Send(ctx context.Context, userMessage string) (string, error) 
 			results = append(results, res)
 		}
 		s.history = append(s.history, Message{Role: RoleTool, Results: results})
+		// last allowed step was spent on tool calls; no budget left for a final-text turn
 		if step == s.maxSteps-1 {
+			s.history = s.history[:base]
 			return "", fmt.Errorf("agent: tool-use loop exceeded maxSteps=%d", s.maxSteps)
 		}
 	}
@@ -100,19 +112,15 @@ func (s *Session) Send(ctx context.Context, userMessage string) (string, error) 
 	return final, nil
 }
 
-// commit persists the workdir, advancing HEAD. On a CAS conflict (which cannot
-// happen under the single-writer Router, but is handled defensively) it
-// re-resolves HEAD and retries once with the same workdir.
+// commit persists the workdir, advancing HEAD.
 func (s *Session) commit(ctx context.Context) error {
 	jobs := []memstore.Job{{Kind: "reindex"}, {Kind: "reflect"}}
 	newHead, err := s.store.CommitWithCAS(ctx, s.agentID, s.head, s.workdir, jobs)
 	if errors.Is(err, memstore.ErrCASConflict) {
-		cur, rerr := s.store.ResolveHead(ctx, s.agentID)
-		if rerr != nil {
-			return fmt.Errorf("agent: resolve after CAS conflict: %w", rerr)
-		}
-		s.head = cur
-		newHead, err = s.store.CommitWithCAS(ctx, s.agentID, s.head, s.workdir, jobs)
+		// Impossible under single-writer-per-agent (Router lock). If it occurs,
+		// the invariant was violated; surface it rather than silently clobbering
+		// the other writer's tree (no lossy merge). Multi-writer reconciliation is L5.
+		return fmt.Errorf("agent: commit conflict — single-writer invariant violated for %s: %w", s.agentID, err)
 	}
 	if err != nil {
 		return fmt.Errorf("agent: commit: %w", err)

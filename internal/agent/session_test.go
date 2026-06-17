@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -119,7 +120,7 @@ func TestSendMultiTurnAccumulatesHistory(t *testing.T) {
 	}
 }
 
-func TestSendCASConflictRetries(t *testing.T) {
+func TestSendCASConflictSurfacesError(t *testing.T) {
 	ctx := context.Background()
 	s, store, _ := sessionFixture(t, []func(Request) Response{
 		func(r Request) Response {
@@ -127,8 +128,6 @@ func TestSendCASConflictRetries(t *testing.T) {
 		},
 		func(r Request) Response { return Response{Text: "ok"} },
 	})
-	// Externally advance HEAD behind the session's back (impossible under the
-	// Router lock, but exercises the bounded retry).
 	other := t.TempDir()
 	if err := store.Materialize(ctx, "a1", s.Head(), other); err != nil {
 		t.Fatal(err)
@@ -139,7 +138,8 @@ func TestSendCASConflictRetries(t *testing.T) {
 	if _, err := store.CommitWithCAS(ctx, "a1", s.Head(), other, nil); err != nil {
 		t.Fatalf("external commit: %v", err)
 	}
-	if _, err := s.Send(ctx, "save"); err != nil {
-		t.Fatalf("send should recover via bounded retry: %v", err)
+	_, err := s.Send(ctx, "save")
+	if !errors.Is(err, memstore.ErrCASConflict) {
+		t.Fatalf("expected ErrCASConflict surfaced, got %v", err)
 	}
 }
