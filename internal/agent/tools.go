@@ -117,23 +117,24 @@ func (t *Toolset) doRead(callID string, in map[string]any) ToolResult {
 	if err != nil {
 		return errResult(callID, "read %s: %v", rel, err)
 	}
-	_, hasStart := in["start"]
-	_, hasEnd := in["end"]
-	if !hasStart && !hasEnd {
+	// Line ranges are 1-based inclusive to match recall/GrepSearch line
+	// numbers (a model recalls line N, then read(start=N) returns that line).
+	// Valid lines are >= 1, so start<=0 && end<=0 unambiguously means "no range".
+	start, end := intInput(in, "start"), intInput(in, "end")
+	if start <= 0 && end <= 0 {
 		return okResult(callID, string(data))
 	}
-	start, end := intInput(in, "start"), intInput(in, "end")
 	all := strings.Split(string(data), "\n")
-	if start < 0 {
-		start = 0
+	if start <= 0 {
+		start = 1
 	}
-	if end < 0 || end >= len(all) {
-		end = len(all) - 1
+	if end <= 0 || end > len(all) {
+		end = len(all)
 	}
-	if start >= len(all) {
+	if start > len(all) {
 		return okResult(callID, "")
 	}
-	return okResult(callID, strings.Join(all[start:end+1], "\n"))
+	return okResult(callID, strings.Join(all[start-1:end], "\n"))
 }
 
 func (t *Toolset) doRecall(ctx context.Context, callID string, in map[string]any) ToolResult {
