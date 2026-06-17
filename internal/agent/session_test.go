@@ -143,3 +143,38 @@ func TestSendCASConflictSurfacesError(t *testing.T) {
 		t.Fatalf("expected ErrCASConflict surfaced, got %v", err)
 	}
 }
+
+func TestSendRecallReadEditChain(t *testing.T) {
+	ctx := context.Background()
+	s, store, _ := sessionFixture(t, []func(Request) Response{
+		func(r Request) Response { // recall
+			return Response{ToolCalls: []ToolCall{{ID: "1", Name: "recall", Input: map[string]any{"query": "resident"}}}}
+		},
+		func(r Request) Response { // read what recall pointed at
+			return Response{ToolCalls: []ToolCall{{ID: "2", Name: "read", Input: map[string]any{"path": "system/about.md"}}}}
+		},
+		func(r Request) Response { // edit based on what it read
+			return Response{ToolCalls: []ToolCall{{ID: "3", Name: "edit", Input: map[string]any{"path": "notes/learned.md", "content": "remembered\n"}}}}
+		},
+		func(r Request) Response { return Response{Text: "done"} },
+	})
+	start := s.Head()
+	out, err := s.Send(ctx, "study and record")
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("final = %q", out)
+	}
+	if s.Head() == start {
+		t.Fatal("HEAD should advance after the edit in the chain")
+	}
+	check := t.TempDir()
+	if err := store.Materialize(ctx, "a1", s.Head(), check); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(check, "notes/learned.md"))
+	if err != nil || string(got) != "remembered\n" {
+		t.Fatalf("chain edit not committed: %q %v", got, err)
+	}
+}
