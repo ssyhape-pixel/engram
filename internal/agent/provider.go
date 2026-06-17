@@ -18,7 +18,7 @@ const (
 type ToolDef struct {
 	Name        string
 	Description string
-	InputSchema map[string]any // JSON Schema for the input object
+	InputSchema map[string]any // JSON Schema object describing the tool's input parameters
 }
 
 // ToolCall is a model-initiated tool invocation.
@@ -35,7 +35,7 @@ type ToolResult struct {
 	IsError bool
 }
 
-// Message is one conversation entry.
+// Message is one conversation entry. Role determines which fields are set: RoleUser/RoleAssistant use Text (assistant may also set ToolCalls); RoleTool uses Results.
 type Message struct {
 	Role      Role
 	Text      string       // user/assistant text

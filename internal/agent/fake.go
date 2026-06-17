@@ -8,6 +8,8 @@ import (
 // FakeProvider returns scripted responses by call index, driving the agent loop
 // deterministically in tests. Each Step receives the Request (so a step can
 // assert on what the loop sent) and returns the Response to hand back.
+//
+// FakeProvider is not safe for concurrent use (test helper).
 type FakeProvider struct {
 	Steps []func(req Request) Response
 	calls int
