@@ -54,20 +54,9 @@ type apiTool struct {
 	InputSchema map[string]any `json:"input_schema"`
 }
 
-type apiBlock struct {
-	Type    string         `json:"type"`
-	Text    string         `json:"text,omitempty"`
-	ID      string         `json:"id,omitempty"`
-	Name    string         `json:"name,omitempty"`
-	Input   map[string]any `json:"input,omitempty"`
-	ToolUse string         `json:"tool_use_id,omitempty"`
-	Content string         `json:"content,omitempty"`
-	IsError bool           `json:"is_error,omitempty"`
-}
-
 type apiMessage struct {
-	Role    string     `json:"role"`
-	Content []apiBlock `json:"content"`
+	Role    string `json:"role"`
+	Content []any  `json:"content"`
 }
 
 type apiRequest struct {
@@ -78,9 +67,22 @@ type apiRequest struct {
 	Tools     []apiTool    `json:"tools,omitempty"`
 }
 
+// apiRespBlock is the response-only content block shape we parse from the API.
+//
+// TODO(task7): the live API may return tool_result content as an array of
+// blocks; validate the real response shape and adjust if needed.
+type apiRespBlock struct {
+	Type  string         `json:"type"`
+	Text  string         `json:"text"`
+	ID    string         `json:"id"`
+	Name  string         `json:"name"`
+	Input map[string]any `json:"input"`
+}
+
+// apiResponse: StopReason is captured but not yet surfaced on Response.
 type apiResponse struct {
-	Content    []apiBlock `json:"content"`
-	StopReason string     `json:"stop_reason"`
+	Content    []apiRespBlock `json:"content"`
+	StopReason string         `json:"stop_reason"`
 }
 
 func toAPIMessages(msgs []Message) []apiMessage {
@@ -88,20 +90,29 @@ func toAPIMessages(msgs []Message) []apiMessage {
 	for _, m := range msgs {
 		switch m.Role {
 		case RoleUser:
-			out = append(out, apiMessage{Role: "user", Content: []apiBlock{{Type: "text", Text: m.Text}}})
+			out = append(out, apiMessage{Role: "user", Content: []any{
+				map[string]any{"type": "text", "text": m.Text},
+			}})
 		case RoleAssistant:
-			var blocks []apiBlock
+			var blocks []any
 			if m.Text != "" {
-				blocks = append(blocks, apiBlock{Type: "text", Text: m.Text})
+				blocks = append(blocks, map[string]any{"type": "text", "text": m.Text})
 			}
 			for _, tc := range m.ToolCalls {
-				blocks = append(blocks, apiBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: tc.Input})
+				input := tc.Input
+				if input == nil {
+					input = map[string]any{} // Anthropic requires input present on tool_use
+				}
+				blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": input})
+			}
+			if len(blocks) == 0 {
+				continue // assistant message must carry >=1 content block
 			}
 			out = append(out, apiMessage{Role: "assistant", Content: blocks})
 		case RoleTool:
-			var blocks []apiBlock
+			var blocks []any
 			for _, r := range m.Results {
-				blocks = append(blocks, apiBlock{Type: "tool_result", ToolUse: r.CallID, Content: r.Content, IsError: r.IsError})
+				blocks = append(blocks, map[string]any{"type": "tool_result", "tool_use_id": r.CallID, "content": r.Content, "is_error": r.IsError})
 			}
 			out = append(out, apiMessage{Role: "user", Content: blocks})
 		}

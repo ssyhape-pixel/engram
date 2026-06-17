@@ -100,3 +100,27 @@ func TestAnthropicNon2xxErrors(t *testing.T) {
 		t.Fatal("expected error on 429")
 	}
 }
+
+func TestAnthropicToolUseAlwaysHasInput(t *testing.T) {
+	var captured map[string]any
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &captured)
+		return jsonResp(200, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`), nil
+	})}
+	p := NewAnthropic("k", WithHTTPClient(client))
+	_, err := p.Generate(context.Background(), Request{Messages: []Message{
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "tu_1", Name: "noargs", Input: nil}}},
+		{Role: RoleTool, Results: []ToolResult{{CallID: "tu_1", Content: "done"}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := captured["messages"].([]any)
+	asst := msgs[0].(map[string]any)
+	blocks := asst["content"].([]any)
+	tu := blocks[0].(map[string]any)
+	if _, ok := tu["input"]; !ok {
+		t.Fatalf("tool_use block must always carry input (even {}): %v", tu)
+	}
+}
