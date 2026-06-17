@@ -39,6 +39,40 @@
 - `system/` 保持小而精（每 turn 入上下文）。recall 不做推理前 top-k 灌入——长尾由模型 mid-loop 拉取。
 - `context.Context` 为所有 I/O 首参；`%w` 包裹错误；小接口、表驱动测试。
 
+## 2.5 架构总览（组件图）
+
+```mermaid
+flowchart TB
+  caller["调用方 / cmd/api"]
+  subgraph L2["L2 — internal/agent + internal/search（本层）"]
+    Router["Router<br/>单写者锁 · 发放/回收 Session"]
+    Session["Session（有状态）<br/>chat history · workdir · HEAD · dirty"]
+    Toolset["Toolset<br/>list · read · recall · edit"]
+    Provider["LLMProvider（接口）"]
+    Fake["FakeProvider<br/>(脚本化, 测试)"]
+    Anthropic["AnthropicProvider<br/>(Messages API)"]
+    Grep["GrepSearch<br/>recall 桩 (绑定 workdir)"]
+  end
+  subgraph L1["L1 — internal/memstore（已合并 main）"]
+    MemStore["MemStore<br/>ResolveHead · Materialize · CommitWithCAS"]
+  end
+  WD[("workdir<br/>物化工作树")]
+  LLM[("LLM / Anthropic API")]
+
+  caller -->|Open / Send / Close| Router
+  Router -->|Open: 取锁 + Materialize| MemStore
+  Router --> Session
+  Session --> Toolset
+  Session -->|Generate| Provider
+  Provider -.实现.-> Fake
+  Provider -.实现.-> Anthropic
+  Anthropic -->|HTTPS tool-use| LLM
+  Toolset -->|recall| Grep
+  Toolset -->|read · edit · list| WD
+  Grep --> WD
+  Session -->|每 turn 若 dirty: CommitWithCAS<br/>入队 reindex/reflect| MemStore
+```
+
 ## 3. 组件设计
 
 ### 3.1 LLMProvider 协议（`internal/agent/provider.go`）
@@ -166,6 +200,47 @@ type Session struct {
 
 `assembleSystem(workdir)`：读 `system/` 下所有文件内容（常驻）+ 遍历全树生成 tree index（path + frontmatter description）。保持 system/ 小。
 
+**Send 一个 turn 的时序：**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as 调用方
+  participant S as Session
+  participant P as LLMProvider
+  participant T as Toolset
+  participant W as workdir
+  participant M as MemStore (L1)
+
+  U->>S: Send(userMessage)
+  S->>S: history += {user, msg}
+  loop 至多 maxSteps
+    S->>S: assembleSystem(workdir) = system/ + tree index
+    S->>P: Generate(System, history, Tools)
+    alt 返回 ToolCalls（未完成）
+      P-->>S: {ToolCalls}
+      S->>S: history += {assistant, toolCalls}
+      loop 每个 ToolCall
+        S->>T: Dispatch(call)
+        T->>W: read / edit / list / recall
+        T-->>S: ToolResult
+      end
+      S->>S: history += {tool, results}；若含 edit ⇒ dirty=true
+    else 返回最终文本（完成）
+      P-->>S: {Text}
+      S->>S: history += {assistant, text}
+      Note over S: 跳出循环
+    end
+  end
+  alt dirty
+    S->>M: CommitWithCAS(agentID, HEAD, workdir, [reindex,reflect])
+    M-->>S: newHEAD（HEAD 推进, dirty=false）
+  else 纯读 turn
+    Note over S,M: 不提交, HEAD 不变
+  end
+  S-->>U: assistant 文本
+```
+
 ### 3.6 Router（`internal/agent/router.go`，单写者）
 
 进程内每 agent 一把锁，保证同一 agent 同时只有一个写者 Session。
@@ -185,6 +260,31 @@ func (r *Router) Open(ctx context.Context, agentID string) (*Session, error)
 - `Open`：尝试取 agent 锁——已被占用 → `ErrAgentBusy`（不阻塞，调用方决定重试/排队）。`ResolveHead` → `Materialize(head, workdir)` → 按该 `workdir` 构造一个 per-session `GrepSearch(workdir)`（见 §3.7）注入工具集 → 构造 Session。`Search` 是 per-session、绑定到当前 agent 活工作树的；Router 不持有全局 Search（L4 换 trigram 时再决定索引的生命周期归属）。
 - `Session.Close()`：释放锁、`os.RemoveAll(workdir)`。
 - L5 注记：多 pod 时锁要换成 sticky 路由 / 分布式协调；CAS 仍是最终兜底。
+
+**单写者准入时序：**
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as 调用方
+  participant R as Router
+  participant M as MemStore
+
+  C->>R: Open(agentID)
+  alt agent 锁空闲
+    R->>R: 取 agent 写锁
+    R->>M: ResolveHead(agentID)
+    M-->>R: HEAD
+    R->>M: Materialize(HEAD, workdir)
+    R->>R: 构造 GrepSearch(workdir) + Toolset
+    R-->>C: *Session
+  else agent 锁被占用
+    R-->>C: ErrAgentBusy（不阻塞）
+  end
+  C->>C: Session.Send(...) 一或多轮
+  C->>R: Session.Close()
+  R->>R: 释放 agent 写锁 + RemoveAll(workdir)
+```
 
 ### 3.7 Search 接口 + grep 桩（`internal/search/`）
 
