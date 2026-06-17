@@ -32,6 +32,7 @@ func (g *GrepSearch) Recall(ctx context.Context, agentID, query string, k int) (
 		if d.IsDir() {
 			return nil
 		}
+		// stop walking once k hits collected (from earlier files)
 		if len(hits) >= k {
 			return filepath.SkipAll
 		}
@@ -39,6 +40,7 @@ func (g *GrepSearch) Recall(ctx context.Context, agentID, query string, k int) (
 		if err != nil {
 			return fmt.Errorf("search: open %s: %w", path, err)
 		}
+		// defer runs when this per-file closure returns, not when Recall returns — fd is closed before the next file opens.
 		defer f.Close()
 		rel, _ := filepath.Rel(g.root, path)
 		sc := bufio.NewScanner(f)
@@ -48,6 +50,7 @@ func (g *GrepSearch) Recall(ctx context.Context, agentID, query string, k int) (
 			text := sc.Text()
 			if strings.Contains(strings.ToLower(text), needle) {
 				hits = append(hits, Hit{Path: rel, LineStart: line, LineEnd: line, Snippet: text})
+				// stop scanning lines in this file
 				if len(hits) >= k {
 					break
 				}
