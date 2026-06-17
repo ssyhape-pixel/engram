@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -42,12 +43,13 @@ func main() {
 	store := memstore.New(objstore.NewLocal(objRoot), refs.New(pool))
 	if _, err := store.CreateAgent(ctx, agentID, map[string]string{
 		"system/about.md": "---\ndescription: who this agent is\n---\nYou are a memory-keeping agent.\n",
-	}); err != nil && err != memstore.ErrAgentAlreadyExists {
+	}); err != nil && !errors.Is(err, memstore.ErrAgentAlreadyExists) {
 		log.Fatalf("create agent: %v", err)
 	}
 
+	providerName := env("ENGRAM_PROVIDER", "fake")
 	var prov agent.LLMProvider
-	switch env("ENGRAM_PROVIDER", "fake") {
+	switch providerName {
 	case "anthropic":
 		key := os.Getenv("ANTHROPIC_API_KEY")
 		if key == "" {
@@ -67,7 +69,7 @@ func main() {
 	}
 	defer sess.Close()
 
-	fmt.Printf("engram session for agent %q (provider=%s). Type a message, Ctrl-D to exit.\n", agentID, env("ENGRAM_PROVIDER", "fake"))
+	fmt.Printf("engram session for agent %q (provider=%s). Type a message, Ctrl-D to exit.\n", agentID, providerName)
 	sc := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("> ")
@@ -80,5 +82,8 @@ func main() {
 			continue
 		}
 		fmt.Printf("%s\n", reply)
+	}
+	if err := sc.Err(); err != nil {
+		log.Printf("stdin: %v", err)
 	}
 }
