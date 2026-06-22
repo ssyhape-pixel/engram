@@ -146,10 +146,14 @@ func (s *Session) assembleSystem(ctx context.Context) (string, error) {
 	if err != nil {
 		return s.buildResident() // cache is an optimization; a key read must not break a turn
 	}
-	sysKey := "sys:" + string(systemSubtree)
+	sysKey := "sys:" + string(systemSubtree) // systemSubtree=="" (no system/ dir) is a valid, stable key
 	sys, ok := s.cache.Get(sysKey)
 	if !ok {
-		sys = s.buildSystemContent()
+		built, berr := s.buildSystemContent()
+		if berr != nil {
+			return "", berr
+		}
+		sys = built
 		s.cache.Put(sysKey, sys)
 	}
 	idxKey := "idx:" + string(rootTree)
@@ -166,35 +170,46 @@ func (s *Session) assembleSystem(ctx context.Context) (string, error) {
 }
 
 func (s *Session) buildResident() (string, error) {
+	sys, err := s.buildSystemContent()
+	if err != nil {
+		return "", err
+	}
 	idx, err := s.buildTreeIndex()
 	if err != nil {
 		return "", err
 	}
-	return s.buildSystemContent() + idx, nil
+	return sys + idx, nil
 }
 
-// buildSystemContent reads all system/ file contents (resident set). system/
-// may not exist yet; per-file read errors are skipped.
-func (s *Session) buildSystemContent() string {
+// buildSystemContent reads all system/ file contents (resident set). An absent
+// system/ dir is tolerated (empty resident set); genuine read errors propagate
+// so we never cache partial content.
+func (s *Session) buildSystemContent() (string, error) {
 	var b strings.Builder
 	b.WriteString("# Resident memory (system/)\n")
 	systemDir := filepath.Join(s.workdir, "system")
-	_ = filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			if errors.Is(err, fs.ErrNotExist) {
+				return fs.SkipAll // no system/ dir yet — fine
+			}
+			return err
 		}
 		if d.IsDir() {
 			return nil
 		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil {
-			return nil
+			return rerr
 		}
 		rel, _ := filepath.Rel(s.workdir, path)
 		fmt.Fprintf(&b, "\n## %s\n%s\n", rel, string(data))
 		return nil
 	})
-	return b.String()
+	if walkErr != nil { // SkipAll resolves to nil, so this is a genuine error
+		return "", fmt.Errorf("agent: read system/: %w", walkErr)
+	}
+	return b.String(), nil
 }
 
 // buildTreeIndex walks the whole tree producing a sorted "path: description"
