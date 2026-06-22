@@ -8,6 +8,7 @@ import (
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/ssy/engram/internal/memstore/objstore"
 )
@@ -92,4 +93,31 @@ func Commit(ctx context.Context, objs objstore.ObjStore, parent string, dir stri
 		return "", fmt.Errorf("gitfs: commit: %w", err)
 	}
 	return h.String(), nil
+}
+
+// TreeKeys returns the root tree hash and the "system" subtree hash for commit.
+// systemSubtree is "" when no system/ directory exists. Both are read from the
+// commit/tree objects in ObjStore (no Postgres). They are immutable cache keys:
+// rootTree changes on any file change; systemSubtree only on system/ changes.
+func TreeKeys(ctx context.Context, objs objstore.ObjStore, commit string) (rootTree, systemSubtree string, err error) {
+	if commit == "" {
+		return "", "", nil
+	}
+	st := NewStorage(ctx, objs)
+	c, err := object.GetCommit(st, plumbing.NewHash(commit))
+	if err != nil {
+		return "", "", fmt.Errorf("gitfs: get commit %s: %w", commit, err)
+	}
+	rootTree = c.TreeHash.String()
+	tree, err := c.Tree()
+	if err != nil {
+		return "", "", fmt.Errorf("gitfs: tree of %s: %w", commit, err)
+	}
+	for _, e := range tree.Entries {
+		if e.Name == "system" && e.Mode == filemode.Dir {
+			systemSubtree = e.Hash.String()
+			break
+		}
+	}
+	return rootTree, systemSubtree, nil
 }

@@ -68,3 +68,88 @@ func TestSecondCommitHasParentAndDiff(t *testing.T) {
 		t.Fatalf("h2 content = %q", got)
 	}
 }
+
+func TestTreeKeysGranularity(t *testing.T) {
+	ctx := context.Background()
+	objs := objstore.NewLocal(t.TempDir())
+	write := func(dir, rel, content string) {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wA := t.TempDir()
+	write(wA, "system/about.md", "a\n")
+	write(wA, "notes/x.md", "x\n")
+	hA, err := Commit(ctx, objs, "", wA, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wB := t.TempDir()
+	if err := Materialize(ctx, objs, hA, wB); err != nil {
+		t.Fatal(err)
+	}
+	write(wB, "notes/x.md", "x2\n")
+	hB, err := Commit(ctx, objs, hA, wB, "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wC := t.TempDir()
+	if err := Materialize(ctx, objs, hA, wC); err != nil {
+		t.Fatal(err)
+	}
+	write(wC, "system/about.md", "a2\n")
+	hC, err := Commit(ctx, objs, hA, wC, "C")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rA, sA, err := TreeKeys(ctx, objs, hA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rB, sB, _ := TreeKeys(ctx, objs, hB)
+	_, sC, _ := TreeKeys(ctx, objs, hC)
+
+	if sA == "" {
+		t.Fatal("systemSubtree should be non-empty when system/ exists")
+	}
+	if rA == rB {
+		t.Fatal("root tree must change when notes/ changes")
+	}
+	if sA != sB {
+		t.Fatal("system subtree must NOT change when only notes/ changes")
+	}
+	if sA == sC {
+		t.Fatal("system subtree must change when system/ changes")
+	}
+}
+
+func TestTreeKeysNoSystemDir(t *testing.T) {
+	ctx := context.Background()
+	objs := objstore.NewLocal(t.TempDir())
+	w := t.TempDir()
+	if err := os.WriteFile(filepath.Join(w, "loose.md"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Commit(ctx, objs, "", w, "init")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, sys, err := TreeKeys(ctx, objs, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root == "" {
+		t.Fatal("root tree should be non-empty")
+	}
+	if sys != "" {
+		t.Fatalf("systemSubtree should be empty without system/, got %q", sys)
+	}
+}

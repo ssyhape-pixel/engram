@@ -34,6 +34,7 @@ type MemStore interface {
 	ResolveHead(ctx context.Context, agentID string) (CommitHash, error)
 	Materialize(ctx context.Context, agentID string, at CommitHash, dir string) error
 	CommitWithCAS(ctx context.Context, agentID string, parent CommitHash, dir string, jobs []Job) (CommitHash, error)
+	TreeKeys(ctx context.Context, at CommitHash) (rootTree, systemSubtree CommitHash, err error)
 }
 
 type Store struct {
@@ -65,6 +66,13 @@ func (s *Store) CommitWithCAS(ctx context.Context, agentID string, parent Commit
 		return "", err // ErrCASConflict propagates as-is
 	}
 	return CommitHash(newHash), nil
+}
+
+// TreeKeys returns the root tree hash and the "system" subtree hash for a
+// commit. Both are immutable cache keys read directly from objects (no Postgres).
+func (s *Store) TreeKeys(ctx context.Context, at CommitHash) (CommitHash, CommitHash, error) {
+	root, sys, err := gitfs.TreeKeys(ctx, s.objs, string(at))
+	return CommitHash(root), CommitHash(sys), err
 }
 
 // CreateAgent seeds an agent's initial commit from `seed` (path->content) and
