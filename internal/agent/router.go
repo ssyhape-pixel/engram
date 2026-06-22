@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ssy/engram/internal/cache"
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/search"
 )
@@ -22,14 +23,15 @@ type Router struct {
 	store   memstore.MemStore
 	prov    LLMProvider
 	scratch string
+	cache   cache.Cache
 
 	mu     sync.Mutex
 	active map[string]bool
 }
 
 // NewRouter creates a Router that materializes session worktrees under scratch.
-func NewRouter(store memstore.MemStore, prov LLMProvider, scratch string) *Router {
-	return &Router{store: store, prov: prov, scratch: scratch, active: map[string]bool{}}
+func NewRouter(store memstore.MemStore, prov LLMProvider, scratch string, c cache.Cache) *Router {
+	return &Router{store: store, prov: prov, scratch: scratch, cache: c, active: map[string]bool{}}
 }
 
 // claim marks agentID as active. Returns false if already claimed.
@@ -86,5 +88,5 @@ func (r *Router) Open(ctx context.Context, agentID string) (*Session, error) {
 			r.free(agentID)
 		})
 	}
-	return NewSession(r.store, r.prov, tools, agentID, head, workdir, release, nil), nil
+	return NewSession(r.store, r.prov, tools, agentID, head, workdir, release, r.cache), nil
 }

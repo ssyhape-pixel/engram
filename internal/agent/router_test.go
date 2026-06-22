@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ssy/engram/internal/cache"
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/memstore/objstore"
 	"github.com/ssy/engram/internal/memstore/refs"
@@ -36,7 +37,7 @@ func routerFixture(t *testing.T) (*Router, *memstore.Store) {
 		t.Fatalf("create agent: %v", err)
 	}
 	prov := &FakeProvider{Steps: []func(Request) Response{func(r Request) Response { return Response{Text: "ok"} }}}
-	return NewRouter(store, prov, t.TempDir()), store
+	return NewRouter(store, prov, t.TempDir(), cache.NewLRU(8)), store
 }
 
 func TestRouterOpenMaterializesWorkdir(t *testing.T) {
@@ -108,5 +109,18 @@ func TestRouterDoubleCloseIsSafe(t *testing.T) {
 	_ = s1.Close()
 	if _, err := r.Open(ctx, "a1"); !errors.Is(err, ErrAgentBusy) {
 		t.Fatalf("stale double-Close freed the live session's claim: got %v want ErrAgentBusy", err)
+	}
+}
+
+func TestRouterInjectsCacheIntoSession(t *testing.T) {
+	ctx := context.Background()
+	r, _ := routerFixture(t)
+	s, err := r.Open(ctx, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.cache == nil {
+		t.Fatal("Router.Open must inject the shared cache into the Session")
 	}
 }
