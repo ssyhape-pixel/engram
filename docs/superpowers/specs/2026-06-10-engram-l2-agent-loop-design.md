@@ -309,7 +309,8 @@ dev 装配 + 手动跑 turn 的最小入口：
 ## 4. 错误处理
 
 - 所有 I/O `%w` 包裹，`context.Context` 首参。
-- `ErrCASConflict`（单写者下罕见）：Session 在 commit 处捕获 → `ResolveHead` 重解析 + `Materialize` 重新物化 workdir → **重放本轮的 edit**？不可行（edit 已写入旧 workdir）。L2 策略：重新物化后，把本轮 dirty 文件从旧 workdir 拷贝覆盖到新 workdir，再次 `CommitWithCAS`；仍冲突则返回错误交调用方。单写者下基本不触发，保持实现简单、有界重试（如 1 次）。
+- `ErrCASConflict`：在单写者模型（Router 锁）下，对同一 agent 的并发提交**不可能**发生，因此一旦 commit 时遇到 CAS 冲突，意味着单写者不变量被破坏（如有进程外/旁路写入）。Session **不重试、不静默覆盖**（覆盖会丢失对方写入，违反"无有损合并"），而是把它包成错误向上抛出（保留 `errors.Is(err, ErrCASConflict)`），让上层把破坏的不变量暴露出来。真正的多写者协调（sticky 路由/重放/合并）是 L5 的事。
+- Send 失败回滚：若一轮在产生任何 assistant 响应之前出错（assembleSystem / Generate / 超出 maxSteps），把本轮已 append 的消息回滚到调用前，避免会话残留"悬空的 user 消息"。commit 阶段失败则保留本轮历史并保持 `dirty=true`（下一轮可重提交）。
 - `ErrAgentBusy`：Router.Open 在锁被占用时返回，调用方自行处理。
 - `maxSteps` 超限：返回 error，避免失控 tool-use 循环消耗 token。
 - AnthropicProvider：HTTP 非 2xx / 解析失败 → 包裹错误返回；不在库层重试（交调用方/上层）。
