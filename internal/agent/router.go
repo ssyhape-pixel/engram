@@ -86,5 +86,5 @@ func (r *Router) Open(ctx context.Context, agentID string) (*Session, error) {
 			r.free(agentID)
 		})
 	}
-	return NewSession(r.store, r.prov, tools, agentID, head, workdir, release), nil
+	return NewSession(r.store, r.prov, tools, agentID, head, workdir, release, nil), nil
 }

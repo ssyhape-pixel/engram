@@ -43,7 +43,7 @@ func sessionFixture(t *testing.T, steps []func(Request) Response) (*Session, *me
 		t.Fatalf("materialize: %v", err)
 	}
 	tools := NewToolset(workdir, "a1", search.NewGrep(workdir))
-	s := NewSession(store, &FakeProvider{Steps: steps}, tools, "a1", head, workdir, nil)
+	s := NewSession(store, &FakeProvider{Steps: steps}, tools, "a1", head, workdir, nil, nil)
 	return s, store, workdir
 }
 
