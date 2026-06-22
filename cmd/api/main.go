@@ -17,6 +17,7 @@ import (
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/memstore/objstore"
 	"github.com/ssy/engram/internal/memstore/refs"
+	"github.com/ssy/engram/internal/search"
 )
 
 func env(key, def string) string {
@@ -63,7 +64,19 @@ func main() {
 		}}
 	}
 
-	router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024))
+	var emb search.Embedder
+	switch env("ENGRAM_EMBEDDER", "fake") {
+	case "voyage":
+		vkey := os.Getenv("VOYAGE_API_KEY")
+		if vkey == "" {
+			log.Fatal("ENGRAM_EMBEDDER=voyage requires VOYAGE_API_KEY")
+		}
+		emb = search.NewVoyage(vkey)
+	default:
+		emb = search.NewFakeEmbedder(256)
+	}
+
+	router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024), emb)
 	sess, err := router.Open(ctx, agentID)
 	if err != nil {
 		log.Fatalf("open session: %v", err)

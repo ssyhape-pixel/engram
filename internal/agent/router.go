@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -24,14 +26,15 @@ type Router struct {
 	prov    LLMProvider
 	scratch string
 	cache   cache.Cache
+	emb     search.Embedder
 
 	mu     sync.Mutex
 	active map[string]bool
 }
 
 // NewRouter creates a Router that materializes session worktrees under scratch.
-func NewRouter(store memstore.MemStore, prov LLMProvider, scratch string, c cache.Cache) *Router {
-	return &Router{store: store, prov: prov, scratch: scratch, cache: c, active: map[string]bool{}}
+func NewRouter(store memstore.MemStore, prov LLMProvider, scratch string, c cache.Cache, emb search.Embedder) *Router {
+	return &Router{store: store, prov: prov, scratch: scratch, cache: c, emb: emb, active: map[string]bool{}}
 }
 
 // claim marks agentID as active. Returns false if already claimed.
@@ -50,6 +53,31 @@ func (r *Router) free(agentID string) {
 	r.mu.Lock()
 	delete(r.active, agentID)
 	r.mu.Unlock()
+}
+
+// readWorkdirFiles loads every file under root into a path->bytes map (paths
+// relative to root) for index construction.
+func readWorkdirFiles(root string) (map[string][]byte, error) {
+	files := map[string][]byte{}
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		rel, _ := filepath.Rel(root, path)
+		files[rel] = data
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("agent: read workdir: %w", err)
+	}
+	return files, nil
 }
 
 // Open acquires the agent's writer slot, materializes HEAD into a fresh workdir,
@@ -78,7 +106,13 @@ func (r *Router) Open(ctx context.Context, agentID string) (*Session, error) {
 		r.free(agentID)
 		return nil, fmt.Errorf("agent: materialize: %w", err)
 	}
-	tools := NewToolset(workdir, agentID, search.NewGrep(workdir))
+	files, err := readWorkdirFiles(workdir)
+	if err != nil {
+		os.RemoveAll(workdir)
+		r.free(agentID)
+		return nil, err
+	}
+	tools := NewToolset(workdir, agentID, search.NewHybrid(ctx, r.emb, r.cache, files))
 	// sync.Once makes release idempotent: a double Close (e.g. defer + explicit)
 	// must not free a claim a *different* session may have re-acquired in between.
 	var once sync.Once
