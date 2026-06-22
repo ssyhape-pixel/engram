@@ -41,6 +41,7 @@ func BuildTrigram(files map[string][]byte) *TrigramIndex {
 	idx := &TrigramIndex{postings: map[string][]posting{}, lines: map[string][]string{}}
 	for path, content := range files {
 		ls := strings.Split(string(content), "\n")
+		// lines retains original-case text for snippets; trigrams() lowercases for indexing/matching.
 		idx.lines[path] = ls
 		for i, line := range ls {
 			for _, tg := range trigrams(line) {
@@ -107,9 +108,12 @@ func (t *TrigramIndex) Search(query string, k int) []Hit {
 	if k <= 0 {
 		k = 8
 	}
+	if query == "" {
+		return nil
+	}
 	q := strings.ToLower(query)
 	var matches []posting
-	for p := range t.candidates(query) {
+	for p := range t.candidates(q) {
 		if strings.Contains(strings.ToLower(t.lineText(p.path, p.line)), q) {
 			matches = append(matches, p)
 		}
