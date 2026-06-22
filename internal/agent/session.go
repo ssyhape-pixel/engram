@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ssy/engram/internal/cache"
 	"github.com/ssy/engram/internal/memstore"
 )
 
@@ -28,12 +29,14 @@ type Session struct {
 	history  []Message
 	dirty    bool
 	maxSteps int
-	release  func() // called by Close; nil for direct (test) construction
+	release  func()      // called by Close; nil for direct (test) construction
+	cache    cache.Cache // nil => always recompute (L2 behavior)
 }
 
 // NewSession wires a session. release (may be nil) is invoked by Close to free
-// the writer lock and clean the workdir; the Router supplies it.
-func NewSession(store memstore.MemStore, prov LLMProvider, tools *Toolset, agentID string, head memstore.CommitHash, workdir string, release func()) *Session {
+// the writer lock and clean the workdir; the Router supplies it. c (may be nil)
+// is the SHA-keyed read cache; nil disables caching (L2 behaviour).
+func NewSession(store memstore.MemStore, prov LLMProvider, tools *Toolset, agentID string, head memstore.CommitHash, workdir string, release func(), c cache.Cache) *Session {
 	return &Session{
 		agentID:  agentID,
 		store:    store,
@@ -43,6 +46,7 @@ func NewSession(store memstore.MemStore, prov LLMProvider, tools *Toolset, agent
 		workdir:  workdir,
 		maxSteps: defaultMaxSteps,
 		release:  release,
+		cache:    c,
 	}
 }
 
@@ -72,7 +76,7 @@ func (s *Session) Send(ctx context.Context, userMessage string) (string, error) 
 
 	final := ""
 	for step := 0; step < s.maxSteps; step++ {
-		sys, err := s.assembleSystem()
+		sys, err := s.assembleSystem(ctx)
 		if err != nil {
 			s.history = s.history[:base]
 			return "", fmt.Errorf("agent: assemble system: %w", err)
@@ -130,28 +134,88 @@ func (s *Session) commit(ctx context.Context) error {
 	return nil
 }
 
-// assembleSystem builds the resident system prompt: all system/ file contents
-// plus a tree index (path: description) of the whole memory tree.
-func (s *Session) assembleSystem() (string, error) {
+// assembleSystem returns the resident system prompt (system/ contents + tree
+// index). When the workdir is clean (== HEAD) and a cache is present, it serves
+// the two pieces from the cache keyed by their immutable tree hashes; when dirty
+// (uncommitted edits) or cache==nil it recomputes from the workdir.
+func (s *Session) assembleSystem(ctx context.Context) (string, error) {
+	if s.cache == nil || s.dirty {
+		return s.buildResident()
+	}
+	rootTree, systemSubtree, err := s.store.TreeKeys(ctx, s.head)
+	if err != nil {
+		return s.buildResident() // cache is an optimization; a key read must not break a turn
+	}
+	sysKey := "sys:" + string(systemSubtree) // systemSubtree=="" (no system/ dir) is a valid, stable key
+	sys, ok := s.cache.Get(sysKey)
+	if !ok {
+		built, berr := s.buildSystemContent()
+		if berr != nil {
+			return "", berr
+		}
+		sys = built
+		s.cache.Put(sysKey, sys)
+	}
+	idxKey := "idx:" + string(rootTree)
+	idx, ok := s.cache.Get(idxKey)
+	if !ok {
+		built, berr := s.buildTreeIndex()
+		if berr != nil {
+			return "", berr
+		}
+		idx = built
+		s.cache.Put(idxKey, idx)
+	}
+	return sys + idx, nil
+}
+
+func (s *Session) buildResident() (string, error) {
+	sys, err := s.buildSystemContent()
+	if err != nil {
+		return "", err
+	}
+	idx, err := s.buildTreeIndex()
+	if err != nil {
+		return "", err
+	}
+	return sys + idx, nil
+}
+
+// buildSystemContent reads all system/ file contents (resident set). An absent
+// system/ dir is tolerated (empty resident set); genuine read errors propagate
+// so we never cache partial content.
+func (s *Session) buildSystemContent() (string, error) {
 	var b strings.Builder
 	b.WriteString("# Resident memory (system/)\n")
 	systemDir := filepath.Join(s.workdir, "system")
-	_ = filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // system/ may not exist yet
+			if errors.Is(err, fs.ErrNotExist) {
+				return fs.SkipAll // no system/ dir yet — fine
+			}
+			return err
 		}
 		if d.IsDir() {
 			return nil
 		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil {
-			return nil
+			return rerr
 		}
 		rel, _ := filepath.Rel(s.workdir, path)
 		fmt.Fprintf(&b, "\n## %s\n%s\n", rel, string(data))
 		return nil
 	})
+	if walkErr != nil { // SkipAll resolves to nil, so this is a genuine error
+		return "", fmt.Errorf("agent: read system/: %w", walkErr)
+	}
+	return b.String(), nil
+}
 
+// buildTreeIndex walks the whole tree producing a sorted "path: description"
+// index from each file's frontmatter.
+func (s *Session) buildTreeIndex() (string, error) {
+	var b strings.Builder
 	b.WriteString("\n# Memory tree index (path: description)\n")
 	var idx []string
 	err := filepath.WalkDir(s.workdir, func(path string, d fs.DirEntry, err error) error {

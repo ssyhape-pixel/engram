@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ssy/engram/internal/agent"
+	"github.com/ssy/engram/internal/cache"
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/memstore/objstore"
 	"github.com/ssy/engram/internal/memstore/refs"
@@ -62,7 +63,7 @@ func main() {
 		}}
 	}
 
-	router := agent.NewRouter(store, prov, os.TempDir())
+	router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024))
 	sess, err := router.Open(ctx, agentID)
 	if err != nil {
 		log.Fatalf("open session: %v", err)
