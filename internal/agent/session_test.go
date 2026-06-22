@@ -14,7 +14,9 @@ import (
 	"github.com/ssy/engram/internal/search"
 )
 
-func sessionFixture(t *testing.T, steps []func(Request) Response) (*Session, *memstore.Store, string) {
+const sessTag = "sess"
+
+func sessionFixture(t *testing.T, steps []func(Request) Response) (*Session, *memstore.Store, string, string) {
 	t.Helper()
 	dsn := os.Getenv("ENGRAM_TEST_DB")
 	if dsn == "" {
@@ -28,28 +30,32 @@ func sessionFixture(t *testing.T, steps []func(Request) Response) (*Session, *me
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor"); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
+	agentID := sessTag + ":" + t.Name()
+	// LIFO: pool.Close runs last, DELETE cleanup runs first (pool still open).
 	t.Cleanup(func() { pool.Close() })
+	t.Cleanup(func() {
+		for _, tbl := range []string{"memory_jobs", "agent_refs", "maintenance_cursor"} {
+			pool.Exec(ctx, "DELETE FROM "+tbl+" WHERE agent_id=$1", agentID)
+		}
+	})
 
 	store := memstore.New(objstore.NewLocal(t.TempDir()), refs.New(pool))
-	head, err := store.CreateAgent(ctx, "a1", map[string]string{"system/about.md": "---\ndescription: who\n---\nresident\n"})
+	head, err := store.CreateAgent(ctx, agentID, map[string]string{"system/about.md": "---\ndescription: who\n---\nresident\n"})
 	if err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	workdir := t.TempDir()
-	if err := store.Materialize(ctx, "a1", head, workdir); err != nil {
+	if err := store.Materialize(ctx, agentID, head, workdir); err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
-	tools := NewToolset(workdir, "a1", search.NewGrep(workdir))
-	s := NewSession(store, &FakeProvider{Steps: steps}, tools, "a1", head, workdir, nil, nil)
-	return s, store, workdir
+	tools := NewToolset(workdir, agentID, search.NewGrep(workdir))
+	s := NewSession(store, &FakeProvider{Steps: steps}, tools, agentID, head, workdir, nil, nil)
+	return s, store, workdir, agentID
 }
 
 func TestSendEditCommitsAndAdvancesHead(t *testing.T) {
 	ctx := context.Background()
-	s, store, _ := sessionFixture(t, []func(Request) Response{
+	s, store, _, agentID := sessionFixture(t, []func(Request) Response{
 		func(r Request) Response {
 			return Response{ToolCalls: []ToolCall{{ID: "1", Name: "edit", Input: map[string]any{"path": "note.md", "content": "hello\n"}}}}
 		},
@@ -68,7 +74,7 @@ func TestSendEditCommitsAndAdvancesHead(t *testing.T) {
 		t.Fatal("HEAD did not advance after an edit")
 	}
 	check := t.TempDir()
-	if err := store.Materialize(ctx, "a1", s.Head(), check); err != nil {
+	if err := store.Materialize(ctx, agentID, s.Head(), check); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(check, "note.md"))
@@ -79,7 +85,7 @@ func TestSendEditCommitsAndAdvancesHead(t *testing.T) {
 
 func TestSendReadOnlyDoesNotCommit(t *testing.T) {
 	ctx := context.Background()
-	s, _, _ := sessionFixture(t, []func(Request) Response{
+	s, _, _, _ := sessionFixture(t, []func(Request) Response{
 		func(r Request) Response {
 			return Response{ToolCalls: []ToolCall{{ID: "1", Name: "read", Input: map[string]any{"path": "system/about.md"}}}}
 		},
@@ -97,7 +103,7 @@ func TestSendReadOnlyDoesNotCommit(t *testing.T) {
 func TestSendMultiTurnAccumulatesHistory(t *testing.T) {
 	ctx := context.Background()
 	turn2SawHistory := false
-	s, _, _ := sessionFixture(t, []func(Request) Response{
+	s, _, _, _ := sessionFixture(t, []func(Request) Response{
 		func(r Request) Response { return Response{Text: "hi"} },
 		func(r Request) Response {
 			if len(r.Messages) >= 3 {
@@ -122,20 +128,20 @@ func TestSendMultiTurnAccumulatesHistory(t *testing.T) {
 
 func TestSendCASConflictSurfacesError(t *testing.T) {
 	ctx := context.Background()
-	s, store, _ := sessionFixture(t, []func(Request) Response{
+	s, store, _, agentID := sessionFixture(t, []func(Request) Response{
 		func(r Request) Response {
 			return Response{ToolCalls: []ToolCall{{ID: "1", Name: "edit", Input: map[string]any{"path": "n.md", "content": "v\n"}}}}
 		},
 		func(r Request) Response { return Response{Text: "ok"} },
 	})
 	other := t.TempDir()
-	if err := store.Materialize(ctx, "a1", s.Head(), other); err != nil {
+	if err := store.Materialize(ctx, agentID, s.Head(), other); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(other, "external.md"), []byte("x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CommitWithCAS(ctx, "a1", s.Head(), other, nil); err != nil {
+	if _, err := store.CommitWithCAS(ctx, agentID, s.Head(), other, nil); err != nil {
 		t.Fatalf("external commit: %v", err)
 	}
 	_, err := s.Send(ctx, "save")
@@ -146,7 +152,7 @@ func TestSendCASConflictSurfacesError(t *testing.T) {
 
 func TestSendRecallReadEditChain(t *testing.T) {
 	ctx := context.Background()
-	s, store, _ := sessionFixture(t, []func(Request) Response{
+	s, store, _, agentID := sessionFixture(t, []func(Request) Response{
 		func(r Request) Response { // recall
 			return Response{ToolCalls: []ToolCall{{ID: "1", Name: "recall", Input: map[string]any{"query": "resident"}}}}
 		},
@@ -170,7 +176,7 @@ func TestSendRecallReadEditChain(t *testing.T) {
 		t.Fatal("HEAD should advance after the edit in the chain")
 	}
 	check := t.TempDir()
-	if err := store.Materialize(ctx, "a1", s.Head(), check); err != nil {
+	if err := store.Materialize(ctx, agentID, s.Head(), check); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(check, "notes/learned.md"))

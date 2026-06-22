@@ -9,7 +9,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func testPool(t *testing.T) *pgxpool.Pool {
+const refsTag = "refs"
+
+func testPool(t *testing.T) (*pgxpool.Pool, string) {
 	t.Helper()
 	dsn := os.Getenv("ENGRAM_TEST_DB")
 	if dsn == "" {
@@ -23,25 +25,25 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
+	agentID := refsTag + ":" + t.Name()
+	// LIFO: pool.Close runs last, DELETE cleanup runs first (pool still open).
+	t.Cleanup(func() { pool.Close() })
 	t.Cleanup(func() {
-		if _, err := pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor"); err != nil {
-			t.Fatalf("truncate: %v", err)
+		for _, tbl := range []string{"memory_jobs", "agent_refs", "maintenance_cursor"} {
+			pool.Exec(ctx, "DELETE FROM "+tbl+" WHERE agent_id=$1", agentID)
 		}
-		pool.Close()
 	})
-	if _, err := pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor"); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
-	return pool
+	return pool, agentID
 }
 
 func TestBootstrapAndResolve(t *testing.T) {
 	ctx := context.Background()
-	r := New(testPool(t))
-	if err := r.Bootstrap(ctx, "a1", "deadbeef"); err != nil {
+	pool, agentID := testPool(t)
+	r := New(pool)
+	if err := r.Bootstrap(ctx, agentID, "deadbeef"); err != nil {
 		t.Fatal(err)
 	}
-	h, err := r.ResolveHead(ctx, "a1")
+	h, err := r.ResolveHead(ctx, agentID)
 	if err != nil || h != "deadbeef" {
 		t.Fatalf("resolve = %q,%v", h, err)
 	}
@@ -49,7 +51,8 @@ func TestBootstrapAndResolve(t *testing.T) {
 
 func TestResolveUnknownAgent(t *testing.T) {
 	ctx := context.Background()
-	r := New(testPool(t))
+	pool, _ := testPool(t)
+	r := New(pool)
 	_, err := r.ResolveHead(ctx, "ghost")
 	if !errors.Is(err, ErrAgentNotFound) {
 		t.Fatalf("err = %v want ErrAgentNotFound", err)
@@ -58,18 +61,18 @@ func TestResolveUnknownAgent(t *testing.T) {
 
 func TestCASSuccessAndEnqueue(t *testing.T) {
 	ctx := context.Background()
-	pool := testPool(t)
+	pool, agentID := testPool(t)
 	r := New(pool)
-	r.Bootstrap(ctx, "a1", "p0")
-	if err := r.CommitRef(ctx, "a1", "p0", "p1", []Job{{Kind: "reindex"}}); err != nil {
+	r.Bootstrap(ctx, agentID, "p0")
+	if err := r.CommitRef(ctx, agentID, "p0", "p1", []Job{{Kind: "reindex"}}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	h, _ := r.ResolveHead(ctx, "a1")
+	h, _ := r.ResolveHead(ctx, agentID)
 	if h != "p1" {
 		t.Fatalf("head = %q want p1", h)
 	}
 	var n int
-	pool.QueryRow(ctx, "SELECT count(*) FROM memory_jobs WHERE agent_id='a1' AND kind='reindex'").Scan(&n)
+	pool.QueryRow(ctx, "SELECT count(*) FROM memory_jobs WHERE agent_id=$1 AND kind='reindex'", agentID).Scan(&n)
 	if n != 1 {
 		t.Fatalf("jobs = %d want 1", n)
 	}
@@ -77,18 +80,19 @@ func TestCASSuccessAndEnqueue(t *testing.T) {
 
 func TestCASConflict(t *testing.T) {
 	ctx := context.Background()
-	r := New(testPool(t))
-	r.Bootstrap(ctx, "a1", "p0")
-	if err := r.CommitRef(ctx, "a1", "p0", "p1", nil); err != nil {
+	pool, agentID := testPool(t)
+	r := New(pool)
+	r.Bootstrap(ctx, agentID, "p0")
+	if err := r.CommitRef(ctx, agentID, "p0", "p1", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Stale parent p0 -> conflict, and must NOT enqueue.
-	err := r.CommitRef(ctx, "a1", "p0", "pX", []Job{{Kind: "reindex"}})
+	err := r.CommitRef(ctx, agentID, "p0", "pX", []Job{{Kind: "reindex"}})
 	if !errors.Is(err, ErrCASConflict) {
 		t.Fatalf("err = %v want ErrCASConflict", err)
 	}
 	var cnt int
-	r.pool.QueryRow(ctx, "SELECT count(*) FROM memory_jobs").Scan(&cnt)
+	r.pool.QueryRow(ctx, "SELECT count(*) FROM memory_jobs WHERE agent_id=$1", agentID).Scan(&cnt)
 	if cnt != 0 {
 		t.Fatalf("conflicting commit must not enqueue; jobs=%d", cnt)
 	}
