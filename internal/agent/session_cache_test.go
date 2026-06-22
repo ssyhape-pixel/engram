@@ -27,7 +27,7 @@ var _ cache.Cache = (*spyCache)(nil)
 
 // residentSession builds a Session over a real committed tree WITHOUT Postgres
 // (refs nil; only assembleSystem/TreeKeys are exercised — object reads only).
-func residentSession(t *testing.T, c cache.Cache) *Session {
+func residentSession(t *testing.T, c cache.Cache) (*Session, objstore.ObjStore) {
 	t.Helper()
 	ctx := context.Background()
 	objs := objstore.NewLocal(t.TempDir())
@@ -53,13 +53,13 @@ func residentSession(t *testing.T, c cache.Cache) *Session {
 	}
 	store := memstore.New(objs, nil)
 	tools := NewToolset(workdir, "a1", search.NewGrep(workdir))
-	return NewSession(store, &FakeProvider{}, tools, "a1", memstore.CommitHash(head), workdir, nil, c)
+	return NewSession(store, &FakeProvider{}, tools, "a1", memstore.CommitHash(head), workdir, nil, c), objs
 }
 
 func TestAssembleSystemReusesCacheWhenClean(t *testing.T) {
 	ctx := context.Background()
 	spy := newSpyCache()
-	s := residentSession(t, spy)
+	s, _ := residentSession(t, spy)
 
 	out1, err := s.assembleSystem(ctx)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestAssembleSystemReusesCacheWhenClean(t *testing.T) {
 func TestAssembleSystemBypassesCacheWhenDirty(t *testing.T) {
 	ctx := context.Background()
 	spy := newSpyCache()
-	s := residentSession(t, spy)
+	s, _ := residentSession(t, spy)
 	s.dirty = true
 
 	out, err := s.assembleSystem(ctx)
@@ -103,12 +103,47 @@ func TestAssembleSystemBypassesCacheWhenDirty(t *testing.T) {
 
 func TestAssembleSystemNilCacheRecomputes(t *testing.T) {
 	ctx := context.Background()
-	s := residentSession(t, nil)
+	s, _ := residentSession(t, nil)
 	out, err := s.assembleSystem(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "resident") || !strings.Contains(out, "a note") {
 		t.Fatalf("nil-cache output missing content:\n%s", out)
+	}
+}
+
+func TestAssembleSystemReusesSystemAcrossNonSystemCommit(t *testing.T) {
+	ctx := context.Background()
+	spy := newSpyCache()
+	s, objs := residentSession(t, spy)
+
+	// First turn at HEAD A: builds + caches both sys: and idx:.
+	if _, err := s.assembleSystem(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if spy.puts != 2 {
+		t.Fatalf("after first build want 2 puts (sys+idx), got %d", spy.puts)
+	}
+
+	// Simulate a notes-only commit advancing HEAD, with the workdir updated in
+	// place (as a real turn would leave it after committing). system/ untouched.
+	notes := filepath.Join(s.workdir, "notes", "n.md")
+	if err := os.WriteFile(notes, []byte("---\ndescription: a note\n---\nCHANGED body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newHead, err := gitfs.Commit(ctx, objs, string(s.head), s.workdir, "notes edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.head = memstore.CommitHash(newHead)
+
+	// Second turn at HEAD B (clean): root tree changed (idx busts -> rebuild),
+	// but system/ subtree hash is unchanged (sys hits -> no rebuild).
+	if _, err := s.assembleSystem(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if spy.puts != 3 {
+		t.Fatalf("notes-only commit should rebuild only idx (want 3 total puts: sys x1, idx x2), got %d", spy.puts)
 	}
 }
