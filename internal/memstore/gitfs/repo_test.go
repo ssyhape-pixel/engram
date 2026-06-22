@@ -114,8 +114,14 @@ func TestTreeKeysGranularity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rB, sB, _ := TreeKeys(ctx, objs, hB)
-	_, sC, _ := TreeKeys(ctx, objs, hC)
+	rB, sB, err := TreeKeys(ctx, objs, hB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sC, err := TreeKeys(ctx, objs, hC)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if sA == "" {
 		t.Fatal("systemSubtree should be non-empty when system/ exists")
