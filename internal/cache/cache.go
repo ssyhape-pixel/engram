@@ -21,6 +21,7 @@ type entry struct{ key, val string }
 
 // LRU is a size-bounded (by entry count), mutex-guarded Cache.
 type LRU struct {
+	// A single Mutex guards all access: Get also mutates the recency list (MoveToFront), so RWMutex's read lock would be unsafe.
 	mu         sync.Mutex
 	maxEntries int
 	ll         *list.List // front = most-recently-used
@@ -52,6 +53,7 @@ func (l *LRU) Put(key, val string) {
 	if el, ok := l.items[key]; ok {
 		l.ll.MoveToFront(el)
 		el.Value.(*entry).val = val
+		// entry count unchanged, so no eviction needed
 		return
 	}
 	el := l.ll.PushFront(&entry{key: key, val: val})
