@@ -61,7 +61,7 @@ func firstNonEmptyLine(text string) string {
 }
 
 func embKey(model, text string) string {
-	sum := sha256.Sum256([]byte(model + "\n" + text))
+	sum := sha256.Sum256([]byte(text))
 	return "emb:" + model + ":" + base64.RawStdEncoding.EncodeToString(sum[:])
 }
 
@@ -169,13 +169,15 @@ func (s *SemanticIndex) Search(ctx context.Context, query string, k int) ([]Hit,
 		return nil, fmt.Errorf("search: embed query returned %d vectors", len(qv))
 	}
 	q := qv[0]
+	scores := make([]float64, len(s.chunks))
+	for i := range s.chunks {
+		scores[i] = cosine(q, s.chunks[i].vec)
+	}
 	idxs := make([]int, len(s.chunks))
 	for i := range s.chunks {
 		idxs[i] = i
 	}
-	sort.SliceStable(idxs, func(i, j int) bool {
-		return cosine(q, s.chunks[idxs[i]].vec) > cosine(q, s.chunks[idxs[j]].vec)
-	})
+	sort.SliceStable(idxs, func(i, j int) bool { return scores[idxs[i]] > scores[idxs[j]] })
 	var hits []Hit
 	for _, ci := range idxs {
 		if len(hits) >= k {
