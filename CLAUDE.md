@@ -65,18 +65,31 @@ go.mod
 
 ## Build / test / run
 
-> Not scaffolded yet — fill these in as the project takes shape, and keep them current.
+> Status: L1 (MemStore core) + L2 (agent loop + Session) are implemented and merged. `cmd/maintenance` is not built yet (L5).
 
 ```
 # build
 go build ./...
-# test
-go test ./...
-# run the request-path API (dev)
-go run ./cmd/api
-# run the maintenance worker (dev)
-go run ./cmd/maintenance
+
+# Postgres-dependent tests (refs / memstore / agent) need a DB. Start one:
+docker run --rm -d --name engram-pg -e POSTGRES_PASSWORD=engram -e POSTGRES_DB=engram -p 5433:5432 postgres:16
+export ENGRAM_TEST_DB="postgres://postgres:engram@localhost:5433/engram?sslmode=disable"
+# test (tests that need a DB t.Skip when ENGRAM_TEST_DB is unset; CI must set it)
+ENGRAM_TEST_DB="$ENGRAM_TEST_DB" go test ./...
+
+# run the request-path dev harness (one interactive agent session, reads stdin)
+#   ENGRAM_DB       Postgres DSN (default: localhost:5433 engram)
+#   ENGRAM_OBJ      local object-store root (default ./engram-objects)
+#   ENGRAM_AGENT    agent id (default "demo")
+#   ENGRAM_PROVIDER fake | anthropic (default fake)
+#   ANTHROPIC_API_KEY  required when ENGRAM_PROVIDER=anthropic
+ENGRAM_PROVIDER=fake go run ./cmd/api
+
+# run the maintenance worker (dev) — not implemented yet (M3/M5)
+# go run ./cmd/maintenance
 ```
+
+Layered build progress: see `docs/superpowers/specs/` (L1/L2 design specs, with diagrams) and `docs/superpowers/plans/` (per-layer implementation plans). Architecture + 2026 best-practice A/B candidates: `docs/architecture.md` (§15).
 
 ## Milestones — build in this order
 
