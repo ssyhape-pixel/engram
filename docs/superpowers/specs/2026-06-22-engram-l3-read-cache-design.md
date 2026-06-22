@@ -39,22 +39,22 @@
 
 ```mermaid
 flowchart TB
-  subgraph L3["L3（本层）"]
-    Cache[("cache.Cache — per-pod LRU\n按内容哈希键 · 跨 agent 共享 · 永不失效")]
+  subgraph L3["L3 (本层)"]
+    Cache[("cache.Cache: per-pod LRU<br/>按内容哈希键, 跨 agent 共享, 永不失效")]
   end
   subgraph L2["L2 agent loop"]
-    Router["Router\n持有共享 Cache"]
+    Router["Router<br/>持有共享 Cache"]
     Session["Session.assembleSystem"]
   end
   subgraph L1["L1 memstore"]
-    TreeKeys["MemStore.TreeKeys(commit)\n→ rootTree, systemSubtree"]
-    gitfs["gitfs: 读 commit→tree 对象"]
+    TreeKeys["MemStore.TreeKeys(commit)<br/>得到 rootTree, systemSubtree"]
+    gitfs["gitfs: 读 commit / tree 对象"]
   end
-  Router -->|Open 注入| Session
+  Router -->|"Open 注入"| Session
   Session -->|"!dirty: 取键"| TreeKeys
   TreeKeys --> gitfs
-  Session -->|"Get sys:<systemSubtree> / idx:<rootTree>"| Cache
-  Cache -. miss .-> Build["从 workdir 构建\nbuildSystemContent / buildTreeIndex"]
+  Session -->|"Get sys: 键 / idx: 键"| Cache
+  Cache -. miss .-> Build["从 workdir 构建<br/>buildSystemContent / buildTreeIndex"]
   Build --> Cache
   Session -->|"dirty: 旁路, 直接重算"| Build
 ```
