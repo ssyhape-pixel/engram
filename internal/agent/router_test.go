@@ -15,7 +15,9 @@ import (
 	"github.com/ssy/engram/internal/search"
 )
 
-func routerFixture(t *testing.T) (*Router, *memstore.Store) {
+const rtTag = "rt"
+
+func routerFixture(t *testing.T) (*Router, *memstore.Store, string) {
 	t.Helper()
 	dsn := os.Getenv("ENGRAM_TEST_DB")
 	if dsn == "" {
@@ -29,22 +31,26 @@ func routerFixture(t *testing.T) (*Router, *memstore.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "TRUNCATE agent_refs, memory_jobs, maintenance_cursor"); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
+	agentID := rtTag + ":" + t.Name()
+	// LIFO: pool.Close runs last, DELETE cleanup runs first (pool still open).
 	t.Cleanup(func() { pool.Close() })
+	t.Cleanup(func() {
+		for _, tbl := range []string{"memory_jobs", "agent_refs", "maintenance_cursor"} {
+			pool.Exec(ctx, "DELETE FROM "+tbl+" WHERE agent_id=$1", agentID)
+		}
+	})
 	store := memstore.New(objstore.NewLocal(t.TempDir()), refs.New(pool))
-	if _, err := store.CreateAgent(ctx, "a1", map[string]string{"system/about.md": "---\ndescription: who\n---\nx\n"}); err != nil {
+	if _, err := store.CreateAgent(ctx, agentID, map[string]string{"system/about.md": "---\ndescription: who\n---\nx\n"}); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	prov := &FakeProvider{Steps: []func(Request) Response{func(r Request) Response { return Response{Text: "ok"} }}}
-	return NewRouter(store, prov, t.TempDir(), cache.NewLRU(8), search.NewFakeEmbedder(64)), store
+	return NewRouter(store, prov, t.TempDir(), cache.NewLRU(8), search.NewFakeEmbedder(64)), store, agentID
 }
 
 func TestRouterOpenMaterializesWorkdir(t *testing.T) {
 	ctx := context.Background()
-	r, _ := routerFixture(t)
-	s, err := r.Open(ctx, "a1")
+	r, _, agentID := routerFixture(t)
+	s, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -56,18 +62,18 @@ func TestRouterOpenMaterializesWorkdir(t *testing.T) {
 
 func TestRouterSingleWriter(t *testing.T) {
 	ctx := context.Background()
-	r, _ := routerFixture(t)
-	s1, err := r.Open(ctx, "a1")
+	r, _, agentID := routerFixture(t)
+	s1, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Open(ctx, "a1"); !errors.Is(err, ErrAgentBusy) {
+	if _, err := r.Open(ctx, agentID); !errors.Is(err, ErrAgentBusy) {
 		t.Fatalf("second Open = %v want ErrAgentBusy", err)
 	}
 	if err := s1.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s2, err := r.Open(ctx, "a1")
+	s2, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatalf("reopen after close: %v", err)
 	}
@@ -76,8 +82,8 @@ func TestRouterSingleWriter(t *testing.T) {
 
 func TestRouterCloseRemovesWorkdir(t *testing.T) {
 	ctx := context.Background()
-	r, _ := routerFixture(t)
-	s, err := r.Open(ctx, "a1")
+	r, _, agentID := routerFixture(t)
+	s, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,8 +98,8 @@ func TestRouterCloseRemovesWorkdir(t *testing.T) {
 
 func TestRouterDoubleCloseIsSafe(t *testing.T) {
 	ctx := context.Background()
-	r, _ := routerFixture(t)
-	s1, err := r.Open(ctx, "a1")
+	r, _, agentID := routerFixture(t)
+	s1, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,22 +107,22 @@ func TestRouterDoubleCloseIsSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A second Open must succeed (slot freed)...
-	s2, err := r.Open(ctx, "a1")
+	s2, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer s2.Close()
 	// ...and a stale double-Close of s1 must NOT free s2's claim.
 	_ = s1.Close()
-	if _, err := r.Open(ctx, "a1"); !errors.Is(err, ErrAgentBusy) {
+	if _, err := r.Open(ctx, agentID); !errors.Is(err, ErrAgentBusy) {
 		t.Fatalf("stale double-Close freed the live session's claim: got %v want ErrAgentBusy", err)
 	}
 }
 
 func TestRouterInjectsCacheIntoSession(t *testing.T) {
 	ctx := context.Background()
-	r, _ := routerFixture(t)
-	s, err := r.Open(ctx, "a1")
+	r, _, agentID := routerFixture(t)
+	s, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,8 +134,8 @@ func TestRouterInjectsCacheIntoSession(t *testing.T) {
 
 func TestRouterWiresHybridSearch(t *testing.T) {
 	ctx := context.Background()
-	r, _ := routerFixture(t)
-	s, err := r.Open(ctx, "a1")
+	r, _, agentID := routerFixture(t)
+	s, err := r.Open(ctx, agentID)
 	if err != nil {
 		t.Fatal(err)
 	}
