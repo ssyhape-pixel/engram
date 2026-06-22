@@ -153,6 +153,16 @@ CREATE TABLE maintenance_cursor (
 - Working trees: ephemeral, on worker scratch / tmpfs, keyed by SHA; rebuildable.
 - Memory file format (inside the tree): markdown with YAML frontmatter; `description` (required) feeds the tree index; files under `system/` are always-resident, others are lazy-loaded.
 
+### 10.1 Deployment storage requirements (what each layer actually needs)
+
+Separate **authoritative durable storage** from **compute locality**:
+
+- **Authoritative durable state needs only an object-storage bucket + Postgres** — no OS-pod persistence. The `ObjStore` contract is just key→bytes with **idempotent, per-key-atomic PUT** + `Get`/`Has`/`List` — exactly S3/OSS, so a bucket suffices (the dev `Local` backend's temp+rename is a filesystem-backend detail, not a contract requirement). Postgres is the one strongly-consistent service (the `agent_id→HEAD` CAS + job queue). One consistency assumption: the bucket must be **read-after-write strongly consistent** (S3 since 2020, OSS) so that objects written before a CAS are visible to a reader resolving the new HEAD.
+- **Compute (agent worker) is stateless but, in the current implementation, requires a writable local filesystem / tmpfs** for the ephemeral working tree: `Router.Open` uses `os.MkdirTemp`, `gitfs.Materialize` checks out via go-git's `osfs`, and the toolset reads/writes/greps via `os.*` on that path. This scratch is disposable and rebuildable from objects — pods stay stateless; the disk is locality, not storage.
+- **Removing the local-FS requirement is a clean future option (not yet done):** materialize into go-git's in-memory billy filesystem (`memfs`) and route the toolset through the billy `Filesystem` abstraction instead of `os.*`. That yields zero-local-disk, RAM-only workers (serverless-friendly), with the bucket + Postgres unchanged.
+
+Minimal infra, current design: **object bucket + Postgres + stateless compute pods with disposable scratch.**
+
 ## 11. Core interface (Go sketch)
 
 ```go
