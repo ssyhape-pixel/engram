@@ -70,7 +70,10 @@ func readWorkdirFiles(root string) (map[string][]byte, error) {
 		if rerr != nil {
 			return rerr
 		}
-		rel, _ := filepath.Rel(root, path)
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return fmt.Errorf("agent: rel path %s: %w", path, relErr)
+		}
 		files[rel] = data
 		return nil
 	})
