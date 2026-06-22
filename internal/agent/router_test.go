@@ -12,6 +12,7 @@ import (
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/memstore/objstore"
 	"github.com/ssy/engram/internal/memstore/refs"
+	"github.com/ssy/engram/internal/search"
 )
 
 func routerFixture(t *testing.T) (*Router, *memstore.Store) {
@@ -37,7 +38,7 @@ func routerFixture(t *testing.T) (*Router, *memstore.Store) {
 		t.Fatalf("create agent: %v", err)
 	}
 	prov := &FakeProvider{Steps: []func(Request) Response{func(r Request) Response { return Response{Text: "ok"} }}}
-	return NewRouter(store, prov, t.TempDir(), cache.NewLRU(8)), store
+	return NewRouter(store, prov, t.TempDir(), cache.NewLRU(8), search.NewFakeEmbedder(64)), store
 }
 
 func TestRouterOpenMaterializesWorkdir(t *testing.T) {
@@ -122,5 +123,18 @@ func TestRouterInjectsCacheIntoSession(t *testing.T) {
 	defer s.Close()
 	if s.cache == nil {
 		t.Fatal("Router.Open must inject the shared cache into the Session")
+	}
+}
+
+func TestRouterWiresHybridSearch(t *testing.T) {
+	ctx := context.Background()
+	r, _ := routerFixture(t)
+	s, err := r.Open(ctx, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, ok := s.tools.search.(*search.HybridSearch); !ok {
+		t.Fatalf("Open must wire a HybridSearch, got %T", s.tools.search)
 	}
 }
