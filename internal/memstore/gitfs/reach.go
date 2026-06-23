@@ -18,57 +18,57 @@ import (
 func ReachableObjects(ctx context.Context, objs objstore.ObjStore, heads []string) (map[string]struct{}, error) {
 	st := NewStorage(ctx, objs)
 	reachable := map[string]struct{}{}
-	seen := map[string]struct{}{} // commits already visited (cycle/dup guard)
+	seenCommits := map[string]struct{}{}
+	seenTrees := map[string]struct{}{}
 
-	var visit func(h string) error
-	visit = func(h string) error {
+	stack := make([]string, 0, len(heads))
+	stack = append(stack, heads...)
+	for len(stack) > 0 {
+		h := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		if h == "" {
-			return nil
+			continue
 		}
-		if _, ok := seen[h]; ok {
-			return nil
+		if _, ok := seenCommits[h]; ok {
+			continue
 		}
-		seen[h] = struct{}{}
+		seenCommits[h] = struct{}{}
 		c, err := object.GetCommit(st, plumbing.NewHash(h))
 		if err != nil {
-			return fmt.Errorf("gitfs: reach commit %s: %w", h, err)
+			return nil, fmt.Errorf("gitfs: reach commit %s: %w", h, err)
 		}
 		reachable[h] = struct{}{}
 		tree, err := c.Tree()
 		if err != nil {
-			return fmt.Errorf("gitfs: reach tree of %s: %w", h, err)
+			return nil, fmt.Errorf("gitfs: reach tree of %s: %w", h, err)
 		}
-		if err := addTree(reachable, tree); err != nil {
-			return err
+		if err := addTree(reachable, seenTrees, st, tree); err != nil {
+			return nil, err
 		}
 		for _, p := range c.ParentHashes {
-			if err := visit(p.String()); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	for _, h := range heads {
-		if err := visit(h); err != nil {
-			return nil, err
+			stack = append(stack, p.String())
 		}
 	}
 	return reachable, nil
 }
 
 // addTree adds the tree's own hash, every entry hash (blob or subtree), and
-// recurses into subtrees.
-func addTree(reachable map[string]struct{}, tree *object.Tree) error {
-	reachable[tree.Hash.String()] = struct{}{}
+// recurses into unseen subtrees. seenTrees dedups shared subtrees across commits.
+func addTree(reachable, seenTrees map[string]struct{}, st *Storage, tree *object.Tree) error {
+	th := tree.Hash.String()
+	if _, ok := seenTrees[th]; ok {
+		return nil
+	}
+	seenTrees[th] = struct{}{}
+	reachable[th] = struct{}{}
 	for _, e := range tree.Entries {
 		reachable[e.Hash.String()] = struct{}{}
 		if e.Mode == filemode.Dir {
-			sub, err := tree.Tree(e.Name)
+			sub, err := object.GetTree(st, e.Hash)
 			if err != nil {
 				return fmt.Errorf("gitfs: reach subtree %s: %w", e.Name, err)
 			}
-			if err := addTree(reachable, sub); err != nil {
+			if err := addTree(reachable, seenTrees, st, sub); err != nil {
 				return err
 			}
 		}
