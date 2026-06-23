@@ -2,6 +2,7 @@ package maintenance
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -106,5 +107,51 @@ func TestReflectDoesNotLoopOnRepeatedCalls(t *testing.T) {
 	h3, _ := store.ResolveHead(ctx, agentID)
 	if h3 == h2 {
 		t.Fatal("second reflection should advance HEAD")
+	}
+}
+
+// advancingStore wraps a real Store and, on the first Materialize call, advances
+// HEAD via an external commit — so Reflect's CommitWithCAS (against the head it
+// resolved before Materialize) deterministically loses the CAS race.
+type advancingStore struct {
+	*memstore.Store
+	bumped bool
+}
+
+func (a *advancingStore) Materialize(ctx context.Context, agentID string, at memstore.CommitHash, dir string) error {
+	if err := a.Store.Materialize(ctx, agentID, at, dir); err != nil {
+		return err
+	}
+	if !a.bumped {
+		a.bumped = true
+		ext, err := os.MkdirTemp("", "engram-ext-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(ext)
+		if err := a.Store.Materialize(ctx, agentID, at, ext); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(ext, "external.md"), []byte("concurrent write\n"), 0o644); err != nil {
+			return err
+		}
+		if _, err := a.Store.CommitWithCAS(ctx, agentID, at, ext, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestReflectConflictReturnsErrConflict(t *testing.T) {
+	ctx := context.Background()
+	store, agentID := reflectStore(t)
+	head, err := store.CreateAgent(ctx, agentID, map[string]string{"system/about.md": "---\ndescription: d\n---\nfacts\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adv := &advancingStore{Store: store}
+	rerr := Reflect(ctx, adv, fakeCompleter{out: "SUMMARY\n"}, agentID, string(head))
+	if !errors.Is(rerr, ErrConflict) {
+		t.Fatalf("expected ErrConflict (Reflect lost the CAS race), got %v", rerr)
 	}
 }
