@@ -97,3 +97,59 @@ func TestCASConflict(t *testing.T) {
 		t.Fatalf("conflicting commit must not enqueue; jobs=%d", cnt)
 	}
 }
+
+func TestAllHeadsContainsBootstrapped(t *testing.T) {
+	ctx := context.Background()
+	pool, agentID := testPool(t)
+	r := New(pool)
+	head := "head-" + agentID // unique per test
+	if err := r.Bootstrap(ctx, agentID, head); err != nil {
+		t.Fatal(err)
+	}
+	heads, err := r.AllHeads(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, h := range heads {
+		if h == head {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("AllHeads should contain %q; got %v", head, heads)
+	}
+}
+
+func TestWithGlobalLockMutualExclusion(t *testing.T) {
+	ctx := context.Background()
+	pool, agentID := testPool(t)
+	r := New(pool)
+	// Unique advisory-lock key per test (the test DB is shared): derive from agentID.
+	var key int64
+	for _, c := range agentID {
+		key = key*131 + int64(c)
+	}
+	if key < 0 {
+		key = -key
+	}
+
+	ran, err := r.WithGlobalLock(ctx, key, func(ctx context.Context) error {
+		// While the outer lock is held on one pooled conn, a second attempt on the
+		// SAME key from another conn must fail to acquire.
+		inner, ierr := r.WithGlobalLock(ctx, key, func(ctx context.Context) error { return nil })
+		if ierr != nil {
+			t.Errorf("inner lock errored: %v", ierr)
+		}
+		if inner {
+			t.Error("inner WithGlobalLock acquired the same key while held — must not")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("outer lock fn errored: %v", err)
+	}
+	if !ran {
+		t.Fatal("outer WithGlobalLock should have acquired and run")
+	}
+}
