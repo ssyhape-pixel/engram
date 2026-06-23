@@ -94,7 +94,12 @@ func (r *Refs) WithGlobalLock(ctx context.Context, key int64, fn func(context.Co
 	if !got {
 		return false, nil
 	}
-	defer conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, key)
+	// Unlock with a background context: the advisory lock is session-scoped and
+	// the pooled conn's session outlives this call, so the unlock MUST run even
+	// if the request ctx was cancelled — otherwise the lock leaks on the conn.
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+	}()
 
 	if err := fn(ctx); err != nil {
 		return true, err
