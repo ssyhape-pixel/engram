@@ -14,11 +14,15 @@ import (
 	"github.com/ssy/engram/internal/memstore/objstore"
 )
 
-// Stats reports the outcome of a GC sweep.
+// Stats reports the outcome of a GC sweep. Kept counts only reachable or
+// within-grace objects; objects kept because Stat or Delete failed are tracked
+// separately (StatErrors / DelErrors) so the worker can log/alert on them.
 type Stats struct {
-	Scanned int
-	Swept   int
-	Kept    int
+	Scanned    int
+	Swept      int
+	Kept       int // reachable or within-grace
+	StatErrors int // conservative keeps: Stat failed (object kept)
+	DelErrors  int // best-effort keeps: Delete failed (object kept)
 }
 
 // GC deletes objects that are unreachable AND older than grace (measured against
@@ -44,14 +48,15 @@ func GC(ctx context.Context, objs objstore.ObjStore, reachable map[string]struct
 		mt, err := objs.Stat(ctx, k)
 		if err != nil {
 			if errors.Is(err, objstore.ErrNotFound) {
-				continue // already gone since the snapshot
+				// object vanished between Iter and Stat (concurrent delete); not counted — Scanned may exceed Swept+Kept+StatErrors+DelErrors by the vanished count.
+				continue
 			}
-			s.Kept++ // stat error: be conservative, keep
+			s.StatErrors++ // stat error: be conservative, keep
 			continue
 		}
 		if now.Sub(mt) > grace {
 			if err := objs.Delete(ctx, k); err != nil {
-				s.Kept++ // delete failed: keep (best effort)
+				s.DelErrors++ // delete failed: keep (best effort)
 				continue
 			}
 			s.Swept++
