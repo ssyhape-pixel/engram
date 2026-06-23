@@ -65,7 +65,7 @@ go.mod
 
 ## Build / test / run
 
-> Status: L1 (MemStore core) + L2 (agent loop + Session) are implemented and merged. `cmd/maintenance` is not built yet (L5).
+> Status: L1 (MemStore core) + L2 (agent loop + Session) + L3 (SHA read cache) + L4 (hybrid search) + L5a (maintenance worker + GC) are implemented and merged. Remaining: L5b reflection + memory_jobs dequeue, L5c defrag, incremental reindex. Layer specs/plans: `docs/superpowers/specs/` + `docs/superpowers/plans/`; newcomer guide: `docs/onboarding.md`.
 
 ```
 # build
@@ -85,8 +85,12 @@ ENGRAM_TEST_DB="$ENGRAM_TEST_DB" go test ./...
 #   ANTHROPIC_API_KEY  required when ENGRAM_PROVIDER=anthropic
 ENGRAM_PROVIDER=fake go run ./cmd/api
 
-# run the maintenance worker (dev) — not implemented yet (M3/M5)
-# go run ./cmd/maintenance
+# run the maintenance worker (dev) — periodic global GC (L5a)
+#   ENGRAM_DB           Postgres DSN
+#   ENGRAM_OBJ          local object-store root (default ./engram-objects)
+#   ENGRAM_GC_INTERVAL  GC poll interval (default 5m)
+#   ENGRAM_GC_GRACE     min object age before an unreachable object is swept (default 1h)
+go run ./cmd/maintenance
 ```
 
 Layered build progress: see `docs/superpowers/specs/` (L1/L2 design specs, with diagrams) and `docs/superpowers/plans/` (per-layer implementation plans). Architecture + 2026 best-practice A/B candidates: `docs/architecture.md` (§15).
