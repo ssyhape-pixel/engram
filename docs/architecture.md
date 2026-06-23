@@ -229,8 +229,9 @@ M1 walking skeleton → M2 SHA cache → M3 reconcile-loop maintenance → M4 tr
 
 - Eventual-consistency window of the index vs read-your-writes (mitigation: just-written files are still in this turn's context; or reindex the foreground agent synchronously).
 - Cross-tenant object dedup vs existence-leak isolation — pick per security requirements.
-- Reflection trigger policy: every N turns vs on compaction event (prefer compaction).
+- Reflection trigger policy: every N turns vs on compaction event (prefer compaction). _(L5b currently enqueues `reflect` per commit, deduped by the partial-unique index — a placeholder for a real compaction trigger.)_
 - Warm-sidecar threshold: when grep fidelity / latency justifies giving up pure statelessness.
+- **Stale-`running` job reaper (L5b gap):** `ClaimJob` marks a job `running`; if the maintenance worker crashes mid-job, that row stays `running` forever (no `claimed_at` timeout, no reaper). `ClaimJob` only selects `pending`, so the job is silently stranded. Mitigation when it matters: add `claimed_at timestamptz` + a reaper sweep (`UPDATE memory_jobs SET state='pending' WHERE state='running' AND claimed_at < now() - interval '10m'`), or adopt River (which handles this). Acceptable for now: single-process dev worker; a process restart re-runs DrainJobs fresh and the periodic per-commit re-enqueue limits the blast radius.
 
 ## 15. Best-practice cross-check & A/B candidates (2026 research)
 
