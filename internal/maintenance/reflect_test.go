@@ -74,6 +74,22 @@ func TestReflectWritesConsolidationAndCommits(t *testing.T) {
 	}
 }
 
+func TestReflectSkipsWhenNoResident(t *testing.T) {
+	ctx := context.Background()
+	store, agentID := reflectStore(t)
+	head, err := store.CreateAgent(ctx, agentID, map[string]string{"notes/n.md": "just a note\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Reflect(ctx, store, fakeCompleter{out: "X"}, agentID, string(head)); err != nil {
+		t.Fatalf("reflect: %v", err)
+	}
+	h2, _ := store.ResolveHead(ctx, agentID)
+	if h2 != head {
+		t.Fatal("reflection with no system/ content must not commit (HEAD unchanged)")
+	}
+}
+
 func TestReflectDoesNotLoopOnRepeatedCalls(t *testing.T) {
 	ctx := context.Background()
 	store, agentID := reflectStore(t)

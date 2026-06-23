@@ -31,6 +31,10 @@ const reflectSystemPrompt = "You are the reflection pass of an agent memory syst
 // resident system/ content, writes the result to system/reflection.md, and
 // commits it with jobs=nil so reflection never re-enqueues itself. A CAS
 // conflict (agent advanced concurrently) returns ErrConflict.
+//
+// fromSHA is the commit at which the job was enqueued; currently unused (Reflect
+// re-resolves HEAD for the freshest state), retained for future
+// diff-since-fromSHA wiring.
 func Reflect(ctx context.Context, store memstore.MemStore, c Completer, agentID, fromSHA string) error {
 	head, err := store.ResolveHead(ctx, agentID)
 	if err != nil {
@@ -45,7 +49,13 @@ func Reflect(ctx context.Context, store memstore.MemStore, c Completer, agentID,
 		return fmt.Errorf("maintenance: materialize: %w", err)
 	}
 
-	resident := readSystemDir(dir)
+	resident, err := readSystemDir(dir)
+	if err != nil {
+		return err
+	}
+	if resident == "" {
+		return nil // nothing resident to consolidate; skip (no commit, no churn)
+	}
 	out, err := c.Complete(ctx, reflectSystemPrompt, resident)
 	if err != nil {
 		return fmt.Errorf("maintenance: complete: %w", err)
@@ -69,20 +79,30 @@ func Reflect(ctx context.Context, store memstore.MemStore, c Completer, agentID,
 }
 
 // readSystemDir concatenates all files under <dir>/system/ (the resident set).
-func readSystemDir(dir string) string {
+// An absent system/ dir yields ("", nil); genuine read errors propagate.
+func readSystemDir(dir string) (string, error) {
 	var b strings.Builder
 	systemDir := filepath.Join(dir, "system")
-	_ = filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	walkErr := filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return fs.SkipAll // no system/ dir yet — fine
+			}
+			return err
+		}
+		if d.IsDir() {
 			return nil
 		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil {
-			return nil
+			return rerr
 		}
 		rel, _ := filepath.Rel(dir, path)
 		fmt.Fprintf(&b, "## %s\n%s\n", rel, string(data))
 		return nil
 	})
-	return b.String()
+	if walkErr != nil { // SkipAll resolves to nil, so this is a genuine error
+		return "", fmt.Errorf("maintenance: read system/: %w", walkErr)
+	}
+	return b.String(), nil
 }
