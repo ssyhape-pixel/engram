@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Local is a filesystem-backed ObjStore. Objects live at
@@ -94,6 +95,24 @@ func (l *Local) Iter(ctx context.Context, fn func(key string) error) error {
 		// With the <key[:2]>/<key> layout the file basename equals the key.
 		return fn(d.Name())
 	})
+}
+
+func (l *Local) Stat(ctx context.Context, key string) (time.Time, error) {
+	fi, err := os.Stat(l.path(key))
+	if errors.Is(err, os.ErrNotExist) {
+		return time.Time{}, ErrNotFound
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("objstore: stat %s: %w", key, err)
+	}
+	return fi.ModTime(), nil
+}
+
+func (l *Local) Delete(ctx context.Context, key string) error {
+	if err := os.Remove(l.path(key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("objstore: delete %s: %w", key, err)
+	}
+	return nil
 }
 
 var _ ObjStore = (*Local)(nil)

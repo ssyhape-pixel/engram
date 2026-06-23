@@ -55,6 +55,58 @@ func (r *Refs) Bootstrap(ctx context.Context, agentID, head string) error {
 	return nil
 }
 
+// AllHeads returns every agent's current HEAD — the reachability roots for GC.
+func (r *Refs) AllHeads(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT head FROM agent_refs`)
+	if err != nil {
+		return nil, fmt.Errorf("refs: all heads: %w", err)
+	}
+	defer rows.Close()
+	var heads []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("refs: scan head: %w", err)
+		}
+		heads = append(heads, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("refs: rows: %w", err)
+	}
+	return heads, nil
+}
+
+// WithGlobalLock tries a session-level Postgres advisory lock on key. If
+// acquired it runs fn and releases the lock, returning ran=true; if another
+// session already holds it, returns ran=false without running fn. Used so only
+// one maintenance worker GCs at a time.
+func (r *Refs) WithGlobalLock(ctx context.Context, key int64, fn func(context.Context) error) (bool, error) {
+	conn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return false, fmt.Errorf("refs: acquire conn: %w", err)
+	}
+	defer conn.Release()
+
+	var got bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&got); err != nil {
+		return false, fmt.Errorf("refs: try advisory lock: %w", err)
+	}
+	if !got {
+		return false, nil
+	}
+	// Unlock with a background context: the advisory lock is session-scoped and
+	// the pooled conn's session outlives this call, so the unlock MUST run even
+	// if the request ctx was cancelled — otherwise the lock leaks on the conn.
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+	}()
+
+	if err := fn(ctx); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // CommitRef atomically advances HEAD parent->next and enqueues jobs in ONE tx.
 // Returns ErrCASConflict if HEAD != parent (0 rows updated). Note that a
 // nonexistent agent also matches 0 rows and thus returns ErrCASConflict, so
