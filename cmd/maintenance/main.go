@@ -35,6 +35,17 @@ func (p providerCompleter) Complete(ctx context.Context, system, user string) (s
 	return resp.Text, nil
 }
 
+// fixedCompleter is the dev reflection backend: a constant consolidation with
+// no per-call limit (unlike a scripted FakeProvider).
+type fixedCompleter struct{}
+
+func (fixedCompleter) Complete(ctx context.Context, system, user string) (string, error) {
+	return "(fake reflection) consolidated\n", nil
+}
+
+var _ maintenance.Completer = fixedCompleter{}
+var _ maintenance.Completer = providerCompleter{}
+
 const gcLockKey int64 = 1
 
 func env(key, def string) string {
@@ -74,25 +85,24 @@ func main() {
 
 	maxAttempts := 5
 	if v := os.Getenv("ENGRAM_JOB_MAX_ATTEMPTS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxAttempts = n
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			log.Fatalf("invalid ENGRAM_JOB_MAX_ATTEMPTS: %q", v)
 		}
+		maxAttempts = n
 	}
 
-	var prov agent.LLMProvider
+	var completer maintenance.Completer
 	switch env("ENGRAM_PROVIDER", "fake") {
 	case "anthropic":
 		key := os.Getenv("ANTHROPIC_API_KEY")
 		if key == "" {
 			log.Fatal("ENGRAM_PROVIDER=anthropic requires ANTHROPIC_API_KEY")
 		}
-		prov = agent.NewAnthropic(key)
+		completer = providerCompleter{prov: agent.NewAnthropic(key)}
 	default:
-		prov = &agent.FakeProvider{Steps: []func(agent.Request) agent.Response{
-			func(r agent.Request) agent.Response { return agent.Response{Text: "(fake reflection) consolidated\n"} },
-		}}
+		completer = fixedCompleter{}
 	}
-	completer := providerCompleter{prov: prov}
 
 	log.Printf("maintenance worker started: interval=%s grace=%s obj=%s", interval, grace, objRoot)
 	for {
