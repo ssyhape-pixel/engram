@@ -107,6 +107,88 @@ func (r *Refs) WithGlobalLock(ctx context.Context, key int64, fn func(context.Co
 	return true, nil
 }
 
+// DequeuedJob is a claimed maintenance job.
+type DequeuedJob struct {
+	ID       int64
+	AgentID  string
+	Kind     string
+	FromSHA  string
+	Attempts int
+}
+
+// ClaimJob atomically claims one pending job (FOR UPDATE SKIP LOCKED, no ORDER
+// BY — queue hygiene) and marks it 'running'. Returns nil if none pending.
+func (r *Refs) ClaimJob(ctx context.Context) (*DequeuedJob, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("refs: begin claim: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var j DequeuedJob
+	var fromSHA *string
+	err = tx.QueryRow(ctx,
+		`SELECT id, agent_id, kind, from_sha, attempts FROM memory_jobs
+		 WHERE state='pending' FOR UPDATE SKIP LOCKED LIMIT 1`).
+		Scan(&j.ID, &j.AgentID, &j.Kind, &fromSHA, &j.Attempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("refs: claim select: %w", err)
+	}
+	if fromSHA != nil {
+		j.FromSHA = *fromSHA
+	}
+	if _, err := tx.Exec(ctx, `UPDATE memory_jobs SET state='running' WHERE id=$1`, j.ID); err != nil {
+		return nil, fmt.Errorf("refs: claim mark running: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("refs: claim commit: %w", err)
+	}
+	return &j, nil
+}
+
+// CompleteJob removes a finished job.
+func (r *Refs) CompleteJob(ctx context.Context, id int64) error {
+	if _, err := r.pool.Exec(ctx, `DELETE FROM memory_jobs WHERE id=$1`, id); err != nil {
+		return fmt.Errorf("refs: complete job %d: %w", id, err)
+	}
+	return nil
+}
+
+// RetryJob increments attempts; if attempts reaches maxAttempts the job is
+// marked 'failed', otherwise returned to 'pending' for a later round.
+func (r *Refs) RetryJob(ctx context.Context, id int64, maxAttempts int) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE memory_jobs
+		 SET attempts = attempts + 1,
+		     state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END
+		 WHERE id=$1`, id, maxAttempts)
+	if err != nil {
+		return fmt.Errorf("refs: retry job %d: %w", id, err)
+	}
+	return nil
+}
+
+// InsertPendingJob enqueues a pending job directly (test support).
+func (r *Refs) InsertPendingJob(ctx context.Context, agentID, kind, fromSHA string) error {
+	_, err := r.pool.Exec(ctx, `INSERT INTO memory_jobs (agent_id, kind, from_sha) VALUES ($1,$2,$3)`, agentID, kind, fromSHA)
+	if err != nil {
+		return fmt.Errorf("refs: insert pending job: %w", err)
+	}
+	return nil
+}
+
+// CountJobs returns the number of memory_jobs rows for an agent (test support).
+func (r *Refs) CountJobs(ctx context.Context, agentID string) (int, error) {
+	var n int
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM memory_jobs WHERE agent_id=$1`, agentID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("refs: count jobs: %w", err)
+	}
+	return n, nil
+}
+
 // CommitRef atomically advances HEAD parent->next and enqueues jobs in ONE tx.
 // Returns ErrCASConflict if HEAD != parent (0 rows updated). Note that a
 // nonexistent agent also matches 0 rows and thus returns ErrCASConflict, so
