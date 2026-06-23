@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func newLocal(t *testing.T) *Local {
@@ -78,5 +79,49 @@ func TestLocalIter(t *testing.T) {
 	}
 	if !seen["aa"] || !seen["bb"] {
 		t.Fatalf("iter saw %v", seen)
+	}
+}
+
+func TestLocalStatReturnsModTime(t *testing.T) {
+	ctx := context.Background()
+	s := newLocal(t)
+	before := time.Now().Add(-time.Second)
+	if err := s.Put(ctx, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	mt, err := s.Stat(ctx, "k")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if mt.Before(before) {
+		t.Fatalf("mtime %v older than %v", mt, before)
+	}
+}
+
+func TestLocalStatMissing(t *testing.T) {
+	_, err := newLocal(t).Stat(context.Background(), "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v want ErrNotFound", err)
+	}
+}
+
+func TestLocalDelete(t *testing.T) {
+	ctx := context.Background()
+	s := newLocal(t)
+	if err := s.Put(ctx, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	ok, _ := s.Has(ctx, "k")
+	if ok {
+		t.Fatal("key should be gone after Delete")
+	}
+}
+
+func TestLocalDeleteMissingIsIdempotent(t *testing.T) {
+	if err := newLocal(t).Delete(context.Background(), "nope"); err != nil {
+		t.Fatalf("deleting a missing key must be nil, got %v", err)
 	}
 }
