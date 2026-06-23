@@ -171,6 +171,24 @@ func (r *Refs) RetryJob(ctx context.Context, id int64, maxAttempts int) error {
 	return nil
 }
 
+// InsertPendingJob enqueues a pending job directly (test support).
+func (r *Refs) InsertPendingJob(ctx context.Context, agentID, kind, fromSHA string) error {
+	_, err := r.pool.Exec(ctx, `INSERT INTO memory_jobs (agent_id, kind, from_sha) VALUES ($1,$2,$3)`, agentID, kind, fromSHA)
+	if err != nil {
+		return fmt.Errorf("refs: insert pending job: %w", err)
+	}
+	return nil
+}
+
+// CountJobs returns the number of memory_jobs rows for an agent (test support).
+func (r *Refs) CountJobs(ctx context.Context, agentID string) (int, error) {
+	var n int
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM memory_jobs WHERE agent_id=$1`, agentID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("refs: count jobs: %w", err)
+	}
+	return n, nil
+}
+
 // CommitRef atomically advances HEAD parent->next and enqueues jobs in ONE tx.
 // Returns ErrCASConflict if HEAD != parent (0 rows updated). Note that a
 // nonexistent agent also matches 0 rows and thus returns ErrCASConflict, so
