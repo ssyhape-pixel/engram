@@ -65,7 +65,7 @@ go.mod
 
 ## Build / test / run
 
-> Status: L1 (MemStore core) + L2 (agent loop + Session) + L3 (SHA read cache) + L4 (hybrid search) + L5a (maintenance worker + GC) are implemented and merged. Remaining: L5b reflection + memory_jobs dequeue, L5c defrag, incremental reindex. Layer specs/plans: `docs/superpowers/specs/` + `docs/superpowers/plans/`; newcomer guide: `docs/onboarding.md`.
+> Status: L1 (MemStore core) + L2 (agent loop + Session) + L3 (SHA read cache) + L4 (hybrid search) + L5a (maintenance GC) + L5b (memory_jobs consumer + reflection) are implemented and merged. The maintenance worker now runs GC + drains memory_jobs (reflection) each round. Remaining: L5c defrag, incremental reindex (needs persisted index), stale-`running` job reaper (see `architecture.md §14`). Layer specs/plans: `docs/superpowers/specs/` + `docs/superpowers/plans/`; newcomer guide: `docs/onboarding.md`.
 
 ```
 # build
