@@ -8,9 +8,11 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/ssy/engram/internal/cache"
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/memstore/objstore"
 	"github.com/ssy/engram/internal/memstore/refs"
+	"github.com/ssy/engram/internal/search"
 )
 
 // isolatedPool returns a pool whose connections use a unique, per-test schema
@@ -100,7 +102,7 @@ func TestDrainReflectAndReindex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	drained, err := DrainJobs(ctx, r, store, fakeDrainCompleter{out: "SUMMARY\n"}, 5)
+	drained, err := DrainJobs(ctx, r, store, fakeDrainCompleter{out: "SUMMARY\n"}, search.NewFakeEmbedder(64), cache.NewObjCache(objstore.NewLocal(t.TempDir())), 5)
 	if err != nil {
 		t.Fatalf("drain: %v", err)
 	}
@@ -139,7 +141,7 @@ func TestDrainReflectRequeuesWhenAgentLockHeld(t *testing.T) {
 	// Hold the per-agent advisory lock, then drain inside it: the reflect job's
 	// inner per-agent lock acquire must fail → job requeued (not completed).
 	ran, err := r.WithGlobalLock(ctx, agentKey(agentID), func(ctx context.Context) error {
-		_, derr := DrainJobs(ctx, r, store, fakeDrainCompleter{out: "X"}, 5)
+		_, derr := DrainJobs(ctx, r, store, fakeDrainCompleter{out: "X"}, search.NewFakeEmbedder(64), cache.NewObjCache(objstore.NewLocal(t.TempDir())), 5)
 		return derr
 	})
 	if err != nil {

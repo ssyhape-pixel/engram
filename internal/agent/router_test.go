@@ -44,7 +44,7 @@ func routerFixture(t *testing.T) (*Router, *memstore.Store, string) {
 		t.Fatalf("create agent: %v", err)
 	}
 	prov := &FakeProvider{Steps: []func(Request) Response{func(r Request) Response { return Response{Text: "ok"} }}}
-	return NewRouter(store, prov, t.TempDir(), cache.NewLRU(8), search.NewFakeEmbedder(64)), store, agentID
+	return NewRouter(store, prov, t.TempDir(), cache.NewLRU(8), cache.NewLRU(8), search.NewFakeEmbedder(64)), store, agentID
 }
 
 func TestRouterOpenMaterializesWorkdir(t *testing.T) {

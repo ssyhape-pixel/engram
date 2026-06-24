@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ssy/engram/internal/agent"
@@ -76,7 +77,12 @@ func main() {
 		emb = search.NewFakeEmbedder(256)
 	}
 
-	router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024), emb)
+	embObjRoot := env("ENGRAM_EMB_OBJ", "./engram-embeddings")
+	if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
+		log.Fatalf("ENGRAM_EMB_OBJ and ENGRAM_OBJ must be different directories (got %q)", embObjRoot)
+	}
+	embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
+	router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024), embCache, emb)
 	sess, err := router.Open(ctx, agentID)
 	if err != nil {
 		log.Fatalf("open session: %v", err)

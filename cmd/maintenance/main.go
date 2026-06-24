@@ -8,16 +8,19 @@ import (
 	"context"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ssy/engram/internal/agent"
+	"github.com/ssy/engram/internal/cache"
 	"github.com/ssy/engram/internal/maintenance"
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/memstore/gitfs"
 	"github.com/ssy/engram/internal/memstore/objstore"
 	"github.com/ssy/engram/internal/memstore/refs"
+	"github.com/ssy/engram/internal/search"
 )
 
 // providerCompleter adapts an agent.LLMProvider to maintenance.Completer (a
@@ -104,6 +107,23 @@ func main() {
 		completer = fixedCompleter{}
 	}
 
+	var emb search.Embedder
+	switch env("ENGRAM_EMBEDDER", "fake") {
+	case "voyage":
+		key := os.Getenv("VOYAGE_API_KEY")
+		if key == "" {
+			log.Fatal("ENGRAM_EMBEDDER=voyage requires VOYAGE_API_KEY")
+		}
+		emb = search.NewVoyage(key)
+	default:
+		emb = search.NewFakeEmbedder(256)
+	}
+	embObjRoot := env("ENGRAM_EMB_OBJ", "./engram-embeddings")
+	if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
+		log.Fatal("ENGRAM_EMB_OBJ must differ from ENGRAM_OBJ (GC must never sweep the embedding store)")
+	}
+	embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
+
 	log.Printf("maintenance worker started: interval=%s grace=%s obj=%s", interval, grace, objRoot)
 	for {
 		ran, err := r.WithGlobalLock(ctx, gcLockKey, func(ctx context.Context) error {
@@ -121,7 +141,7 @@ func main() {
 			}
 			log.Printf("gc: agents=%d scanned=%d swept=%d kept=%d statErrors=%d delErrors=%d",
 				len(heads), stats.Scanned, stats.Swept, stats.Kept, stats.StatErrors, stats.DelErrors)
-			processed, derr := maintenance.DrainJobs(ctx, r, store, completer, maxAttempts)
+			processed, derr := maintenance.DrainJobs(ctx, r, store, completer, emb, embCache, maxAttempts)
 			if derr != nil {
 				return derr
 			}

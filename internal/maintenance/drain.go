@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"hash/fnv"
 
+	"github.com/ssy/engram/internal/cache"
 	"github.com/ssy/engram/internal/memstore"
 	"github.com/ssy/engram/internal/memstore/refs"
+	"github.com/ssy/engram/internal/search"
 )
 
 // agentKey hashes an agent id to an advisory-lock key (per-agent reflection
@@ -20,7 +22,7 @@ func agentKey(agentID string) int64 {
 
 // processJob dispatches a single claimed job, always resolving it (CompleteJob or
 // RetryJob) so the row never stays stuck in 'running'.
-func processJob(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Completer, job *refs.DequeuedJob, maxAttempts int) error {
+func processJob(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Completer, emb search.Embedder, embCache cache.Cache, job *refs.DequeuedJob, maxAttempts int) error {
 	switch job.Kind {
 	case "reflect":
 		ran, err := r.WithGlobalLock(ctx, agentKey(job.AgentID), func(ctx context.Context) error {
@@ -36,7 +38,9 @@ func processJob(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Co
 		}
 		return r.CompleteJob(ctx, job.ID)
 	case "reindex":
-		// No persistent index yet (L4 rebuilds per session); drain to avoid pileup.
+		if err := Reindex(ctx, store, emb, embCache, job.AgentID); err != nil {
+			return r.RetryJob(ctx, job.ID, maxAttempts)
+		}
 		return r.CompleteJob(ctx, job.ID)
 	default:
 		// Unknown kind: discard so it can't clog the queue.
@@ -49,7 +53,7 @@ func processJob(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Co
 // within the same round (it was requeued by processJob) is RetryJob'd again
 // (attempts bumped a second time) and the round ends — so a perpetually-blocked
 // job can't busy-loop and fails out via maxAttempts within a few rounds.
-func DrainJobs(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Completer, maxAttempts int) (int, error) {
+func DrainJobs(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Completer, emb search.Embedder, embCache cache.Cache, maxAttempts int) (int, error) {
 	seen := map[int64]struct{}{}
 	processed := 0
 	for {
@@ -67,7 +71,7 @@ func DrainJobs(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Com
 			return processed, nil
 		}
 		seen[job.ID] = struct{}{}
-		if err := processJob(ctx, r, store, c, job, maxAttempts); err != nil {
+		if err := processJob(ctx, r, store, c, emb, embCache, job, maxAttempts); err != nil {
 			return processed, fmt.Errorf("maintenance: process job %d: %w", job.ID, err)
 		}
 		processed++
