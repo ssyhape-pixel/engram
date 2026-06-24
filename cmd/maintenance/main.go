@@ -108,15 +108,15 @@ func main() {
 	}
 
 	var emb search.Embedder
-	switch env("ENGRAM_PROVIDER", "fake") {
-	case "anthropic", "voyage":
+	switch env("ENGRAM_EMBEDDER", "fake") {
+	case "voyage":
 		key := os.Getenv("VOYAGE_API_KEY")
 		if key == "" {
-			log.Fatal("ENGRAM_PROVIDER=anthropic|voyage requires VOYAGE_API_KEY for reindex embeddings")
+			log.Fatal("ENGRAM_EMBEDDER=voyage requires VOYAGE_API_KEY")
 		}
 		emb = search.NewVoyage(key)
 	default:
-		emb = search.NewFakeEmbedder(0)
+		emb = search.NewFakeEmbedder(256)
 	}
 	embObjRoot := env("ENGRAM_EMB_OBJ", "./engram-embeddings")
 	if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
