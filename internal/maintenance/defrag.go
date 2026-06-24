@@ -44,8 +44,11 @@ func splitTopLevel(content []byte) [][]byte {
 }
 
 // isSplittable reports whether a file qualifies for defrag: a .md file larger
-// than maxBytes with at least 2 top-level-heading parts (so splitting strictly
-// reduces the largest file — guaranteeing convergence).
+// than maxBytes with at least 2 top-level-heading parts. Convergence is
+// structural, not size-based: each part splitTopLevel produces contains exactly
+// one top-level heading, so splitTopLevel(part) returns 1 part and isSplittable
+// is false for it — a second defrag pass finds nothing to split (even a single
+// section larger than maxBytes is left alone, since it has only one heading).
 func isSplittable(path string, content []byte, maxBytes int) bool {
 	return strings.HasSuffix(path, ".md") && len(content) > maxBytes && len(splitTopLevel(content)) >= 2
 }
