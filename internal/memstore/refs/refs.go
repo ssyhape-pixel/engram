@@ -189,6 +189,41 @@ func (r *Refs) CountJobs(ctx context.Context, agentID string) (int, error) {
 	return n, nil
 }
 
+// EnqueueJob idempotently enqueues a pending job out-of-band (not tied to a
+// commit). ON CONFLICT against the partial-unique index makes a duplicate
+// enqueue (an existing pending job for the same agent+kind) a no-op.
+func (r *Refs) EnqueueJob(ctx context.Context, agentID, kind, fromSHA string) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO memory_jobs (agent_id, kind, from_sha) VALUES ($1,$2,$3)
+		 ON CONFLICT (agent_id, kind) WHERE state='pending' DO NOTHING`,
+		agentID, kind, fromSHA)
+	if err != nil {
+		return fmt.Errorf("refs: enqueue job: %w", err)
+	}
+	return nil
+}
+
+// AllAgentIDs returns every agent id with a ref (for maintenance scans).
+func (r *Refs) AllAgentIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT agent_id FROM agent_refs`)
+	if err != nil {
+		return nil, fmt.Errorf("refs: all agent ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("refs: scan agent id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("refs: iterate agent ids: %w", err)
+	}
+	return ids, nil
+}
+
 // CommitRef atomically advances HEAD parent->next and enqueues jobs in ONE tx.
 // Returns ErrCASConflict if HEAD != parent (0 rows updated). Note that a
 // nonexistent agent also matches 0 rows and thus returns ErrCASConflict, so
