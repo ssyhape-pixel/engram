@@ -65,7 +65,7 @@ go.mod
 
 ## Build / test / run
 
-> Status: L1 (MemStore core) + L2 (agent loop + Session) + L3 (SHA read cache) + L4 (hybrid search) + L5a (maintenance GC) + L5b (memory_jobs consumer + reflection) are implemented and merged. The maintenance worker now runs GC + drains memory_jobs (reflection) each round. Remaining: L5c defrag, incremental reindex (needs persisted index), stale-`running` job reaper (see `architecture.md §14`). Layer specs/plans: `docs/superpowers/specs/` + `docs/superpowers/plans/`; newcomer guide: `docs/onboarding.md`.
+> Status: L1 (MemStore core) + L2 (agent loop + Session) + L3 (SHA read cache) + L4 (hybrid search) + L4b (embedding index persistence + incremental reindex) + L5a (maintenance GC) + L5b (memory_jobs consumer + reflection) are implemented and merged. The maintenance worker runs GC + drains memory_jobs (reflection + reindex) each round; the reindex job warms a persistent content-addressed embedding store (separate from the GC'd git object store) that sessions share. Remaining: L5c defrag, stale-`running` job reaper (see `architecture.md §14`), embedding-store eviction. Layer specs/plans: `docs/superpowers/specs/` + `docs/superpowers/plans/`; newcomer guide: `docs/onboarding.md`.
 
 ```
 # build
@@ -80,16 +80,23 @@ ENGRAM_TEST_DB="$ENGRAM_TEST_DB" go test ./...
 # run the request-path dev harness (one interactive agent session, reads stdin)
 #   ENGRAM_DB       Postgres DSN (default: localhost:5433 engram)
 #   ENGRAM_OBJ      local object-store root (default ./engram-objects)
+#   ENGRAM_EMB_OBJ  persistent embedding store root (default ./engram-embeddings; MUST differ from ENGRAM_OBJ — GC never sweeps it)
 #   ENGRAM_AGENT    agent id (default "demo")
-#   ENGRAM_PROVIDER fake | anthropic (default fake)
+#   ENGRAM_PROVIDER fake | anthropic (default fake) — the agent LLM
+#   ENGRAM_EMBEDDER fake | voyage (default fake) — the search embedder; MUST match the maintenance worker (shared embedding store keys by model)
 #   ANTHROPIC_API_KEY  required when ENGRAM_PROVIDER=anthropic
+#   VOYAGE_API_KEY     required when ENGRAM_EMBEDDER=voyage
 ENGRAM_PROVIDER=fake go run ./cmd/api
 
-# run the maintenance worker (dev) — periodic global GC (L5a)
+# run the maintenance worker (dev) — periodic GC (L5a) + drains memory_jobs: reflection (L5b) + reindex (L4b)
 #   ENGRAM_DB           Postgres DSN
-#   ENGRAM_OBJ          local object-store root (default ./engram-objects)
-#   ENGRAM_GC_INTERVAL  GC poll interval (default 5m)
+#   ENGRAM_OBJ          git object-store root (default ./engram-objects) — GC scans this
+#   ENGRAM_EMB_OBJ      persistent embedding store root (default ./engram-embeddings; MUST differ from ENGRAM_OBJ)
+#   ENGRAM_PROVIDER     fake | anthropic (default fake) — reflection LLM
+#   ENGRAM_EMBEDDER     fake | voyage (default fake) — reindex embedder; MUST match cmd/api
+#   ENGRAM_GC_INTERVAL  round interval (default 5m)
 #   ENGRAM_GC_GRACE     min object age before an unreachable object is swept (default 1h)
+#   ENGRAM_JOB_MAX_ATTEMPTS  per-job retry cap before 'failed' (default 5)
 go run ./cmd/maintenance
 ```
 
