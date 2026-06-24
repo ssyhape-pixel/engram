@@ -22,19 +22,23 @@ var ErrAgentBusy = errors.New("agent: agent already has an active session")
 // agent_id (an in-process lock that rebuilds the serialization a single client
 // would provide). Multi-pod sticky routing is L5; the ref CAS is the backstop.
 type Router struct {
-	store   memstore.MemStore
-	prov    LLMProvider
-	scratch string
-	cache   cache.Cache
-	emb     search.Embedder
+	store    memstore.MemStore
+	prov     LLMProvider
+	scratch  string
+	cache    cache.Cache
+	embCache cache.Cache
+	emb      search.Embedder
 
 	mu     sync.Mutex
 	active map[string]bool
 }
 
 // NewRouter creates a Router that materializes session worktrees under scratch.
-func NewRouter(store memstore.MemStore, prov LLMProvider, scratch string, c cache.Cache, emb search.Embedder) *Router {
-	return &Router{store: store, prov: prov, scratch: scratch, cache: c, emb: emb, active: map[string]bool{}}
+// sysCache is the L3 system read cache; embCache is the (separate) persistent
+// embedding cache for search — they MUST be different instances so system
+// content is not written into the embedding store.
+func NewRouter(store memstore.MemStore, prov LLMProvider, scratch string, sysCache cache.Cache, embCache cache.Cache, emb search.Embedder) *Router {
+	return &Router{store: store, prov: prov, scratch: scratch, cache: sysCache, embCache: embCache, emb: emb, active: map[string]bool{}}
 }
 
 // claim marks agentID as active. Returns false if already claimed.
@@ -115,7 +119,7 @@ func (r *Router) Open(ctx context.Context, agentID string) (*Session, error) {
 		r.free(agentID)
 		return nil, err
 	}
-	tools := NewToolset(workdir, agentID, search.NewHybrid(ctx, r.emb, r.cache, files))
+	tools := NewToolset(workdir, agentID, search.NewHybrid(ctx, r.emb, r.embCache, files))
 	// sync.Once makes release idempotent: a double Close (e.g. defer + explicit)
 	// must not free a claim a *different* session may have re-acquired in between.
 	var once sync.Once
