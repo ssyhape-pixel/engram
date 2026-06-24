@@ -159,6 +159,9 @@ func main() {
 			}
 			log.Printf("gc: agents=%d scanned=%d swept=%d kept=%d statErrors=%d delErrors=%d",
 				len(heads), stats.Scanned, stats.Swept, stats.Kept, stats.StatErrors, stats.DelErrors)
+			if derr := maintenance.EnqueueDefrag(ctx, r, store, deps.DefragMaxBytes); derr != nil {
+				log.Printf("defrag scan error: %v", derr)
+			}
 			processed, derr := maintenance.DrainJobs(ctx, r, deps, maxAttempts)
 			if derr != nil {
 				return derr
