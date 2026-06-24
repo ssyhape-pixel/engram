@@ -11,6 +11,15 @@ import (
 	"github.com/ssy/engram/internal/search"
 )
 
+// Deps carries the per-kind job-handler dependencies for DrainJobs.
+type Deps struct {
+	Store          memstore.MemStore
+	Completer      Completer       // reflect
+	Emb            search.Embedder // reindex
+	EmbCache       cache.Cache     // reindex
+	DefragMaxBytes int             // defrag
+}
+
 // agentKey hashes an agent id to an advisory-lock key (per-agent reflection
 // singleton). Collisions only cause two agents to occasionally serialize — safe.
 func agentKey(agentID string) int64 {
@@ -22,23 +31,26 @@ func agentKey(agentID string) int64 {
 
 // processJob dispatches a single claimed job, always resolving it (CompleteJob or
 // RetryJob) so the row never stays stuck in 'running'.
-func processJob(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Completer, emb search.Embedder, embCache cache.Cache, job *refs.DequeuedJob, maxAttempts int) error {
+func processJob(ctx context.Context, r *refs.Refs, deps Deps, job *refs.DequeuedJob, maxAttempts int) error {
 	switch job.Kind {
 	case "reflect":
 		ran, err := r.WithGlobalLock(ctx, agentKey(job.AgentID), func(ctx context.Context) error {
-			return Reflect(ctx, store, c, job.AgentID, job.FromSHA)
+			return Reflect(ctx, deps.Store, deps.Completer, job.AgentID, job.FromSHA)
 		})
-		if !ran {
-			// Another worker holds this agent's reflection lock; retry later.
-			return r.RetryJob(ctx, job.ID, maxAttempts)
-		}
-		if err != nil {
-			// ErrConflict (agent advanced) or any reflection error → retry later.
+		if !ran || err != nil {
 			return r.RetryJob(ctx, job.ID, maxAttempts)
 		}
 		return r.CompleteJob(ctx, job.ID)
 	case "reindex":
-		if err := Reindex(ctx, store, emb, embCache, job.AgentID); err != nil {
+		if err := Reindex(ctx, deps.Store, deps.Emb, deps.EmbCache, job.AgentID); err != nil {
+			return r.RetryJob(ctx, job.ID, maxAttempts)
+		}
+		return r.CompleteJob(ctx, job.ID)
+	case "defrag":
+		ran, err := r.WithGlobalLock(ctx, agentKey(job.AgentID), func(ctx context.Context) error {
+			return Defrag(ctx, deps.Store, job.AgentID, deps.DefragMaxBytes)
+		})
+		if !ran || err != nil {
 			return r.RetryJob(ctx, job.ID, maxAttempts)
 		}
 		return r.CompleteJob(ctx, job.ID)
@@ -53,7 +65,7 @@ func processJob(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Co
 // within the same round (it was requeued by processJob) is RetryJob'd again
 // (attempts bumped a second time) and the round ends — so a perpetually-blocked
 // job can't busy-loop and fails out via maxAttempts within a few rounds.
-func DrainJobs(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Completer, emb search.Embedder, embCache cache.Cache, maxAttempts int) (int, error) {
+func DrainJobs(ctx context.Context, r *refs.Refs, deps Deps, maxAttempts int) (int, error) {
 	seen := map[int64]struct{}{}
 	processed := 0
 	for {
@@ -71,7 +83,7 @@ func DrainJobs(ctx context.Context, r *refs.Refs, store memstore.MemStore, c Com
 			return processed, nil
 		}
 		seen[job.ID] = struct{}{}
-		if err := processJob(ctx, r, store, c, emb, embCache, job, maxAttempts); err != nil {
+		if err := processJob(ctx, r, deps, job, maxAttempts); err != nil {
 			return processed, fmt.Errorf("maintenance: process job %d: %w", job.ID, err)
 		}
 		processed++

@@ -85,6 +85,17 @@ func (f fakeDrainCompleter) Complete(ctx context.Context, system, user string) (
 	return f.out, nil
 }
 
+func testDeps(t *testing.T, store *memstore.Store, c Completer) Deps {
+	t.Helper()
+	return Deps{
+		Store:          store,
+		Completer:      c,
+		Emb:            search.NewFakeEmbedder(64),
+		EmbCache:       cache.NewObjCache(objstore.NewLocal(t.TempDir())),
+		DefragMaxBytes: 16384,
+	}
+}
+
 func TestDrainReflectAndReindex(t *testing.T) {
 	ctx := context.Background()
 	pool := isolatedPool(t)
@@ -102,7 +113,7 @@ func TestDrainReflectAndReindex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	drained, err := DrainJobs(ctx, r, store, fakeDrainCompleter{out: "SUMMARY\n"}, search.NewFakeEmbedder(64), cache.NewObjCache(objstore.NewLocal(t.TempDir())), 5)
+	drained, err := DrainJobs(ctx, r, testDeps(t, store, fakeDrainCompleter{out: "SUMMARY\n"}), 5)
 	if err != nil {
 		t.Fatalf("drain: %v", err)
 	}
@@ -141,7 +152,7 @@ func TestDrainReflectRequeuesWhenAgentLockHeld(t *testing.T) {
 	// Hold the per-agent advisory lock, then drain inside it: the reflect job's
 	// inner per-agent lock acquire must fail → job requeued (not completed).
 	ran, err := r.WithGlobalLock(ctx, agentKey(agentID), func(ctx context.Context) error {
-		_, derr := DrainJobs(ctx, r, store, fakeDrainCompleter{out: "X"}, search.NewFakeEmbedder(64), cache.NewObjCache(objstore.NewLocal(t.TempDir())), 5)
+		_, derr := DrainJobs(ctx, r, testDeps(t, store, fakeDrainCompleter{out: "X"}), 5)
 		return derr
 	})
 	if err != nil {
@@ -153,6 +164,37 @@ func TestDrainReflectRequeuesWhenAgentLockHeld(t *testing.T) {
 	n, _ := r.CountJobs(ctx, agentID)
 	if n == 0 {
 		t.Fatal("reflect job should remain (requeued) while agent lock was held")
+	}
+}
+
+func TestDrainDefrag(t *testing.T) {
+	ctx := context.Background()
+	pool := isolatedPool(t)
+	r := refs.New(pool)
+	store := memstore.New(objstore.NewLocal(t.TempDir()), r)
+	agentID := "a1"
+	big := "# Alpha\n" + strings.Repeat("a", 40) + "\n# Beta\n" + strings.Repeat("b", 40) + "\n"
+	if _, err := store.CreateAgent(ctx, agentID, map[string]string{"notes/big.md": big}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.EnqueueJob(ctx, agentID, "defrag", "h"); err != nil {
+		t.Fatal(err)
+	}
+	deps := Deps{Store: store, Completer: fakeDrainCompleter{}, Emb: search.NewFakeEmbedder(64), EmbCache: cache.NewObjCache(objstore.NewLocal(t.TempDir())), DefragMaxBytes: 50}
+	processed, err := DrainJobs(ctx, r, deps, 5)
+	if err != nil || processed != 1 {
+		t.Fatalf("drain: processed=%d err=%v", processed, err)
+	}
+	if j, _ := r.ClaimJob(ctx); j != nil {
+		t.Fatalf("queue should be empty, got %+v", j)
+	}
+	nh, _ := store.ResolveHead(ctx, agentID)
+	dir := t.TempDir()
+	if err := store.Materialize(ctx, agentID, nh, dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "notes", "big.01.md")); err != nil {
+		t.Fatalf("defrag via drain should have split big.md: %v", err)
 	}
 }
 

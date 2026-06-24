@@ -66,6 +66,16 @@ func dur(key, def string) time.Duration {
 	return d
 }
 
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+		log.Fatalf("invalid %s: %q", key, v)
+	}
+	return def
+}
+
 func main() {
 	ctx := context.Background()
 	dsn := env("ENGRAM_DB", "postgres://postgres:engram@localhost:5433/engram?sslmode=disable")
@@ -124,6 +134,14 @@ func main() {
 	}
 	embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
 
+	deps := maintenance.Deps{
+		Store:          store,
+		Completer:      completer,
+		Emb:            emb,
+		EmbCache:       embCache,
+		DefragMaxBytes: envInt("ENGRAM_DEFRAG_MAX_BYTES", 16384),
+	}
+
 	log.Printf("maintenance worker started: interval=%s grace=%s obj=%s", interval, grace, objRoot)
 	for {
 		ran, err := r.WithGlobalLock(ctx, gcLockKey, func(ctx context.Context) error {
@@ -141,7 +159,7 @@ func main() {
 			}
 			log.Printf("gc: agents=%d scanned=%d swept=%d kept=%d statErrors=%d delErrors=%d",
 				len(heads), stats.Scanned, stats.Swept, stats.Kept, stats.StatErrors, stats.DelErrors)
-			processed, derr := maintenance.DrainJobs(ctx, r, store, completer, emb, embCache, maxAttempts)
+			processed, derr := maintenance.DrainJobs(ctx, r, deps, maxAttempts)
 			if derr != nil {
 				return derr
 			}
