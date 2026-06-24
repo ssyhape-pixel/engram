@@ -8,6 +8,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -118,7 +119,7 @@ func main() {
 		emb = search.NewFakeEmbedder(0)
 	}
 	embObjRoot := env("ENGRAM_EMB_OBJ", "./engram-embeddings")
-	if embObjRoot == objRoot {
+	if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
 		log.Fatal("ENGRAM_EMB_OBJ must differ from ENGRAM_OBJ (GC must never sweep the embedding store)")
 	}
 	embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
