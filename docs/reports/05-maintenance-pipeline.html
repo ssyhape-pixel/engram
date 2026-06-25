@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · 维护管线</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
+</head>
+<body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html">总览索引</a>
+  <a href="01-architecture-overview.html">① 架构总览</a>
+  <a href="02-request-path.html">② 请求路径</a>
+  <a href="03-storage-consistency.html">③ 存储与一致性</a>
+  <a href="04-search-index.html">④ 搜索与索引</a>
+  <a href="05-maintenance-pipeline.html" class="active">⑤ 维护管线</a>
+  <a href="06-build-journey.html">⑥ 构建历程</a>
+</nav>
+<main>
+
+<p class="meta">L5a · L5b · L5c · L5d · GC mark-sweep · memory_jobs · reflection · defrag · reaper</p>
+<h1>⑤ 维护管线</h1>
+<p class="lead">一个后台 Go worker，在前台请求路径之外运行——GC、反射整合、碎片整理、失效 job 回收——
+全部幂等、可重推导，无需 Temporal 或 Kafka。</p>
+
+<!-- ────────────────────────────────────────────── §1 总览 -->
+<h2 id="s1">1. 维护 worker 概览</h2>
+
+<p>
+Engram 的维护管线是一个单进程 Go worker（<code>cmd/maintenance/main.go</code>），
+与请求路径完全分离。它的职责是：
+</p>
+<ul>
+  <li><strong>GC</strong>：mark-sweep 清除不可达且超出宽限期的 content-addressed 对象（L5a）；</li>
+  <li><strong>Reaper</strong>：将因 worker 崩溃而停留在 <code>running</code> 状态的 job 回收到 <code>pending</code>（L5d）；</li>
+  <li><strong>Defrag 扫描</strong>：遍历所有 agent，为包含可拆分 <code>.md</code> 文件的 agent 幂等入队 <code>defrag</code> job（L5c）；</li>
+  <li><strong>DrainJobs</strong>：依次消费 <code>memory_jobs</code> 中的 pending 条目，派发 reflect / reindex / defrag（L5b / L5c）。</li>
+</ul>
+
+<p>
+每一项操作都是<strong>幂等的、可重推导的</strong>：GC 只删除已确认不可达的对象；
+reflect / defrag 通过 CAS 写入，冲突则重试；reindex 纯粹填充 embedding 缓存，无副作用。
+这就是为什么不需要 Temporal 或 Kafka——job 不携带不可再生的中间状态，崩溃重启即可重做。
+</p>
+
+<h3>单 round 流程</h3>
+
+<pre class="mermaid">
+flowchart TD
+    TIMER([定时器到期]) --> LOCK[WithGlobalLock gcLockKey=1]
+    LOCK -->|未获锁| SKIP[跳过本轮]
+    LOCK -->|获锁| GC[GC mark-sweep\n清除不可达对象]
+    GC --> REAP[ReapStaleJobs\n回收 stale running job]
+    REAP --> SCAN[EnqueueDefrag\n扫描全部 agent 幂等入队]
+    SCAN --> DRAIN[DrainJobs\n逐条消费 pending job]
+    DRAIN --> UNLOCK[释放全局锁]
+    UNLOCK --> SLEEP[Sleep ENGRAM_GC_INTERVAL]
+    SLEEP --> TIMER
+</pre>
+<p class="fileref">cmd/maintenance/main.go:148–185</p>
+
+<p>
+整个 round 包裹在一个 Postgres session 级 advisory lock（<code>gcLockKey=1</code>）之内，
+保证在任何时刻最多只有一个 worker 实例在执行维护，水平扩展时自动降级为主备。
+</p>
+
+<div class="callout invariant">
+  <span class="tag">不变量</span>
+  维护 worker 运行在请求路径之外，永不阻塞前台 agent 会话。
+  所有写入均通过与前台相同的 CommitWithCAS 接口进行，确保单一一致性控制点。
+</div>
+
+<!-- ────────────────────────────────────────────── §2 状态机 -->
+<h2 id="s2">2. memory_jobs 状态机</h2>
+
+<h3>表结构与关键列</h3>
+
+<p>
+<code>memory_jobs</code> 是 Postgres 中驱动整个维护管线的任务队列。其核心列为：
+</p>
+
+<table>
+  <thead>
+    <tr><th>列</th><th>类型</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>id</code></td><td>bigserial PK</td><td>全局唯一 job ID</td></tr>
+    <tr><td><code>agent_id</code></td><td>text</td><td>归属 agent</td></tr>
+    <tr><td><code>kind</code></td><td>text</td><td><code>reflect</code> / <code>reindex</code> / <code>defrag</code></td></tr>
+    <tr><td><code>from_sha</code></td><td>text nullable</td><td>入队时的 HEAD commit SHA（供 diff-since 用）</td></tr>
+    <tr><td><code>state</code></td><td>text</td><td><code>pending</code> / <code>running</code> / <code>failed</code></td></tr>
+    <tr><td><code>attempts</code></td><td>int default 0</td><td>已尝试次数；达到 maxAttempts 转为 <code>failed</code></td></tr>
+    <tr><td><code>claimed_at</code></td><td>timestamptz nullable</td><td>最近一次被 claim 的时间；Reaper 据此判断是否 stale</td></tr>
+  </tbody>
+</table>
+
+<p>
+<strong>入队来源有两类</strong>：
+</p>
+<ul>
+  <li><strong>同事务入队（commit 路径）</strong>：<code>CommitRef</code> 在同一 Postgres tx 里推进 HEAD 并插入 <code>reflect</code>/<code>reindex</code> job，
+    保证 job 当且仅当 commit 成功时存在（替代 Kafka + outbox 模式）。</li>
+  <li><strong>带外入队（defrag 扫描）</strong>：<code>EnqueueJob</code> 通过 partial-unique index <code>(agent_id, kind) WHERE state='pending'</code>
+    做 <code>ON CONFLICT DO NOTHING</code>，同一 agent 的同类 pending job 永远只有一行。</li>
+</ul>
+
+<h3>状态转换</h3>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> pending : CommitRef 或 EnqueueJob 入队
+    pending --> running : ClaimJob FOR UPDATE SKIP LOCKED
+    running --> done : CompleteJob 删除行
+    done --> [*]
+    running --> pending : RetryJob attempts 未达上限
+    running --> failed : RetryJob attempts 达到 maxAttempts
+    running --> pending : ReapStaleJobs claimed_at 超时
+    running --> failed : ReapStaleJobs attempts 达到 maxAttempts
+    failed --> [*] : 不再重试 留存审计
+</pre>
+
+<div class="callout win">
+  <span class="tag">设计亮点</span>
+  完成（done）状态即行删除，不留墓碑——队列只包含活跃工作，历史完成量对表大小无影响。
+  <code>failed</code> 行留存供审计排查（不会被 Drain 或 Reaper 二次处理）。
+</div>
+
+<!-- ────────────────────────────────────────────── §3 SKIP LOCKED -->
+<h2 id="s3">3. SKIP LOCKED 消费</h2>
+
+<p>
+<code>ClaimJob</code>（<code>refs/refs.go:122</code>）用一个两步事务原子地"抢占"一行 pending job：
+</p>
+
+<pre><code>// ClaimJob atomically claims one pending job (FOR UPDATE SKIP LOCKED, no ORDER
+// BY — queue hygiene) and marks it 'running'. Returns nil if none pending.
+func (r *Refs) ClaimJob(ctx context.Context) (*DequeuedJob, error) {
+    tx, err := r.pool.Begin(ctx)
+    ...
+    err = tx.QueryRow(ctx,
+        `SELECT id, agent_id, kind, from_sha, attempts FROM memory_jobs
+         WHERE state='pending' FOR UPDATE SKIP LOCKED LIMIT 1`).
+        Scan(&j.ID, &j.AgentID, &j.Kind, &fromSHA, &j.Attempts)
+    ...
+    tx.Exec(ctx,
+        `UPDATE memory_jobs SET state='running', claimed_at=now() WHERE id=$1`, j.ID)
+    tx.Commit(ctx)
+    return &j, nil
+}</code></pre>
+<p class="fileref">internal/memstore/refs/refs.go:122–151</p>
+
+<p>
+几个关键设计点：
+</p>
+<ul>
+  <li><strong>FOR UPDATE SKIP LOCKED</strong>：跳过被其他事务锁定的行，天然支持多 worker（尽管当前单 worker），
+    避免锁等待导致 claim 挂起。</li>
+  <li><strong>无 ORDER BY</strong>：队列公平性（所谓 queue hygiene）——不对 pending job 排序，
+    防止因某类 job 长期失败而饥饿其他 job。</li>
+  <li><strong>LIMIT 1</strong>：每次只取一行，保持细粒度进度与错误边界。</li>
+  <li><strong>claimed_at=now()</strong>：标记声领时间，供 Reaper 后续判断是否超时。</li>
+</ul>
+
+<p>
+<strong>CompleteJob</strong> 直接删除行（<code>DELETE FROM memory_jobs WHERE id=$1</code>）；
+<strong>RetryJob</strong> 执行 attempts++ 并根据是否达到 maxAttempts 将 state 设为 <code>pending</code> 或 <code>failed</code>，
+同时清空 <code>claimed_at</code>：
+</p>
+
+<pre><code>UPDATE memory_jobs
+SET attempts = attempts + 1,
+    state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END,
+    claimed_at = NULL
+WHERE id=$1</code></pre>
+<p class="fileref">internal/memstore/refs/refs.go:164–174</p>
+
+<!-- ────────────────────────────────────────────── §4 Deps + DrainJobs -->
+<h2 id="s4">4. Deps 派发与 DrainJobs</h2>
+
+<h3>Deps 结构体</h3>
+
+<p>
+<code>Deps</code> 是 DrainJobs 的依赖容器，按 job kind 分离关注点：
+</p>
+
+<pre><code>type Deps struct {
+    Store          memstore.MemStore
+    Completer      Completer       // reflect
+    Emb            search.Embedder // reindex
+    EmbCache       cache.Cache     // reindex
+    DefragMaxBytes int             // defrag
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:15–21</p>
+
+<p>
+这样 <code>processJob</code> 的每个分支只取用自己需要的字段，且各 handler 依赖独立可 mock。
+</p>
+
+<h3>processJob 派发</h3>
+
+<pre><code>func processJob(ctx context.Context, r *refs.Refs, deps Deps,
+    job *refs.DequeuedJob, maxAttempts int) error {
+    switch job.Kind {
+    case "reflect":
+        ran, err := r.WithGlobalLock(ctx, agentKey(job.AgentID), func(ctx context.Context) error {
+            return Reflect(ctx, deps.Store, deps.Completer, job.AgentID, job.FromSHA)
+        })
+        if !ran || err != nil {
+            return r.RetryJob(ctx, job.ID, maxAttempts)
+        }
+        return r.CompleteJob(ctx, job.ID)
+    case "reindex":
+        if err := Reindex(ctx, deps.Store, deps.Emb, deps.EmbCache, job.AgentID); err != nil {
+            return r.RetryJob(ctx, job.ID, maxAttempts)
+        }
+        return r.CompleteJob(ctx, job.ID)
+    case "defrag":
+        ran, err := r.WithGlobalLock(ctx, agentKey(job.AgentID), func(ctx context.Context) error {
+            return Defrag(ctx, deps.Store, job.AgentID, deps.DefragMaxBytes)
+        })
+        if !ran || err != nil {
+            return r.RetryJob(ctx, job.ID, maxAttempts)
+        }
+        return r.CompleteJob(ctx, job.ID)
+    default:
+        // Unknown kind: discard so it can't clog the queue.
+        return r.CompleteJob(ctx, job.ID)
+    }
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:34–61</p>
+
+<p>
+三条核心规则贯穿所有分支：
+</p>
+<ol>
+  <li><strong>总是解决 job</strong>：无论成功或失败，processJob 一定调用 CompleteJob 或 RetryJob，
+    job 行绝不会永久停留在 <code>running</code>。</li>
+  <li><strong>未知 kind 直接 Complete</strong>：unknown job 不重试，避免僵尸 job 堵塞队列。</li>
+  <li><strong>未获到 per-agent lock（ran=false）视为失败</strong>：退回 RetryJob，等下一轮再试。</li>
+</ol>
+
+<h3>DrainJobs 与 seen-set 防忙循环</h3>
+
+<pre><code>func DrainJobs(ctx context.Context, r *refs.Refs, deps Deps, maxAttempts int) (int, error) {
+    seen := map[int64]struct{}{}
+    processed := 0
+    for {
+        job, err := r.ClaimJob(ctx)
+        ...
+        if job == nil {
+            return processed, nil   // 队列已空
+        }
+        if _, dup := seen[job.ID]; dup {
+            // 同一 round 内再次见到同一 job —— 它被 requeue 了
+            // 再 Retry 一次（bumps attempts）然后结束本轮
+            if err := r.RetryJob(ctx, job.ID, maxAttempts); err != nil { ... }
+            return processed, nil
+        }
+        seen[job.ID] = struct{}{}
+        if err := processJob(ctx, r, deps, job, maxAttempts); err != nil { ... }
+        processed++
+    }
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:68–91</p>
+
+<p>
+<code>seen</code> 集合记录本 round 内已处理过的 job ID。如果一个 job 被 RetryJob 回到 <code>pending</code> 并被同 round 的下一次 ClaimJob 再次取到，
+则立刻再 RetryJob（第二次 bump attempts）并终止本轮循环——
+防止单个反复失败的 job 导致本 round 无限消耗资源，并借助 maxAttempts 在若干 round 内最终使其进入 <code>failed</code>。
+</p>
+
+<div class="callout gotcha">
+  <span class="tag">注意</span>
+  seen-set 只在一个 DrainJobs 调用（一轮）内有效，不跨 round 持久化。
+  每轮 drain 前 GC 和 Reap 已先行执行，stale running job 已被回收，所以 drain 开始时 seen 集合总是干净的。
+</div>
+
+<!-- ────────────────────────────────────────────── §5 per-agent advisory lock -->
+<h2 id="s5">5. per-agent advisory lock 与防自触发循环</h2>
+
+<h3>agentKey：FNV 哈希到 advisory lock key</h3>
+
+<pre><code>func agentKey(agentID string) int64 {
+    h := fnv.New64a()
+    _, _ = h.Write([]byte(agentID))
+    return int64(h.Sum64())
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:25–30</p>
+
+<p>
+每个 agent 的 reflect 和 defrag job 都在 <code>WithGlobalLock(ctx, agentKey(agentID), ...)</code> 下运行。
+这是<strong>维护侧的单例锁</strong>，防止同 agent 的多个 job（例如同 round 内有多个 reflect job 时）并发写入。
+</p>
+
+<p>
+哈希碰撞只会让两个 agent 偶尔串行化，不影响正确性——advisory lock 是"尽力而为"的串行化，
+真正的正确性由 CommitWithCAS 的 CAS 保障。
+</p>
+
+<h3>jobs=nil：切断自触发回路</h3>
+
+<p>
+reflect 和 defrag 在写回时均调用：
+</p>
+
+<pre><code>// jobs=nil: reflection never enqueues a reflect job (no self-trigger loop).
+if _, err := store.CommitWithCAS(ctx, agentID, head, dir, nil); err != nil { ... }</code></pre>
+<p class="fileref">internal/maintenance/reflect.go:72 &nbsp;|&nbsp; internal/maintenance/defrag.go:159</p>
+
+<p>
+<code>CommitWithCAS</code> 接受 <code>jobs []refs.Job</code> 参数，传入 <code>nil</code> 表示本次提交不入队任何维护 job。
+这与前台 agent 提交（传入 <code>reflect</code>/<code>reindex</code>）形成对比：
+<strong>维护提交永远不会触发新的维护 job</strong>，从根本上断开反馈回路。
+</p>
+
+<div class="callout invariant">
+  <span class="tag">不变量</span>
+  maintenance commit 使用 jobs=nil，因此不会自我触发 reflect 或 defrag job。
+  这是防止维护管线进入无限自增长循环的结构性保障，而非依赖运行时检查。
+</div>
+
+<h3>CAS 冲突 → ErrConflict → 重试</h3>
+
+<p>
+如果 agent 在维护写入期间推进了 HEAD（前台并发写），CommitWithCAS 的 CAS 会失败，
+reflect.go 和 defrag.go 均将其转化为 <code>ErrConflict</code>，
+processJob 随即调用 RetryJob 将 job 还回 <code>pending</code>。
+下一轮 Drain 时 Reflect 会重新 ResolveHead，看到最新状态再做整合——
+<strong>绝不做有损的强制覆盖</strong>。
+</p>
+
+<!-- ────────────────────────────────────────────── §6 Reflection -->
+<h2 id="s6">6. Reflection（反射整合）</h2>
+
+<h3>Completer 窄接口</h3>
+
+<pre><code>type Completer interface {
+    Complete(ctx context.Context, system, user string) (string, error)
+}</code></pre>
+<p class="fileref">internal/maintenance/reflect.go:18–20</p>
+
+<p>
+Reflection 只需要一次文本补全，因此抽象为最小接口 <code>Completer</code>，
+与 agent 包的全功能 <code>LLMProvider</code>（含工具调用协议）解耦。
+<code>cmd/maintenance/main.go</code> 根据 <code>ENGRAM_PROVIDER</code> 环境变量提供两种适配器：
+</p>
+
+<table>
+  <thead>
+    <tr><th>适配器</th><th>用途</th><th>实现</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>providerCompleter</code></td>
+      <td>生产环境，调用真实 LLM</td>
+      <td>包装 <code>agent.LLMProvider.Generate</code>，抽取 <code>resp.Text</code></td>
+    </tr>
+    <tr>
+      <td><code>fixedCompleter</code></td>
+      <td>开发/测试，无 API 调用</td>
+      <td>返回常量字符串 <code>"(fake reflection) consolidated\n"</code></td>
+    </tr>
+  </tbody>
+</table>
+<p class="fileref">cmd/maintenance/main.go:28–49</p>
+
+<h3>Reflect 执行流程</h3>
+
+<p>
+<code>Reflect</code>（<code>reflect.go:38</code>）的完整路径：
+</p>
+<ol>
+  <li><strong>ResolveHead</strong>：取当前 HEAD（忽略 fromSHA，总是看最新状态；fromSHA 保留供未来 diff-since 使用）。</li>
+  <li><strong>Materialize</strong>：将 HEAD tree 物化到临时目录。</li>
+  <li><strong>readSystemDir</strong>：遍历 <code>system/</code> 子目录，将所有文件拼接为带路径标题的字符串。
+    若 <code>system/</code> 不存在，返回 <code>("", nil)</code>。</li>
+  <li><strong>空常驻集跳过</strong>：<code>if resident == "" { return nil }</code>——当 system/ 为空时不提交任何内容，避免产生无意义的 commit churn。</li>
+  <li><strong>Complete</strong>：调用 Completer，传入 <code>reflectSystemPrompt</code> + 居民内容，获得整合摘要。</li>
+  <li><strong>写入 system/reflection.md</strong>：将 LLM 输出写到物化目录中。</li>
+  <li><strong>CommitWithCAS(jobs=nil)</strong>：CAS 提交，冲突返回 ErrConflict。</li>
+</ol>
+
+<h3>readSystemDir 错误传播</h3>
+
+<pre><code>walkErr := filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
+    if err != nil {
+        if errors.Is(err, fs.ErrNotExist) {
+            return fs.SkipAll // no system/ dir yet — fine
+        }
+        return err   // genuine error: propagate
+    }
+    ...
+})
+if walkErr != nil { // SkipAll resolves to nil, so this is a genuine error
+    return "", fmt.Errorf("maintenance: read system/: %w", walkErr)
+}</code></pre>
+<p class="fileref">internal/maintenance/reflect.go:86–107</p>
+
+<p>
+<code>fs.ErrNotExist</code>（system/ 目录尚未创建）通过 <code>SkipAll</code> 静默处理，
+WalkDir 返回 <code>nil</code>，readSystemDir 返回 <code>""</code>，上层跳过本次整合。
+其他读取错误（权限问题、IO 故障）则向上传播，最终触发 RetryJob。
+</p>
+
+<div class="callout win">
+  <span class="tag">设计亮点</span>
+  Reflect 总是基于最新 HEAD（不是 fromSHA 快照），确保整合结果不会基于过时的居民集。
+  fromSHA 字段已保留，为未来 diff-since-last-reflect 优化提供钩子，
+  届时可以只把变化部分送给 LLM 而非全量重读。
+</div>
+
+<!-- ────────────────────────────────────────────── §7 Defrag -->
+<h2 id="s7">7. Defrag（碎片整理）</h2>
+
+<h3>可拆分性判断</h3>
+
+<p>
+一个文件符合拆分条件（<code>isSplittable</code>）需同时满足三个条件：
+</p>
+<ol>
+  <li>以 <code>.md</code> 结尾；</li>
+  <li>字节大小超过 <code>maxBytes</code>（默认 <code>ENGRAM_DEFRAG_MAX_BYTES=16384</code>）；</li>
+  <li><code>splitTopLevel</code> 解析后至少产生 2 个部分（即至少有 2 个 <code># </code> 顶级标题）。</li>
+</ol>
+
+<pre><code>func isSplittable(path string, content []byte, maxBytes int) bool {
+    return strings.HasSuffix(path, ".md") &&
+        len(content) > maxBytes &&
+        len(splitTopLevel(content)) >= 2
+}</code></pre>
+<p class="fileref">internal/maintenance/defrag.go:52–54</p>
+
+<h3>splitTopLevel：按顶级标题切分</h3>
+
+<pre><code>func splitTopLevel(content []byte) [][]byte {
+    var parts [][]byte
+    var cur []byte
+    flush := func() {
+        if len(bytes.TrimSpace(cur)) > 0 {
+            parts = append(parts, cur)
+        }
+        cur = nil
+    }
+    for _, ln := range bytes.SplitAfter(content, []byte("\n")) {
+        if len(ln) == 0 { continue }
+        if isTopHeading(ln) { flush() }
+        cur = append(cur, ln...)
+    }
+    flush()
+    return parts
+}</code></pre>
+<p class="fileref">internal/maintenance/defrag.go:24–44</p>
+
+<p>
+只有 <code># </code>（单个 <code>#</code> 加空格）开头的行触发切分，<code>##</code> 及以上不是切分点。
+首个顶级标题之前的前导内容（preamble）若含非空白字符则成为第 0 部分。
+</p>
+
+<h3>收敛性：结构性而非尺寸性</h3>
+
+<p>
+Defrag 的收敛不依赖"切分后每部分都小于 maxBytes"，而是依赖结构性约束：
+</p>
+
+<blockquote>
+每个拆分产生的 <code>base.NN.md</code> 部分<strong>恰好包含一个顶级标题</strong>（就是那个触发切分的 <code># </code> 行）。
+因此对该部分调用 <code>splitTopLevel</code> 只返回 1 个元素，<code>isSplittable</code> 为 false。
+下一轮扫描不会为它再入队 defrag job，下一次 Defrag 也不会对它再拆分。
+</blockquote>
+
+<p>
+副作用：<strong>单个超大节（大于 maxBytes 但只有一个顶级标题）永远不会被拆分</strong>，
+因为 splitTopLevel 只返回 1 部分。这是故意为之——
+强行按字节截断 markdown 会产生损坏的语义结构；拆分应由文档结构决定，不由字节数决定。
+</p>
+
+<h3>Defrag 执行 + 命名方案</h3>
+
+<pre><code>for _, tg := range targets {
+    base := strings.TrimSuffix(tg.abs, ".md")
+    for i, p := range tg.parts {
+        out := fmt.Sprintf("%s.%02d.md", base, i+1)
+        os.WriteFile(out, p, 0o644)
+    }
+    os.Remove(tg.abs)
+}
+// jobs=nil: 不自触发
+store.CommitWithCAS(ctx, agentID, head, dir, nil)</code></pre>
+<p class="fileref">internal/maintenance/defrag.go:146–164</p>
+
+<p>
+原文件 <code>notes.md</code> 被删除，各部分写为 <code>notes.01.md</code>、<code>notes.02.md</code>……
+若 targets 为空（没有可拆分文件）则直接返回，不产生空 commit。
+</p>
+
+<h3>Defrag 全流程</h3>
+
+<pre class="mermaid">
+flowchart LR
+    S1[EnqueueDefrag\n扫描每个 agent] -->|发现可拆分文件| S2[EnqueueJob defrag\nON CONFLICT DO NOTHING]
+    S2 --> S3[DrainJobs ClaimJob defrag]
+    S3 --> S4[Defrag 物化工作目录]
+    S4 --> S5[splitTopLevel 拆分\n写 base.NN.md\n删除原文件]
+    S5 --> S6[CommitWithCAS jobs=nil]
+    S6 -->|下轮扫描| S7{isSplittable?}
+    S7 -->|每部分只含 1 个顶级标题\n不可再拆| S8[不入队 已收敛]
+    S7 -->|仍可拆| S2
+</pre>
+
+<div class="callout invariant">
+  <span class="tag">不变量</span>
+  收敛性由结构保证：每次拆分后各部分恰好有 1 个顶级标题，使 isSplittable 对其永久返回 false，
+  与文件大小无关（单节超大文件保持完整）。
+</div>
+
+<!-- ────────────────────────────────────────────── §8 Reaper -->
+<h2 id="s8">8. Reaper：stale running job 回收</h2>
+
+<p>
+如果 worker 进程在处理 job 的过程中崩溃，该 job 的 state 停留在 <code>running</code>，
+<code>claimed_at</code> 不再更新。下一轮的 <code>ReapStaleJobs</code> 将其回收：
+</p>
+
+<pre><code>func (r *Refs) ReapStaleJobs(ctx context.Context, before time.Time, maxAttempts int) (int, error) {
+    tag, err := r.pool.Exec(ctx,
+        `UPDATE memory_jobs
+         SET attempts = attempts + 1,
+             state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END,
+             claimed_at = NULL
+         WHERE state='running' AND (claimed_at IS NULL OR claimed_at < $1)`,
+        before, maxAttempts)
+    ...
+    return int(tag.RowsAffected()), nil
+}</code></pre>
+<p class="fileref">internal/memstore/refs/refs.go:181–193</p>
+
+<p>
+<code>before = time.Now().Add(-reapAfter)</code>，其中 <code>reapAfter</code> 默认 10 分钟（<code>ENGRAM_JOB_REAP_AFTER</code>）。
+<code>claimed_at IS NULL</code> 处理了极端情况：行处于 running 但 claimed_at 从未被写入（不应发生，但防御性处理）。
+</p>
+
+<p>
+<strong>毒药 job 保护</strong>：每次 Reap 也执行 <code>attempts++</code>，
+因此一个每次都让 worker 崩溃的 job 在 maxAttempts 轮（崩溃→Reap→pending→崩溃……）后
+自动进入 <code>failed</code>，不再被 ClaimJob 取到。
+</p>
+
+<div class="callout gotcha">
+  <span class="tag">注意</span>
+  Reap 的设计前提是<strong>单 worker 假设</strong>：<code>reapAfter</code> 必须远大于任何单个 job 的预期执行时间。
+  若多 worker 并发运行（未来扩展），需将 reapAfter 设得更保守，或改用心跳续约机制，
+  避免将正常运行中的 job 误判为 stale。
+</div>
+
+<table>
+  <thead>
+    <tr><th>场景</th><th>claimed_at 状态</th><th>Reap 动作</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>worker 正常处理中</td><td>在 reapAfter 窗口内</td><td>不触碰</td></tr>
+    <tr><td>worker 崩溃，job 超时</td><td>早于 before</td><td>attempts++ → pending 或 failed</td></tr>
+    <tr><td>claimed_at 为 NULL（异常）</td><td>NULL</td><td>attempts++ → pending 或 failed</td></tr>
+    <tr><td>毒药 job，第 N 次 Reap</td><td>早于 before</td><td>attempts 达上限 → failed，终止循环</td></tr>
+  </tbody>
+</table>
+
+<!-- ────────────────────────────────────────────── §9 Round 顺序与配置 -->
+<h2 id="s9">9. Round 顺序与配置</h2>
+
+<h3>执行顺序的必要性</h3>
+
+<p>
+单 round 内的执行顺序并非随意，有逻辑依赖关系：
+</p>
+
+<table>
+  <thead>
+    <tr><th>步骤</th><th>原因必须在此位置</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>① GC</td>
+      <td>先于 drain，确保本轮清理的是最新可达集；GC 失败则整个 round 中止（不能用不完整的可达集删对象）</td>
+    </tr>
+    <tr>
+      <td>② ReapStaleJobs</td>
+      <td>先于 drain，确保 stale running job 已回到 pending，本轮 drain 能取到它们；scan/reap 错误仅记日志，不中止</td>
+    </tr>
+    <tr>
+      <td>③ EnqueueDefrag</td>
+      <td>先于 drain，确保本轮扫描出的 defrag job 在本轮 drain 中就能被处理（最快响应路径）；扫描错误仅记日志</td>
+    </tr>
+    <tr>
+      <td>④ DrainJobs</td>
+      <td>最后执行；drain 错误中止 round 但不影响已完成的 GC 和 reap</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+全部在 <code>WithGlobalLock(gcLockKey)</code> 内执行——整个 round 在同一个 Postgres session 上持有全局锁，
+同时只有一个 worker 实例执行任何维护操作。
+</p>
+
+<h3>环境变量配置表</h3>
+
+<table>
+  <thead>
+    <tr><th>环境变量</th><th>默认值</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ENGRAM_DB</code></td><td><code>postgres://postgres:engram@localhost:5433/engram?sslmode=disable</code></td><td>Postgres DSN</td></tr>
+    <tr><td><code>ENGRAM_OBJ</code></td><td><code>./engram-objects</code></td><td>对象存储根目录</td></tr>
+    <tr><td><code>ENGRAM_GC_INTERVAL</code></td><td><code>5m</code></td><td>每轮间隔（<code>time.ParseDuration</code>）</td></tr>
+    <tr><td><code>ENGRAM_GC_GRACE</code></td><td><code>1h</code></td><td>GC 宽限期：对象写入后至少多久才可被清除（保护飞行中提交）</td></tr>
+    <tr><td><code>ENGRAM_JOB_MAX_ATTEMPTS</code></td><td><code>5</code></td><td>job 失败后最多重试次数；超过则转 failed</td></tr>
+    <tr><td><code>ENGRAM_JOB_REAP_AFTER</code></td><td><code>10m</code></td><td>running job 超过此时长未更新 claimed_at 则被 Reap</td></tr>
+    <tr><td><code>ENGRAM_DEFRAG_MAX_BYTES</code></td><td><code>16384</code></td><td>单文件触发 defrag 的字节阈值</td></tr>
+    <tr><td><code>ENGRAM_PROVIDER</code></td><td><code>fake</code></td><td><code>fake</code> 用 fixedCompleter；<code>anthropic</code> 用真实 LLM</td></tr>
+    <tr><td><code>ANTHROPIC_API_KEY</code></td><td>—</td><td>当 ENGRAM_PROVIDER=anthropic 时必须设置</td></tr>
+    <tr><td><code>ENGRAM_EMBEDDER</code></td><td><code>fake</code></td><td><code>fake</code> 用随机向量；<code>voyage</code> 用 Voyage AI</td></tr>
+    <tr><td><code>VOYAGE_API_KEY</code></td><td>—</td><td>当 ENGRAM_EMBEDDER=voyage 时必须设置</td></tr>
+    <tr><td><code>ENGRAM_EMB_OBJ</code></td><td><code>./engram-embeddings</code></td><td>embedding 持久化存储根目录（必须与 ENGRAM_OBJ 不同，防止 GC 误清）</td></tr>
+  </tbody>
+</table>
+
+<div class="callout gotcha">
+  <span class="tag">陷阱</span>
+  <code>ENGRAM_EMB_OBJ</code> 与 <code>ENGRAM_OBJ</code> 设为同一路径时 worker 启动即 Fatal——
+  因为主对象存储的 GC 会将 embedding 对象（不在任何 commit tree 中）误判为不可达并删除。
+  两者必须物理隔离。
+  <p class="fileref" style="margin-top:8px">cmd/maintenance/main.go:133–135</p>
+</div>
+
+<h3>最佳努力 vs. 硬失败</h3>
+
+<p>
+round 内各步骤的错误策略是有意分层的：
+</p>
+<ul>
+  <li><strong>GC 失败</strong>：整个 round 返回错误，记日志，但不崩溃——下一轮重试。
+    原因：不能基于不完整的可达集删对象，宁可跳过一轮。</li>
+  <li><strong>ReapStaleJobs 失败</strong>：仅记日志（<code>log.Printf("reap error: %v", rerr)</code>），round 继续。
+    已 reap 的 job 等下轮处理；未能 reap 的 stale job 下轮再 reap。</li>
+  <li><strong>EnqueueDefrag 失败</strong>：仅记日志，round 继续。
+    本轮未入队的 defrag job 在下轮扫描时会再次入队（幂等）。</li>
+  <li><strong>DrainJobs 失败</strong>：round 返回错误，记日志。已处理的 job 不回滚（已 Complete/Retry）。</li>
+</ul>
+
+</main>
+<footer>Engram 深入解析报告 · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
+</body>
+</html>

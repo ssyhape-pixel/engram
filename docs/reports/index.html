@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · 深入解析报告</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
+</head>
+<body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html" class="active">总览索引</a>
+  <a href="01-architecture-overview.html">① 架构总览</a>
+  <a href="02-request-path.html">② 请求路径</a>
+  <a href="03-storage-consistency.html">③ 存储与一致性</a>
+  <a href="04-search-index.html">④ 搜索与索引</a>
+  <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>
+  <a href="06-build-journey.html">⑥ 构建历程</a>
+</nav>
+<main>
+  <h1>Engram 深入解析报告</h1>
+  <p class="lead">一座云端多租户 agent 记忆系统的完整剖析 —— 从内容寻址对象到后台维护管线。</p>
+  <p class="meta">基于 <code>main</code> 分支 · L1–L5d 全部实现并合并 · 生成于 2026-06</p>
+
+  <p>Engram 把一套 git 风格的「记忆文件系统」搬到服务端：<strong>内容寻址的不可变对象</strong> + <strong>Postgres 上对 <code>agent_id→HEAD</code> 的 CAS</strong> + <strong>无状态计算</strong>。每个 agent 拥有一个版本化的记忆仓库，由无状态 worker 服务；agent 能读取常驻记忆、按需召回长尾、跨会话持久地编辑记忆。设计刻意轻量——不上 Temporal、不上 Kafka——一切并发与一致性都汇聚到那一个 ref CAS 上。</p>
+
+  <blockquote>核心一句话：<strong>记忆是主动式（agentic）的，不是 RAG。</strong>推理前只装载常驻 <code>system/</code> + 一份廉价的树索引（文件名 + 描述）；长尾由模型在循环中通过 recall/read 工具自行拉取。</blockquote>
+
+  <h2>六份报告</h2>
+  <div class="cardgrid">
+    <div class="card">
+      <div class="num">报告 ①</div>
+      <h3><a href="01-architecture-overview.html">架构总览</a></h3>
+      <p>四个区、三条核心不变量、端到端数据流、关键设计决策、L1–L5d 分层地图。先读这份建立全局观。</p>
+    </div>
+    <div class="card">
+      <div class="num">报告 ②</div>
+      <h3><a href="02-request-path.html">请求路径</a></h3>
+      <p>Router 单写者锁、Session 多轮生命周期、上下文装配、recall/read/edit 工具、LLMProvider 抽象、提交与 CAS 冲突处理。</p>
+    </div>
+    <div class="card">
+      <div class="num">报告 ③</div>
+      <h3><a href="03-storage-consistency.html">存储与一致性</a></h3>
+      <p>系统的心脏：内容寻址对象模型、go-git Storer over ObjStore、ref CAS 单序列化点、「提交即一个 Postgres 事务」、GC 可达性 mark-sweep + 龄期宽限。</p>
+    </div>
+    <div class="card">
+      <div class="num">报告 ④</div>
+      <h3><a href="04-search-index.html">搜索与索引</a></h3>
+      <p>Hybrid 检索（trigram + Voyage 语义 + RRF）、变体 A 本地索引、L3 SHA 读缓存、embedding 持久化（ObjCache/Tiered）、增量 reindex、与 GC 的隔离。</p>
+    </div>
+    <div class="card">
+      <div class="num">报告 ⑤</div>
+      <h3><a href="05-maintenance-pipeline.html">维护管线</a></h3>
+      <p>memory_jobs 状态机、SKIP LOCKED 消费、Deps 派发、reflection、defrag（收敛）、reaper（claimed_at）、GC，以及每轮的全局锁循环。</p>
+    </div>
+    <div class="card">
+      <div class="num">报告 ⑥</div>
+      <h3><a href="06-build-journey.html">构建历程</a></h3>
+      <p>M1–M5 路线图与分层落地、brainstorm→spec→plan→subagent→双阶段审查→合并的工程规程、审查链抓到的真实 bug、测试隔离的故事、规模与状态。</p>
+    </div>
+  </div>
+
+  <h2>系统全景</h2>
+  <pre class="mermaid">
+flowchart TB
+  Client["客户端"]
+  subgraph Z1["① 请求路径"]
+    Router["Session Router<br/>单写者 per agent"]
+    Worker["Agent Worker<br/>无状态"]
+    LLM["LLM Provider"]
+  end
+  subgraph Z2["② 读加速器"]
+    Cache["SHA 读缓存"]
+    Search["搜索 本地索引"]
+  end
+  subgraph Z3["③ 权威存储"]
+    Obj["对象存储<br/>内容寻址不可变"]
+    PG["Postgres<br/>refs CAS 加 job 队列"]
+  end
+  subgraph Z4["④ 维护"]
+    Maint["Go worker 每轮<br/>GC 到 reap 到 defrag 到 drain"]
+  end
+  Client --> Router --> Worker --> LLM
+  Worker --> Cache
+  Worker --> Search
+  Worker -->|"先写对象 再 ref CAS 同一事务"| Obj
+  Worker --> PG
+  PG -->|"同事务入队 job"| Maint
+  Maint --> Obj
+  Maint --> PG
+  </pre>
+
+  <h2>分层地图</h2>
+  <table>
+    <thead><tr><th>层</th><th>交付</th><th>核心保证</th><th>深读</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1</strong></td><td>MemStore 核心（对象 + refs + CAS）</td><td>内容寻址不可变对象 + 单点 ref CAS + 先对象后 ref</td><td>报告 ③</td></tr>
+      <tr><td><strong>L2</strong></td><td>Agent Loop + Session</td><td>单写者 per agent + provider 无关 + agentic recall</td><td>报告 ②</td></tr>
+      <tr><td><strong>L3</strong></td><td>SHA 读缓存</td><td>内容寻址、永不失效（失效退化为 LRU 淘汰）</td><td>报告 ④</td></tr>
+      <tr><td><strong>L4</strong></td><td>Hybrid 搜索</td><td>trigram + Voyage 语义 + RRF 融合 + 降级</td><td>报告 ④</td></tr>
+      <tr><td><strong>L4b</strong></td><td>embedding 索引持久化 + 增量 reindex</td><td>持久内容寻址 embedding 库 + 与 GC 隔离</td><td>报告 ④</td></tr>
+      <tr><td><strong>L5a</strong></td><td>维护 GC</td><td>全局可达性 mark-sweep + 龄期宽限</td><td>报告 ③ / ⑤</td></tr>
+      <tr><td><strong>L5b</strong></td><td>memory_jobs 消费 + Reflection</td><td>SKIP LOCKED + per-agent 单例锁 + 防自触发 + 冲突退让</td><td>报告 ⑤</td></tr>
+      <tr><td><strong>L5c</strong></td><td>确定性 defrag</td><td>按顶层标题拆大文件 + 结构性收敛保证</td><td>报告 ⑤</td></tr>
+      <tr><td><strong>L5d</strong></td><td>stale-running reaper</td><td>claimed_at + 每轮回收崩溃搁浅的 job</td><td>报告 ⑤</td></tr>
+    </tbody>
+  </table>
+
+  <h2>阅读建议</h2>
+  <ul>
+    <li><strong>第一次了解全貌</strong>：① 架构总览 → ⑥ 构建历程，半小时建立全局观与工程方法认知。</li>
+    <li><strong>要改/接请求路径</strong>：② 请求路径（再按需翻 ③ 的 CAS 机制、④ 的缓存）。</li>
+    <li><strong>关心一致性/存储/GC</strong>：③ 存储与一致性是系统的心脏，最值得逐行读。</li>
+    <li><strong>做检索/embedding</strong>：④ 搜索与索引。</li>
+    <li><strong>做后台/运维</strong>：⑤ 维护管线（job 队列、reflection、defrag、reaper、每轮循环）。</li>
+  </ul>
+
+  <div class="callout win">
+    <div class="tag">状态</div>
+    M1–M5 路线图全部完成：10 个包、2 个可执行进程（<code>cmd/api</code> + <code>cmd/maintenance</code>）、9 个分层 merge。全套 <code>go test ./... -p 1</code> 序列化全绿、新包 <code>-race</code> 干净。唯一显式延后：embedding 库淘汰（派生、可重算、体量小，当前无压力）。
+  </div>
+</main>
+<footer>Engram 深入解析报告 · 共 6 份 + 本索引 · 共享 style.css + Mermaid CDN · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
+</body>
+</html>

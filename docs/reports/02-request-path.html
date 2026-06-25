@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · 请求路径</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
+</head>
+<body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html">总览索引</a>
+  <a href="01-architecture-overview.html">① 架构总览</a>
+  <a href="02-request-path.html" class="active">② 请求路径</a>
+  <a href="03-storage-consistency.html">③ 存储与一致性</a>
+  <a href="04-search-index.html">④ 搜索与索引</a>
+  <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>
+  <a href="06-build-journey.html">⑥ 构建历程</a>
+</nav>
+<main>
+
+<p class="meta">② 请求路径 · L1–L2（L3/L4 已集成） · 基于 main 分支</p>
+<h1>请求路径：Router · Session · Agent Loop · Tools</h1>
+<p class="lead">从客户端消息到持久化记忆提交的全链路——单写者保护、上下文装配、工具调用与 CAS 提交。</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §1  概览
+     ═══════════════════════════════════════════════════ -->
+<h2 id="overview">1. 概览</h2>
+
+<p>
+Engram 的<strong>请求路径</strong>（区域 ①）是唯一与 LLM provider 直接交互的路径。
+其设计哲学是：<em>计算无状态、存储有状态</em>。
+一个 <code>Session</code> 代表一次与某个 agent 的对话；它持有临时的
+chat history 和物化的工作目录，但真正的持久状态始终是记忆 repo（对象存储中的 git 树 + Postgres HEAD ref）。
+Session 结束时工作目录被销毁——下次打开时从 HEAD 重新物化，天然无泄漏。
+</p>
+
+<p>组件关系如下：</p>
+
+<pre class="mermaid">
+flowchart LR
+  CLI["cmd/api\n(stdin harness)"]
+  R["Router\n单写者锁\nclaim / free"]
+  S["Session\nchat history\nworkdir · dirty · HEAD"]
+  TS["Toolset\nlist · read · recall · edit"]
+  P["LLMProvider\n接口"]
+  FP["FakeProvider\n(测试脚本化)"]
+  AP["AnthropicProvider\n(Messages API)"]
+  MS["MemStore\nL1 权威存储"]
+  WD[("workdir\n物化工作树")]
+
+  CLI -->|Open / Send / Close| R
+  R -->|claim + Materialize| MS
+  R -->|返回| S
+  S -->|Generate| P
+  P -.实现.-> FP
+  P -.实现.-> AP
+  S -->|Dispatch| TS
+  TS --> WD
+  S -->|CommitWithCAS + 入队 reindex/reflect| MS
+</pre>
+
+<div class="callout invariant">
+  <span class="tag">核心不变量</span>
+  <strong>Session 是唯一写者。</strong>
+  Router 在进程内通过 <code>sync.Mutex + active map</code> 保证每个 agentID 同时只有一个活跃 Session。
+  跨 pod 的兜底是 Postgres ref CAS（<code>ErrCASConflict</code>）。
+  任何时候都不做有损的 markdown 合并。
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+     §2  Router：单写者
+     ═══════════════════════════════════════════════════ -->
+<h2 id="router">2. Router：单写者</h2>
+
+<h3>2.1 为什么需要单写者</h3>
+<p>
+记忆文件是结构化散文 Markdown。两个写者并发修改同一文件时，任何自动三方合并都是<strong>有损的</strong>——语义上下文会被丢失或混淆。
+因此 Engram 的设计决策是：对同一 agent 的写操作必须完全串行化，而不是乐观并发。
+Router 是进程内的第一道关口；Postgres ref CAS 是跨 pod 的最终兜底。
+</p>
+
+<h3>2.2 进程内锁：claim / free</h3>
+
+<p>Router 用一个 <code>sync.Mutex</code> 保护一张 <code>active map[string]bool</code>：</p>
+
+<pre><code>// internal/agent/router.go:24-34
+type Router struct {
+    store    memstore.MemStore
+    prov     LLMProvider
+    scratch  string
+    cache    cache.Cache   // sysCache — L3 system/ 读缓存
+    embCache cache.Cache   // embCache — L4 向量嵌入缓存（分离实例）
+    emb      search.Embedder
+
+    mu     sync.Mutex
+    active map[string]bool
+}</code></pre>
+
+<p>
+<span class="fileref">internal/agent/router.go:45-60</span>
+<code>claim(agentID)</code> 在锁下检查 active 映射：已存在则返回 <code>false</code>（非阻塞，不排队）；不存在则置为 <code>true</code>。
+<code>free(agentID)</code> 在锁下删除条目。
+<code>Open</code> 调用 <code>claim</code>，失败时立即返回 <code>ErrAgentBusy</code>，让调用方决定是否重试或排队。
+</p>
+
+<pre><code>// internal/agent/router.go:45-53
+func (r *Router) claim(agentID string) bool {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    if r.active[agentID] {
+        return false
+    }
+    r.active[agentID] = true
+    return true
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">设计选择</span>
+  锁的语义是<strong>准入</strong>，而非<strong>等待</strong>。
+  <code>ErrAgentBusy</code> 意味着"现在不行"，调用方决定重试策略。
+  这与整体"stateless workers"哲学一致：worker 不持有任何排队状态。
+</div>
+
+<h3>2.3 幂等释放：sync.Once</h3>
+
+<p>
+<span class="fileref">internal/agent/router.go:124-131</span>
+<code>Open</code> 把 <code>release</code> 包裹在 <code>sync.Once</code> 中再传给 Session：
+</p>
+
+<pre><code>var once sync.Once
+release := func() {
+    once.Do(func() {
+        os.RemoveAll(workdir)
+        r.free(agentID)
+    })
+}</code></pre>
+
+<p>
+这保证即使 <code>Session.Close()</code> 被调用两次（defer + 显式调用），也不会错误地释放一个<em>其他</em> Session 可能已重新获取的 claim。
+</p>
+
+<h3>2.4 sysCache vs embCache：两个独立缓存实例</h3>
+
+<p>
+<span class="fileref">internal/agent/router.go:38-42</span>
+<code>NewRouter</code> 接受两个分离的 <code>cache.Cache</code> 实例：
+</p>
+
+<table>
+  <thead><tr><th>参数</th><th>用途</th><th>键前缀</th><th>混用的风险</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>sysCache</code>（字段 <code>cache</code>）</td>
+      <td>L3 系统内容读缓存：<code>sys:&lt;subtree-SHA&gt;</code> 和 <code>idx:&lt;root-SHA&gt;</code></td>
+      <td><code>sys:</code> / <code>idx:</code></td>
+      <td rowspan="2">若同一实例，system/ 纯文本内容将写入向量嵌入存储，导致类型混淆和后端存储污染</td>
+    </tr>
+    <tr>
+      <td><code>embCache</code></td>
+      <td>L4b 向量嵌入持久化缓存（<code>cache.NewTiered</code> LRU + ObjCache）</td>
+      <td>embedding SHA</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+在 <span class="fileref">cmd/api/main.go:84-85</span> 可见装配时刻意使用不同对象根目录：
+<code>embObjRoot</code> 与 <code>objRoot</code> 相同时程序启动即 Fatal。
+</p>
+
+<h3>2.5 跨 pod 的兜底</h3>
+
+<p>
+进程内锁只能保护单 pod 范围。多 pod 部署时，两个 pod 各自持有不同 agent 的锁，不会冲突；但若 sticky routing 失效，同一 agent 可能被两个 pod 同时服务。
+此时兜底是 Postgres ref CAS（<a href="03-storage-consistency.html">见 ③ 存储与一致性</a>）：后写者会收到 <code>ErrCASConflict</code>，而不是静默覆盖。
+多 pod sticky routing 是 L5 的工作。
+</p>
+
+<h3>2.6 Open 的完整流程</h3>
+
+<p><span class="fileref">internal/agent/router.go:92-133</span></p>
+
+<pre class="mermaid">
+sequenceDiagram
+  participant C as 调用方
+  participant R as Router
+  participant M as MemStore
+
+  C->>R: Open(agentID)
+  alt 锁空闲
+    R->>R: claim(agentID) = true
+    R->>M: ResolveHead(agentID)
+    M-->>R: HEAD commit hash
+    R->>M: Materialize(HEAD, workdir)
+    M-->>R: 工作目录就绪
+    R->>R: 读 workdir 文件，构造 HybridSearch + Toolset
+    R-->>C: Session
+  else 已被占用
+    R-->>C: ErrAgentBusy
+  end
+  C->>C: sess.Send(...) 一轮或多轮
+  C->>R: sess.Close()
+  R->>R: once.Do - RemoveAll workdir + free(agentID)
+</pre>
+
+<p>
+注意 <code>search.NewHybrid</code> 在 <span class="fileref">internal/agent/router.go:122</span> 处构造，注入当前 workdir 的全部文件快照，作为本 Session 的本地搜索引擎。
+</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §3  Session 生命周期
+     ═══════════════════════════════════════════════════ -->
+<h2 id="session">3. Session 生命周期</h2>
+
+<h3>3.1 Session 的字段</h3>
+
+<p><span class="fileref">internal/agent/session.go:22-34</span></p>
+
+<pre><code>type Session struct {
+    agentID  string
+    store    memstore.MemStore
+    prov     LLMProvider
+    tools    *Toolset
+    head     memstore.CommitHash  // 当前已提交 HEAD
+    workdir  string               // 物化的临时工作目录
+    history  []Message            // 本 Session 的 chat history（临时）
+    dirty    bool                 // 本轮是否发生过 edit
+    maxSteps int                  // 防失控循环，默认 16
+    release  func()               // Close 时调用：RemoveAll + free
+    cache    cache.Cache          // L3 SHA 键缓存；nil = 每轮重算
+}</code></pre>
+
+<p>
+<code>history</code> 是纯内存、仅在本 Session 生命周期内有效。
+<code>dirty</code> 是本<em>轮</em>的写标记，commit 成功后归零。
+<code>head</code> 在每次成功提交后推进，始终对应对象存储中的真实 commit。
+</p>
+
+<h3>3.2 一个 Turn 的完整时序</h3>
+
+<p><span class="fileref">internal/agent/session.go:73-117</span></p>
+
+<pre class="mermaid">
+sequenceDiagram
+  participant U as 调用方
+  participant S as Session
+  participant P as LLMProvider
+  participant T as Toolset
+  participant W as workdir
+  participant M as MemStore
+
+  U->>S: Send(userMessage)
+  S->>S: history += user消息
+
+  loop 至多 maxSteps=16 步
+    S->>S: assembleSystem(ctx)
+    Note over S: sys/ 常驻内容 + tree index
+    S->>P: Generate(System, history, Tools)
+    alt 返回 ToolCalls（未完成）
+      P-->>S: ToolCalls
+      S->>S: history += assistant-toolcalls
+      loop 每个 ToolCall
+        S->>T: Dispatch(call)
+        T->>W: list / read / recall / edit
+        T-->>S: ToolResult
+      end
+      S->>S: history += tool-results
+      Note over S: edit 成功则 dirty=true
+    else 返回最终文本（完成）
+      P-->>S: Text
+      S->>S: history += assistant-text
+      Note over S: 跳出循环
+    end
+  end
+
+  alt dirty=true
+    S->>M: CommitWithCAS(head, workdir, reindex+reflect)
+    M-->>S: newHead
+    S->>S: head=newHead, dirty=false
+  else 纯读轮
+    Note over S,M: 不提交，HEAD 不变
+  end
+
+  S-->>U: 最终文本
+</pre>
+
+<h3>3.3 历史回滚机制</h3>
+
+<p>
+<span class="fileref">internal/agent/session.go:74</span>
+<code>Send</code> 在进入循环前记录当前 history 长度 <code>base := len(s.history)</code>。
+若 <code>assembleSystem</code> 或 <code>Generate</code> 失败，或 tool 循环超出 <code>maxSteps</code>，
+都执行 <code>s.history = s.history[:base]</code> 回滚，避免在 history 中留下悬空的 user 消息。
+commit 阶段失败则<em>不</em>回滚 history，保留 <code>dirty=true</code>，下一轮可重提交。
+</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §4  上下文装配
+     ═══════════════════════════════════════════════════ -->
+<h2 id="context-assembly">4. 上下文装配</h2>
+
+<p>
+每一步 Generate 前，<code>assembleSystem</code> 返回系统提示的完整字符串，由两部分拼接而成：
+</p>
+
+<table>
+  <thead><tr><th>部分</th><th>来源</th><th>缓存键（L3）</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>常驻 system/ 内容</td>
+      <td>workdir 中 <code>system/</code> 目录下全部文件</td>
+      <td><code>sys:&lt;systemSubtree-SHA&gt;</code></td>
+      <td>模型每轮都能看到的核心记忆（persona、规则、关键事实）</td>
+    </tr>
+    <tr>
+      <td>Tree index</td>
+      <td>walkDir 全树，提取 frontmatter <code>description:</code></td>
+      <td><code>idx:&lt;rootTree-SHA&gt;</code></td>
+      <td>"路径:描述"索引，让模型知道长尾文件的存在，按需 recall/read</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>4.1 缓存分支 vs 直接重算</h3>
+
+<p><span class="fileref">internal/agent/session.go:141-170</span></p>
+
+<pre><code>func (s *Session) assembleSystem(ctx context.Context) (string, error) {
+    if s.cache == nil || s.dirty {
+        return s.buildResident()  // dirty 或无缓存：从 workdir 重算
+    }
+    rootTree, systemSubtree, err := s.store.TreeKeys(ctx, s.head)
+    if err != nil {
+        return s.buildResident() // TreeKeys 读失败不致命；退化为重算
+    }
+    sysKey := "sys:" + string(systemSubtree)
+    sys, ok := s.cache.Get(sysKey)
+    if !ok {
+        built, berr := s.buildSystemContent()
+        if berr != nil { return "", berr }
+        sys = built
+        s.cache.Put(sysKey, sys)
+    }
+    idxKey := "idx:" + string(rootTree)
+    idx, ok := s.cache.Get(idxKey)
+    if !ok {
+        built, berr := s.buildTreeIndex()
+        if berr != nil { return "", berr }
+        idx = built
+        s.cache.Put(idxKey, idx)
+    }
+    return sys + idx, nil
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">缓存正确性</span>
+  缓存键是 <strong>immutable git tree hash</strong>，由 <code>TreeKeys</code> 从对象存储直接读取（不经 Postgres）。
+  只要 HEAD 未推进，<code>system/</code> 子树的内容不变，<code>sys:SHA</code> 永远有效。
+  workdir 有未提交改动时（<code>dirty=true</code>），缓存被绕过，直接从 workdir 重算——保证模型看到最新编辑。
+  详见 <a href="04-search-index.html">④ 搜索与索引（L3 缓存实现）</a>。
+</div>
+
+<h3>4.2 buildSystemContent</h3>
+
+<p>
+<span class="fileref">internal/agent/session.go:187-213</span>
+遍历 <code>workdir/system/</code>，若目录不存在则返回空（通过 <code>fs.SkipAll</code> 静默处理，不报错）。
+任何<em>真实</em>读取错误（权限、I/O）都被传播，以防缓存到部分内容。
+</p>
+
+<pre><code>b.WriteString("# Resident memory (system/)\n")
+// 对每个文件：
+fmt.Fprintf(&amp;b, "\n## %s\n%s\n", rel, string(data))</code></pre>
+
+<h3>4.3 buildTreeIndex</h3>
+
+<p>
+<span class="fileref">internal/agent/session.go:217-238</span>
+遍历 workdir 全树，对每个文件调用 <code>frontmatterDescription(path)</code>（见 <a href="#tools">§5.4</a>），
+构造 <code>path: description</code> 行，排序后输出。
+这是一个<strong>廉价索引</strong>（只读 frontmatter，不读文件体），token 开销小。
+</p>
+
+<div class="callout win">
+  <span class="tag">设计亮点</span>
+  <strong>记忆是 agentic 的，不是 RAG 的。</strong>
+  Tree index 只给模型"线索"（路径 + 描述），不把全部长尾内容灌入上下文。
+  模型在推理过程中用 <code>recall</code> / <code>read</code> 工具按需拉取长尾，
+  既节省 token，又保持信息的精确性。
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+     §5  工具：recall / read / edit
+     ═══════════════════════════════════════════════════ -->
+<h2 id="tools">5. 工具：recall / read / edit</h2>
+
+<p>
+<code>Toolset</code> 是绑定到单个 Session workdir 的无状态工具集。
+<span class="fileref">internal/agent/tools.go:18-25</span>
+所有工具通过 <code>Dispatch(ctx, ToolCall) ToolResult</code> 路由。
+Session 负责追踪 <code>dirty</code>，Toolset 本身不持有写标记。
+</p>
+
+<h3>5.1 工具定义（Defs）</h3>
+
+<p><span class="fileref">internal/agent/tools.go:29-36</span></p>
+
+<pre><code>[]ToolDef{
+    {Name: "list",
+     Description: "List memory files with their descriptions (the tree index).",
+     InputSchema: {"type":"object","properties":{}}},
+
+    {Name: "read",
+     Description: "Read a memory file, optionally a 1-based inclusive line range.",
+     InputSchema: {"type":"object","properties":{
+       "path":  {"type":"string"},
+       "start": {"type":"integer"},   // 1-based，含
+       "end":   {"type":"integer"}},  // 1-based，含
+     "required":["path"]}},
+
+    {Name: "recall",
+     Description: "Search memory for a query; returns matching line ranges.",
+     InputSchema: {"type":"object","properties":{
+       "query": {"type":"string"}},
+     "required":["query"]}},
+
+    {Name: "edit",
+     Description: "Write content to a memory file (creates or overwrites).",
+     InputSchema: {"type":"object","properties":{
+       "path":    {"type":"string"},
+       "content": {"type":"string"}},
+     "required":["path","content"]}},
+}</code></pre>
+
+<h3>5.2 recall — 搜索长尾，返回行范围</h3>
+
+<p>
+<span class="fileref">internal/agent/tools.go:140-153</span>
+<code>doRecall</code> 调用 <code>t.search.Recall(ctx, t.agentID, query, 8)</code>，
+返回最多 8 个 <code>Hit{Path, LineStart, LineEnd, Snippet}</code>，
+序列化为 <code>path:start-end: snippet</code> 格式传回模型。
+</p>
+
+<pre><code>for _, h := range hits {
+    fmt.Fprintf(&amp;b, "%s:%d-%d: %s\n", h.Path, h.LineStart, h.LineEnd, h.Snippet)
+}</code></pre>
+
+<p>
+L2 阶段的搜索后端是 GrepSearch（子串扫描 workdir）；L4 替换为 HybridSearch（trigram + 向量混合）。接口不变。
+</p>
+
+<h3>5.3 read — 按行范围读取（1-based）</h3>
+
+<p><span class="fileref">internal/agent/tools.go:110-138</span></p>
+
+<pre><code>// Line ranges are 1-based inclusive to match recall/GrepSearch line
+// numbers (a model recalls line N, then read(start=N) returns that line).
+// Valid lines are >= 1, so start&lt;=0 &amp;&amp; end&lt;=0 unambiguously means "no range".
+start, end := intInput(in, "start"), intInput(in, "end")
+if start &lt;= 0 &amp;&amp; end &lt;= 0 {
+    return okResult(callID, string(data))
+}
+// ...
+return okResult(callID, strings.Join(all[start-1:end], "\n"))</code></pre>
+
+<div class="callout gotcha">
+  <span class="tag">注意：1-based 行号</span>
+  <code>read</code> 的 <code>start</code>/<code>end</code> 参数是 <strong>1-based 闭区间</strong>，与 <code>recall</code> 返回的 <code>LineStart</code>/<code>LineEnd</code> 完全对齐。
+  模型拿到 recall 返回的 <code>notes.md:5-12</code>，直接传 <code>start=5, end=12</code> 给 read 即可正确取回对应行。
+  内部转换：<code>all[start-1 : end]</code>（Go 切片 0-based 开区间）。
+  若改为 0-based，模型需要减一转换，极易引入 off-by-one。
+</div>
+
+<h3>5.4 edit — 写入 workdir，置 dirty</h3>
+
+<p>
+<span class="fileref">internal/agent/tools.go:155-168</span>
+<code>doEdit</code> 用 <code>os.WriteFile</code> 覆写（或新建）文件，
+先用 <code>os.MkdirAll</code> 确保父目录存在。
+所有路径都经过 <code>safePath</code>（<span class="fileref">internal/agent/tools.go:47-54</span>）做 <code>filepath.Clean</code> + 前缀检查，
+拒绝 <code>..</code> 逃逸。
+Session 在 <code>Dispatch</code> 返回后检查 <code>call.Name == "edit" &amp;&amp; !res.IsError</code>，将 <code>s.dirty</code> 置为 <code>true</code>。
+</p>
+
+<h3>5.5 frontmatterDescription — Tree Index 的信息来源</h3>
+
+<p>
+<span class="fileref">internal/agent/tools.go:172-192</span>
+用 <code>bufio.Scanner</code> 逐行读文件头，检测 YAML frontmatter <code>---</code> 分隔符，
+提取 <code>description:</code> 字段值。文件不存在、无 frontmatter、无 description 字段时均返回空字符串。
+</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §6  LLMProvider 抽象
+     ═══════════════════════════════════════════════════ -->
+<h2 id="provider">6. LLMProvider 抽象</h2>
+
+<h3>6.1 接口</h3>
+
+<p><span class="fileref">internal/agent/provider.go:62-64</span></p>
+
+<pre><code>type LLMProvider interface {
+    Generate(ctx context.Context, req Request) (Response, error)
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">边界价值</span>
+  这个接口是整个 agent loop 与 LLM provider 之间的唯一边界。
+  Session 从未 import Anthropic SDK，也从未触及 HTTP；
+  FakeProvider 用同一接口驱动所有自动测试，零网络调用。
+  换提供商只需实现此接口，Session/Toolset 代码不改。
+</div>
+
+<h3>6.2 协议类型</h3>
+
+<table>
+  <thead><tr><th>类型</th><th>字段</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>Request</code></td><td>System, Messages, Tools</td><td>一次 Generate 的输入</td></tr>
+    <tr><td><code>Response</code></td><td>Text, ToolCalls</td><td>ToolCalls 非空=轮次未完成；否则 Text=最终回复</td></tr>
+    <tr><td><code>Message</code></td><td>Role, Text, ToolCalls, Results</td><td>多角色：user/assistant/tool</td></tr>
+    <tr><td><code>ToolDef</code></td><td>Name, Description, InputSchema</td><td>JSON Schema 描述输入</td></tr>
+    <tr><td><code>ToolCall</code></td><td>ID, Name, Input</td><td>模型发起的工具调用</td></tr>
+    <tr><td><code>ToolResult</code></td><td>CallID, Content, IsError</td><td>执行结果，喂回下一轮</td></tr>
+  </tbody>
+</table>
+
+<h3>6.3 FakeProvider — 脚本化确定性驱动</h3>
+
+<p><span class="fileref">internal/agent/fake.go</span></p>
+
+<pre><code>type FakeProvider struct {
+    Steps []func(req Request) Response  // 按调用序号取脚本
+    calls int
+}
+func (f *FakeProvider) Generate(ctx context.Context, req Request) (Response, error) {
+    if f.calls &gt;= len(f.Steps) {
+        return Response{}, fmt.Errorf("fake: no scripted response for call %d", f.calls)
+    }
+    step := f.Steps[f.calls]
+    f.calls++
+    return step(req), nil
+}</code></pre>
+
+<p>
+每个 <code>Step</code> 接收完整的 <code>Request</code>（含 system 提示和 history），可在其中断言上下文是否符合预期。
+典型测试脚本：Step 0 返回 recall ToolCall，Step 1 返回 edit ToolCall，Step 2 返回最终文本。
+调用次数超出脚本长度时返回 error，防止测试写漏步骤时静默通过。
+</p>
+
+<h3>6.4 AnthropicProvider — 真实 API 接入</h3>
+
+<p>
+<span class="fileref">internal/agent/anthropic.go</span>
+将 provider 无关协议映射到 Anthropic Messages API（<code>POST /v1/messages</code>）。
+</p>
+
+<h4>消息映射（toAPIMessages）</h4>
+
+<p><span class="fileref">internal/agent/anthropic.go:88-121</span></p>
+
+<table>
+  <thead><tr><th>内部 Role</th><th>Anthropic 表示</th><th>注意事项</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>RoleUser</code></td>
+      <td>user + text block</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td><code>RoleAssistant</code>（有文本）</td>
+      <td>assistant + text block + 可选 tool_use blocks</td>
+      <td>text 为空时不加 text block</td>
+    </tr>
+    <tr>
+      <td><code>RoleAssistant</code>（仅工具调用）</td>
+      <td>assistant + tool_use blocks（blocks 不能为空，否则跳过整条消息）</td>
+      <td><span class="fileref">anthropic.go:108-110</span>：<code>if len(blocks)==0 { continue }</code></td>
+    </tr>
+    <tr>
+      <td><code>RoleTool</code></td>
+      <td>user + tool_result blocks（<code>tool_use_id</code>=CallID）</td>
+      <td>Anthropic 要求工具结果作为 user 消息发回</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout gotcha">
+  <span class="tag">Anthropic API 特殊性</span>
+  两个关键守卫：
+  (1) <code>tool_use</code> block 的 <code>input</code> 字段不能为 <code>null</code>——nil map 被替换为空 map（<span class="fileref">anthropic.go:103-105</span>）。
+  (2) assistant 消息至少要有一个 content block，否则 API 报错——空 blocks 时直接 <code>continue</code> 跳过该消息（<span class="fileref">anthropic.go:108-110</span>）。
+  <code>apiRequest</code> 的 <code>System</code> 和 <code>Tools</code> 字段标注了 <code>omitempty</code>，空时不序列化到 JSON。
+</div>
+
+<h4>请求构造</h4>
+
+<pre><code>type apiRequest struct {
+    Model     string       `json:"model"`
+    MaxTokens int          `json:"max_tokens"`
+    System    string       `json:"system,omitempty"`   // 空时省略
+    Messages  []apiMessage `json:"messages"`
+    Tools     []apiTool    `json:"tools,omitempty"`    // 无工具时省略
+}</code></pre>
+
+<p>
+默认模型 <code>claude-sonnet-4-6</code>，<code>max_tokens=4096</code>，API 版本头 <code>anthropic-version: 2023-06-01</code>。
+HTTP client 可注入（<span class="fileref">anthropic.go:33-36</span>），便于测试时替换为 mock RoundTripper。
+</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §7  提交与 CAS 冲突
+     ═══════════════════════════════════════════════════ -->
+<h2 id="commit-cas">7. 提交与 CAS 冲突</h2>
+
+<h3>7.1 commit 的两步写序</h3>
+
+<p>
+<span class="fileref">internal/agent/session.go:120-135</span>
+<code>commit</code> 调用 <code>store.CommitWithCAS</code>，后者内部严格遵循"先写对象，再推 ref"的顺序：
+</p>
+
+<pre class="mermaid">
+flowchart LR
+  A["gitfs.Commit\n写 blob+tree+commit 对象到 ObjStore\n(幂等，内容寻址)"]
+  B["refs.CommitRef\n单一 Postgres tx:\nCAS HEAD parent-&gt;new\n+ 入队 reindex + reflect job"]
+  A -->|成功后| B
+</pre>
+
+<p>
+<span class="fileref">internal/memstore/memstore.go:60-68</span>
+若对象写成功但 Postgres tx 失败（或崩溃），只留下不可达的 garbage 对象——GC（L5a）会清理，不会产生 torn ref。
+反之不可能：ref 先推进而对象未落盘是不存在的状态。
+</p>
+
+<h3>7.2 commit 同时入队两个维护 job</h3>
+
+<pre><code>// internal/agent/session.go:121
+jobs := []memstore.Job{{Kind: "reindex"}, {Kind: "reflect"}}</code></pre>
+
+<p>
+这两个 job 在<em>同一个</em> Postgres tx 内随 ref CAS 一起入队（<a href="05-maintenance-pipeline.html">见 ⑤ 维护管线</a>）。
+这保证"job 入队当且仅当 commit 成功"——无需 Kafka，也无需 outbox 表：Postgres tx 就是天然的原子单元。
+</p>
+
+<h3>7.3 ErrCASConflict — 暴露而非覆盖</h3>
+
+<p><span class="fileref">internal/agent/session.go:123-128</span></p>
+
+<pre><code>if errors.Is(err, memstore.ErrCASConflict) {
+    // Impossible under single-writer-per-agent (Router lock). If it occurs,
+    // the invariant was violated; surface it rather than silently clobbering
+    // the other writer's tree (no lossy merge). Multi-writer reconciliation is L5.
+    return fmt.Errorf("agent: commit conflict — single-writer invariant violated for %s: %w",
+        s.agentID, err)
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">设计决策：不重试、不覆盖</span>
+  <p>在正确的 Router 单写者保护下，<code>ErrCASConflict</code> 理论上不可发生。
+  一旦出现，意味着存在旁路写入（进程外的工具直接修改 Postgres，或多 pod 下 sticky routing 失效）。</p>
+  <p>
+  曾被考虑但被拒绝的方案：<strong>有界重试 + clobber</strong>（重新 materialize 新 HEAD，重放本轮编辑，再提交）。
+  被拒绝的原因：rebase 需要将本轮 edit 的内容合并到别人修改后的树上，对散文 Markdown 而言是有损操作；
+  丢弃对方的写入同样违反"无有损合并"原则。
+  正确的多写者协调（reconcile + reflection）是 L5 的职责。
+  </p>
+  <p>当前行为：将错误透明上报，让调用方知晓不变量被破坏，而不是静默修复一个不该静默修复的问题。</p>
+</div>
+
+<h3>7.4 commit 全流程小结</h3>
+
+<table>
+  <thead><tr><th>步骤</th><th>位置</th><th>失败后果</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>1. gitfs.Commit — 写所有对象到 ObjStore</td>
+      <td><span class="fileref">memstore/memstore.go:61</span></td>
+      <td>只有 garbage 对象，ref 未变，GC 清理</td>
+    </tr>
+    <tr>
+      <td>2. refs.CommitRef — CAS HEAD + 入队 jobs（单一 Postgres tx）</td>
+      <td><span class="fileref">memstore/memstore.go:65</span></td>
+      <td>ErrCASConflict（单写者违反），或通用 DB 错误</td>
+    </tr>
+    <tr>
+      <td>3. Session 更新 head，dirty=false</td>
+      <td><span class="fileref">session.go:132-133</span></td>
+      <td>commit 失败时 dirty 保持 true，下一轮可重提交</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════
+     §8  cmd/api 装配
+     ═══════════════════════════════════════════════════ -->
+<h2 id="wiring">8. cmd/api 装配</h2>
+
+<p>
+<span class="fileref">cmd/api/main.go</span>
+是一个开发用交互式 harness，把整条请求路径串起来。
+</p>
+
+<pre><code>// 存储层
+store := memstore.New(objstore.NewLocal(objRoot), refs.New(pool))
+
+// Provider 选择
+switch providerName {
+case "anthropic":
+    prov = agent.NewAnthropic(key)
+default:
+    prov = &amp;agent.FakeProvider{Steps: []func(agent.Request) agent.Response{
+        func(r agent.Request) agent.Response {
+            return agent.Response{Text: "(fake) received your message"}
+        },
+    }}
+}
+
+// 向量嵌入器选择
+switch env("ENGRAM_EMBEDDER", "fake") {
+case "voyage":
+    emb = search.NewVoyage(vkey)
+default:
+    emb = search.NewFakeEmbedder(256)
+}
+
+// 嵌入缓存（分层：内存 LRU + 持久化 ObjCache）
+embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
+
+// Router 装配（sysCache 和 embCache 必须分离）
+router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024), embCache, emb)</code></pre>
+
+<p>
+<span class="fileref">cmd/api/main.go:81-83</span>
+代码在此处检查 <code>embObjRoot</code> 与 <code>objRoot</code> 是否相同，相同则 Fatal。
+这是对 <strong>sysCache vs embCache 必须分离</strong> 这一不变量的主动防御。
+</p>
+
+<h3>环境变量一览</h3>
+
+<table>
+  <thead><tr><th>变量</th><th>默认值</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>ENGRAM_DB</code></td><td><code>postgres://postgres:engram@localhost:5433/engram</code></td><td>Postgres DSN</td></tr>
+    <tr><td><code>ENGRAM_OBJ</code></td><td><code>./engram-objects</code></td><td>本地对象存储根目录</td></tr>
+    <tr><td><code>ENGRAM_EMB_OBJ</code></td><td><code>./engram-embeddings</code></td><td>向量嵌入持久化目录（不得与 ENGRAM_OBJ 相同）</td></tr>
+    <tr><td><code>ENGRAM_AGENT</code></td><td><code>demo</code></td><td>Agent ID</td></tr>
+    <tr><td><code>ENGRAM_PROVIDER</code></td><td><code>fake</code></td><td><code>fake</code> 或 <code>anthropic</code></td></tr>
+    <tr><td><code>ANTHROPIC_API_KEY</code></td><td>（必填，当 provider=anthropic）</td><td>Anthropic API 密钥</td></tr>
+    <tr><td><code>ENGRAM_EMBEDDER</code></td><td><code>fake</code></td><td><code>fake</code> 或 <code>voyage</code></td></tr>
+    <tr><td><code>VOYAGE_API_KEY</code></td><td>（必填，当 embedder=voyage）</td><td>Voyage AI API 密钥</td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════
+     §9  横向关联
+     ═══════════════════════════════════════════════════ -->
+<h2 id="cross-links">9. 横向关联</h2>
+
+<div class="cardgrid">
+  <div class="card">
+    <div class="num">③ 存储与一致性</div>
+    <h3>MemStore / CAS 机制</h3>
+    <p><code>CommitWithCAS</code> 的对象写入顺序、Postgres tx 原子性、<code>ErrCASConflict</code> 的底层实现——refs.CommitRef 和 gitfs.Commit 的细节在 ③ 中展开。</p>
+    <a href="03-storage-consistency.html">查看 ③ →</a>
+  </div>
+  <div class="card">
+    <div class="num">④ 搜索与索引</div>
+    <h3>L3 缓存 + L4 HybridSearch</h3>
+    <p><code>TreeKeys</code> 返回的不可变 SHA 键、<code>cache.NewTiered</code>、<code>search.NewHybrid</code> 的 trigram+向量混合实现——④ 中详解。</p>
+    <a href="04-search-index.html">查看 ④ →</a>
+  </div>
+  <div class="card">
+    <div class="num">⑤ 维护管线</div>
+    <h3>reindex + reflect job 消费</h3>
+    <p>commit 入队的 <code>reindex</code> 和 <code>reflect</code> job 由维护 worker 异步消费——job 队列结构、消费逻辑见 ⑤。</p>
+    <a href="05-maintenance-pipeline.html">查看 ⑤ →</a>
+  </div>
+</div>
+
+</main>
+<footer>Engram 深入解析报告 · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
+</body>
+</html>
