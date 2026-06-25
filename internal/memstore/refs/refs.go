@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -140,7 +141,7 @@ func (r *Refs) ClaimJob(ctx context.Context) (*DequeuedJob, error) {
 	if fromSHA != nil {
 		j.FromSHA = *fromSHA
 	}
-	if _, err := tx.Exec(ctx, `UPDATE memory_jobs SET state='running' WHERE id=$1`, j.ID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE memory_jobs SET state='running', claimed_at=now() WHERE id=$1`, j.ID); err != nil {
 		return nil, fmt.Errorf("refs: claim mark running: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -163,12 +164,32 @@ func (r *Refs) RetryJob(ctx context.Context, id int64, maxAttempts int) error {
 	_, err := r.pool.Exec(ctx,
 		`UPDATE memory_jobs
 		 SET attempts = attempts + 1,
-		     state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END
+		     state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END,
+		     claimed_at = NULL
 		 WHERE id=$1`, id, maxAttempts)
 	if err != nil {
 		return fmt.Errorf("refs: retry job %d: %w", id, err)
 	}
 	return nil
+}
+
+// ReapStaleJobs returns stale 'running' jobs (claimed before `before`, or with a
+// NULL claimed_at) to the queue, so a worker that crashed mid-job doesn't strand
+// them. attempts is bumped (poison-job protection: a job that crashes the worker
+// on every claim fails out at maxAttempts), state becomes 'pending' (or 'failed'
+// at the cap), and claimed_at is cleared. Returns the number of jobs reaped.
+func (r *Refs) ReapStaleJobs(ctx context.Context, before time.Time, maxAttempts int) (int, error) {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE memory_jobs
+		 SET attempts = attempts + 1,
+		     state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END,
+		     claimed_at = NULL
+		 WHERE state='running' AND (claimed_at IS NULL OR claimed_at < $1)`,
+		before, maxAttempts)
+	if err != nil {
+		return 0, fmt.Errorf("refs: reap stale jobs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // InsertPendingJob enqueues a pending job directly (test support).
