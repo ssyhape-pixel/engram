@@ -65,7 +65,7 @@ go.mod
 
 ## Build / test / run
 
-> Status: L1 (MemStore core) + L2 (agent loop + Session) + L3 (SHA read cache) + L4 (hybrid search) + L4b (embedding index persistence + incremental reindex) + L5a (maintenance GC) + L5b (memory_jobs consumer + reflection) are implemented and merged. The maintenance worker runs GC + drains memory_jobs (reflection + reindex) each round; the reindex job warms a persistent content-addressed embedding store (separate from the GC'd git object store) that sessions share. Remaining: L5c defrag, stale-`running` job reaper (see `architecture.md §14`), embedding-store eviction. Layer specs/plans: `docs/superpowers/specs/` + `docs/superpowers/plans/`; newcomer guide: `docs/onboarding.md`.
+> Status: L1 (MemStore core) + L2 (agent loop + Session) + L3 (SHA read cache) + L4 (hybrid search) + L4b (embedding index persistence + incremental reindex) + L5a (maintenance GC) + L5b (memory_jobs consumer + reflection) + L5c (deterministic defrag) are implemented and merged. Each maintenance round: GC → defrag scan → drain memory_jobs (reflection + reindex + defrag). Defrag splits oversized markdown files at top-level headings (deterministic, convergent). The reindex job warms a persistent content-addressed embedding store (separate from the GC'd git object store) that sessions share. Remaining: stale-`running` job reaper (see `architecture.md §14`) + embedding-store eviction (grouped as L5d). Layer specs/plans: `docs/superpowers/specs/` + `docs/superpowers/plans/`; newcomer guide: `docs/onboarding.md`.
 
 ```
 # build
@@ -96,7 +96,8 @@ ENGRAM_PROVIDER=fake go run ./cmd/api
 #   ENGRAM_EMBEDDER     fake | voyage (default fake) — reindex embedder; MUST match cmd/api
 #   ENGRAM_GC_INTERVAL  round interval (default 5m)
 #   ENGRAM_GC_GRACE     min object age before an unreachable object is swept (default 1h)
-#   ENGRAM_JOB_MAX_ATTEMPTS  per-job retry cap before 'failed' (default 5)
+#   ENGRAM_JOB_MAX_ATTEMPTS   per-job retry cap before 'failed' (default 5)
+#   ENGRAM_DEFRAG_MAX_BYTES   .md files larger than this (with >=2 top-level headings) get split (default 16384)
 go run ./cmd/maintenance
 ```
 
