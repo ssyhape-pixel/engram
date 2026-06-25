@@ -176,3 +176,40 @@ func TestClaimJobSkipLockedTwoJobs(t *testing.T) {
 		t.Fatalf("both jobs should be claimed, got %v", got)
 	}
 }
+
+func TestEnqueueJobIdempotent(t *testing.T) {
+	ctx := context.Background()
+	pool := isolatedPool(t)
+	r := New(pool)
+	if err := r.EnqueueJob(ctx, "a1", "defrag", "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.EnqueueJob(ctx, "a1", "defrag", "h1"); err != nil { // dup → no-op
+		t.Fatal(err)
+	}
+	var n int
+	pool.QueryRow(ctx, "SELECT count(*) FROM memory_jobs WHERE agent_id='a1' AND kind='defrag' AND state='pending'").Scan(&n)
+	if n != 1 {
+		t.Fatalf("idempotent enqueue should leave 1 pending, got %d", n)
+	}
+}
+
+func TestAllAgentIDs(t *testing.T) {
+	ctx := context.Background()
+	pool := isolatedPool(t)
+	r := New(pool)
+	if _, err := pool.Exec(ctx, "INSERT INTO agent_refs (agent_id, head) VALUES ('a1','h1'),('a2','h2')"); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := r.AllAgentIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !got["a1"] || !got["a2"] {
+		t.Fatalf("want a1,a2; got %v", ids)
+	}
+}
