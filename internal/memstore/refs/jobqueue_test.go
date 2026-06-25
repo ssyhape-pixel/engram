@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -53,7 +54,7 @@ func isolatedPool(t *testing.T) *pgxpool.Pool {
 	}
 	ddl := []string{
 		`CREATE TABLE agent_refs (agent_id text PRIMARY KEY, head text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`,
-		`CREATE TABLE memory_jobs (id bigserial PRIMARY KEY, agent_id text NOT NULL, kind text NOT NULL, from_sha text, state text NOT NULL DEFAULT 'pending', attempts int NOT NULL DEFAULT 0, created_at timestamptz NOT NULL DEFAULT now())`,
+		`CREATE TABLE memory_jobs (id bigserial PRIMARY KEY, agent_id text NOT NULL, kind text NOT NULL, from_sha text, state text NOT NULL DEFAULT 'pending', attempts int NOT NULL DEFAULT 0, claimed_at timestamptz, created_at timestamptz NOT NULL DEFAULT now())`,
 		`CREATE UNIQUE INDEX memory_jobs_pending_uniq ON memory_jobs (agent_id, kind) WHERE state='pending'`,
 		`CREATE TABLE maintenance_cursor (agent_id text NOT NULL, kind text NOT NULL, processed_sha text NOT NULL, PRIMARY KEY (agent_id, kind))`,
 	}
@@ -211,5 +212,100 @@ func TestAllAgentIDs(t *testing.T) {
 	}
 	if !got["a1"] || !got["a2"] {
 		t.Fatalf("want a1,a2; got %v", ids)
+	}
+}
+
+func TestClaimJobStampsClaimedAt(t *testing.T) {
+	ctx := context.Background()
+	pool := isolatedPool(t)
+	r := New(pool)
+	enqueue(t, pool, "a1", "reflect")
+	if _, err := r.ClaimJob(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var claimedAt *time.Time
+	pool.QueryRow(ctx, "SELECT claimed_at FROM memory_jobs WHERE agent_id='a1'").Scan(&claimedAt)
+	if claimedAt == nil {
+		t.Fatal("ClaimJob must stamp claimed_at")
+	}
+}
+
+func TestRetryJobClearsClaimedAt(t *testing.T) {
+	ctx := context.Background()
+	pool := isolatedPool(t)
+	r := New(pool)
+	id := enqueue(t, pool, "a1", "reflect")
+	if _, err := r.ClaimJob(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RetryJob(ctx, id, 5); err != nil {
+		t.Fatal(err)
+	}
+	var claimedAt *time.Time
+	var state string
+	pool.QueryRow(ctx, "SELECT claimed_at, state FROM memory_jobs WHERE id=$1", id).Scan(&claimedAt, &state)
+	if claimedAt != nil || state != "pending" {
+		t.Fatalf("after retry: claimed_at=%v state=%s (want nil/pending)", claimedAt, state)
+	}
+}
+
+func TestReapStaleJobs(t *testing.T) {
+	ctx := context.Background()
+	pool := isolatedPool(t)
+	r := New(pool)
+	base := time.Now()
+	var staleID int64
+	pool.QueryRow(ctx,
+		"INSERT INTO memory_jobs (agent_id,kind,state,claimed_at,attempts) VALUES ('stale','reflect','running',$1,0) RETURNING id",
+		base.Add(-time.Hour)).Scan(&staleID)
+	var freshID int64
+	pool.QueryRow(ctx,
+		"INSERT INTO memory_jobs (agent_id,kind,state,claimed_at,attempts) VALUES ('fresh','reflect','running',$1,0) RETURNING id",
+		base).Scan(&freshID)
+	var nullID int64
+	pool.QueryRow(ctx,
+		"INSERT INTO memory_jobs (agent_id,kind,state,claimed_at,attempts) VALUES ('legacy','reflect','running',NULL,0) RETURNING id").Scan(&nullID)
+	pool.Exec(ctx, "INSERT INTO memory_jobs (agent_id,kind,state) VALUES ('pend','reflect','pending')")
+
+	n, err := r.ReapStaleJobs(ctx, base.Add(-time.Minute), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("reaped %d, want 2 (stale + null)", n)
+	}
+	check := func(id int64) (string, *time.Time, int) {
+		var st string
+		var ca *time.Time
+		var att int
+		pool.QueryRow(ctx, "SELECT state, claimed_at, attempts FROM memory_jobs WHERE id=$1", id).Scan(&st, &ca, &att)
+		return st, ca, att
+	}
+	if st, ca, att := check(staleID); st != "pending" || ca != nil || att != 1 {
+		t.Fatalf("stale reaped wrong: %s %v %d", st, ca, att)
+	}
+	if st, _, _ := check(nullID); st != "pending" {
+		t.Fatalf("null-claimed_at running should be reaped, state=%s", st)
+	}
+	if st, _, _ := check(freshID); st != "running" {
+		t.Fatalf("fresh running must NOT be reaped, state=%s", st)
+	}
+}
+
+func TestReapStaleJobsFailsAtCap(t *testing.T) {
+	ctx := context.Background()
+	pool := isolatedPool(t)
+	r := New(pool)
+	var id int64
+	pool.QueryRow(ctx,
+		"INSERT INTO memory_jobs (agent_id,kind,state,claimed_at,attempts) VALUES ('a1','reflect','running',$1,4) RETURNING id",
+		time.Now().Add(-time.Hour)).Scan(&id)
+	if _, err := r.ReapStaleJobs(ctx, time.Now(), 5); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	pool.QueryRow(ctx, "SELECT state FROM memory_jobs WHERE id=$1", id).Scan(&state)
+	if state != "failed" {
+		t.Fatalf("at the attempt cap a reaped job must fail, got %s", state)
 	}
 }
