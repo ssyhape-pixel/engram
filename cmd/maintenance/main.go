@@ -104,6 +104,7 @@ func main() {
 		}
 		maxAttempts = n
 	}
+	reapAfter := dur("ENGRAM_JOB_REAP_AFTER", "10m")
 
 	var completer maintenance.Completer
 	switch env("ENGRAM_PROVIDER", "fake") {
@@ -159,6 +160,12 @@ func main() {
 			}
 			log.Printf("gc: agents=%d scanned=%d swept=%d kept=%d statErrors=%d delErrors=%d",
 				len(heads), stats.Scanned, stats.Swept, stats.Kept, stats.StatErrors, stats.DelErrors)
+			reaped, rerr := r.ReapStaleJobs(ctx, time.Now().Add(-reapAfter), maxAttempts)
+			if rerr != nil {
+				log.Printf("reap error: %v", rerr)
+			} else if reaped > 0 {
+				log.Printf("reaped: %d stale running jobs", reaped)
+			}
 			if derr := maintenance.EnqueueDefrag(ctx, r, store, deps.DefragMaxBytes); derr != nil {
 				log.Printf("defrag scan error: %v", derr)
 			}
