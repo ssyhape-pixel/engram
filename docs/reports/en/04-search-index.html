@@ -1,0 +1,742 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · Search &amp; index</title>
+<link rel="stylesheet" href="../style.css">
+</head><body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html">Index</a>
+  <a href="01-architecture-overview.html">Architecture</a>
+  <a href="02-request-path.html">Request Path</a>
+  <a href="03-storage-consistency.html">Storage</a>
+  <a href="04-search-index.html" class="active">Search</a>
+  <a href="05-maintenance-pipeline.html">Maintenance</a>
+  <a href="06-build-journey.html">Build Journey</a>
+  <a class="lang" href="../cn/04-search-index.html">中文</a>
+</nav>
+<main>
+
+<p class="meta">L4 · L4b · hybrid search · embedding persistence · incremental reindex</p>
+<h1>Search &amp; Index</h1>
+<p class="lead">Two complementary retrieval strategies — trigram inverted index and paragraph-level semantic vectors — are fused into a single ranked result via RRF.
+Vectors are computed once and persisted; every subsequent call transparently reuses them across session restarts, pod migrations, and background pre-warming, all sharing the same vector store.</p>
+
+<!-- ────────────────────────────────────────────── §1 Philosophy -->
+<h2 id="s1">1. Philosophy: memory is fetched on demand, not front-loaded</h2>
+
+<p>
+Engram's recall is a <strong>mid-loop tool call</strong> — the model issues it on demand during reasoning,
+not a pre-inference "RAG dump" that retrieves every relevant chunk up front.
+</p>
+<p>
+Only two things are loaded at the start of inference:
+</p>
+<ul>
+  <li><strong>Resident <code>system/</code> files</strong> — injected directly into the system prompt, accelerated by the L3 SHA read cache (see report <a href="02-request-path.html">② Request Path</a>);</li>
+  <li><strong>Tree index (filenames + description fields)</strong> — tells the model that long-tail memory exists, without pulling its content in.</li>
+</ul>
+<p>
+Only when the model judges that some long-tail memory is relevant to the current task does it explicitly call <code>recall(query, k)</code>,
+getting back precise line ranges and snippets. This is "fetch on demand" rather than "bulk preload."
+</p>
+
+<p>
+<strong>Search locality (Variant A, default):</strong>
+The trigram index and semantic index are rebuilt in memory from the materialized working directory when a Session opens,
+with zero object-storage access at query time. Indexes are discarded when the Session closes — they are disposable derived views, not authoritative storage.
+</p>
+
+<div class="callout invariant">
+  <span class="tag">Invariant</span>
+  <p>Indexes (trigram + semantic) are derived, disposable views. The source of truth lives entirely in the content-addressed objects in the object store plus the Postgres ref. Cache crashes and index loss can all be rebuilt from objects with no impact on correctness (core invariant ③).</p>
+</div>
+
+<h3>Recall query path</h3>
+
+<div class="figure">
+<!-- recall path: horizontal flow -->
+<div class="flow">
+  <div class="node accent">
+    <span class="t">Model</span>
+    <span class="s">recall("query", k=5)</span>
+  </div>
+  <div class="arrow"></div>
+  <div class="node accent">
+    <span class="t">RecallTool</span>
+    <span class="s">HybridSearch.Recall</span>
+  </div>
+  <div class="arrow"></div>
+  <div class="node">
+    <span class="t">TrigramIndex</span>
+    <span class="s">Search(query, n=10)</span>
+  </div>
+  <div class="arrow lbl"><span class="al">parallel</span></div>
+  <div class="node">
+    <span class="t">SemanticIndex</span>
+    <span class="s">Search(ctx, query, n=10)</span>
+  </div>
+  <div class="arrow"></div>
+  <div class="node accent">
+    <span class="t">rrf(lists, k=5)</span>
+    <span class="s">RRF merge → top-5 Hit</span>
+  </div>
+</div>
+<p class="figcap">
+  <code>search.go:8–21</code> · <code>hybrid.go:30–48</code> ·
+  RecallTool returns each Hit's Path + LineStart/LineEnd + Snippet to the model
+</p>
+</div>
+
+<p>
+Semantic retrieval requires one embedding call (<code>Embed</code>) on the query; if <code>Embed</code> fails,
+that branch is silently dropped and only the trigram results are used — the model always gets an answer (see §4).
+</p>
+
+<!-- ────────────────────────────────────────────── §2 Trigram -->
+<h2 id="s2">2. Keyword retrieval: trigram inverted index</h2>
+
+<p>
+Plain-English explanation of "trigram inverted index":
+every line of text is broken into sliding windows of three characters (shingles), building a reverse lookup table — given any three-character shingle, you can instantly find which lines contain it.
+When searching for "project goals," the index first uses <code>pro</code>, <code>roj</code>, <code>oje</code>… to narrow the candidate lines,
+then exactly verifies which lines actually contain the full string.
+</p>
+
+<p>
+This index is pure CPU, zero I/O. It is rebuilt synchronously with the materialized tree when a Session opens, lightweight enough to be discarded and rebuilt at any time.
+</p>
+
+<h3>Trigram extraction</h3>
+
+<pre><code><span class="cm">// trigram.go:21–37</span>
+func trigrams(s string) []string {
+    r := []rune(strings.ToLower(s))
+    if len(r) &lt; 3 { return nil }
+    seen := make(map[string]struct{}, len(r))
+    out := make([]string, 0, len(r)-2)
+    for i := 0; i+3 &lt;= len(r); i++ {
+        t := string(r[i : i+3])
+        if _, ok := seen[t]; ok { continue }   <span class="cm">// deduplicate: count each trigram once per line</span>
+        seen[t] = struct{}{}
+        out = append(out, t)
+    }
+    return out
+}</code></pre>
+
+<p>
+Deduplication is essential: a trigram that appears more than once in a line is counted only once, preventing posting-list bloat.
+Both indexing and querying are lowercased; returned snippets preserve original casing.
+</p>
+
+<h3>Candidate intersection → exact verification</h3>
+
+<p>
+<code>candidates(query)</code> (<code>trigram.go:65–102</code>) works in two steps:
+</p>
+
+<ol class="steps">
+  <li><span class="st">Slice into trigrams, look up posting lists.</span><span class="sd">Each three-character shingle of the query fetches the set of lines that contain it; if any trigram is absent from the entire index, return empty immediately (early exit).</span></li>
+  <li><span class="st">Intersect starting from the smallest set.</span><span class="sd">Sort posting sets by size ascending and filter from the smallest one, minimizing wasted iteration.</span></li>
+  <li><span class="st">Exact substring verification.</span><span class="sd"><code>strings.Contains(lowercase(lineText), lowercase(query))</code> is the final gate — the trigram intersection is a <strong>pre-filter</strong> (may have false positives); the substring check removes them. No false negatives, no false positives.</span></li>
+  <li><span class="st">Short queries fall back to full scan.</span><span class="sd">Queries shorter than 3 runes have no trigrams to use, so a linear scan over all lines is performed.</span></li>
+</ol>
+
+<pre><code><span class="cm">// trigram.go:107–135 (Search)</span>
+func (t *TrigramIndex) Search(query string, k int) []Hit {
+    q := strings.ToLower(query)
+    var matches []posting
+    for p := range t.candidates(q) {
+        if strings.Contains(strings.ToLower(t.lineText(p.path, p.line)), q) {
+            matches = append(matches, p)
+        }
+    }
+    sort.Slice(matches, func(i, j int) bool { <span class="cm">/* path asc, line asc */</span> })
+    <span class="cm">// truncate to top-k; each hit has LineStart == LineEnd (single line)</span>
+    ...
+}</code></pre>
+
+<table>
+  <thead><tr><th>Property</th><th>Detail</th></tr></thead>
+  <tbody>
+    <tr><td>Granularity</td><td>Line-level posting; returns Hit with LineStart == LineEnd (single line)</td></tr>
+    <tr><td>Case</td><td>Index and query are both lowercased; snippet preserves original casing</td></tr>
+    <tr><td>Rebuild cost</td><td>Pure CPU; completes synchronously with tree materialization at Session open</td></tr>
+    <tr><td>False positives</td><td>Eliminated by exact substring check after trigram intersection; no false negatives</td></tr>
+    <tr><td>Short query (&lt;3 runes)</td><td>Falls back to full linear scan</td></tr>
+    <tr><td>I/O</td><td>Zero — line text already lives in <code>lines map[string][]string</code></td></tr>
+  </tbody>
+</table>
+
+<p class="fileref">trigram.go · BuildTrigram:40 · candidates:65 · Search:107</p>
+
+<!-- ────────────────────────────────────────────── §3 Semantic -->
+<h2 id="s3">3. Semantic retrieval: paragraph vector index</h2>
+
+<p>
+Plain-English explanation: a passage of text is "turned into a sequence of numbers" such that passages with similar meaning produce similar number sequences (high cosine similarity).
+Keyword retrieval requires an exact token match between query and document; semantic retrieval captures cross-lingual and near-synonym associations like "项目目标" and "project goals," as well as meaning distributed across multiple lines.
+</p>
+
+<h3>Sectionization logic</h3>
+
+<p>
+<code>sectionize</code> (<code>semantic.go:40–52</code>) splits a file into <strong>sections</strong> at any Markdown heading line (lines starting with <code>#</code>).
+Content before the first heading forms its own section; a file with no headings is treated as a single section.
+Each section carries a 1-based line range used for Hit location.
+</p>
+
+<h3>Embedding key design — content addressing</h3>
+
+<pre><code><span class="cm">// semantic.go:63–66</span>
+func embKey(model, text string) string {
+    sum := sha256.Sum256([]byte(text))
+    return "emb:" + model + ":" + base64.RawStdEncoding.EncodeToString(sum[:])
+}</code></pre>
+
+<p>
+Two pieces of information make up the key:
+</p>
+<ul>
+  <li><strong><code>model</code> prefix</strong> — different embedding models have different vector dimensions and semantic spaces; mixing them makes similarity scores meaningless;</li>
+  <li><strong><code>sha256(text)</code></strong> — identical content maps to the same key across any time and any worker; the key changes naturally when content changes, providing inherent content addressing.</li>
+</ul>
+
+<h3>BuildSemantic: cache hit → reuse, miss → batch Embed → Put</h3>
+
+<pre><code><span class="cm">// semantic.go:107–156 (core logic)</span>
+for _, p := range paths {
+    for _, sec := range sectionize(string(files[p])) {
+        ci := len(si.chunks)
+        si.chunks = append(si.chunks, chunk{...})
+        key := embKey(emb.Model(), sec.text)
+        if c != nil {
+            if enc, ok := c.Get(key); ok {
+                si.chunks[ci].vec = decodeVec(enc)
+                continue              <span class="cm">// cache hit: reuse directly, skip Embed call</span>
+            }
+        }
+        pend = append(pend, pending{ci: ci, text: sec.text, key: key})
+    }
+}
+if len(pend) &gt; 0 {
+    vecs, err := emb.Embed(ctx, texts)   <span class="cm">// all missing sections in a single batch call</span>
+    ...
+    for i, pp := range pend {
+        si.chunks[pp.ci].vec = vecs[i]
+        if c != nil { c.Put(pp.key, encodeVec(vecs[i])) }   <span class="cm">// write into cache</span>
+    }
+}</code></pre>
+
+<p>
+Vectors are stored as base64-encoded little-endian float32 byte strings (<code>semantic.go:68–86</code>),
+directly compatible with <code>cache.Cache</code>'s <code>string</code> interface — no extra serialization layer needed.
+</p>
+
+<h3>Embedder interface and implementations</h3>
+
+<table>
+  <thead><tr><th>Implementation</th><th>Use</th><th>Model()</th><th>Behavior</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>FakeEmbedder</code></td>
+      <td>Testing / development</td>
+      <td><code>"fake"</code></td>
+      <td>Deterministic FNV bag-of-words; texts sharing vocabulary produce higher cosine similarity; no network calls</td>
+    </tr>
+    <tr>
+      <td><code>VoyageEmbedder</code></td>
+      <td>Production</td>
+      <td><code>"voyage-3"</code> (overridable)</td>
+      <td>JSON POST to <code>https://api.voyageai.com/v1/embeddings</code>; batch input; HTTP errors wrapped and returned</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="fileref">embedder.go:10–54 · voyage.go:33–92</p>
+
+<!-- ────────────────────────────────────────────── §4 RRF -->
+<h2 id="s4">4. Merging both strategies: RRF fusion</h2>
+
+<p>
+Plain-English explanation of RRF (Reciprocal Rank Fusion):
+score each candidate result by its <strong>rank</strong> in each list — higher rank means higher score;
+results that rank high in both lists accumulate the highest total score. The formula is <code>1 / (60 + rank + 1)</code>;
+the constant 60 smooths the gap between top ranks (a standard hyperparameter), so the score difference between rank 1 and rank 2 is not dramatic.
+When the same result appears in multiple lists, its scores are summed.
+</p>
+
+<h3>RRF implementation</h3>
+
+<pre><code><span class="cm">// hybrid.go:56–85</span>
+func rrf(lists [][]Hit, k int) []Hit {
+    const rrfK = 60
+    scores := map[string]*agg{}
+    var order []string   <span class="cm">// insertion order for stable tie-breaking</span>
+    for _, list := range lists {
+        for rank, hit := range list {
+            id := fmt.Sprintf("%s:%d-%d", hit.Path, hit.LineStart, hit.LineEnd)
+            a, ok := scores[id]
+            if !ok {
+                a = &amp;agg{hit: hit}
+                scores[id] = a
+                order = append(order, id)
+            }
+            a.score += 1.0 / float64(rrfK+rank+1)   <span class="cm">// accumulate contribution</span>
+        }
+    }
+    sort.SliceStable(order, func(i, j int) bool {
+        return scores[order[i]].score &gt; scores[order[j]].score
+    })
+    <span class="cm">// take top-k</span>
+}</code></pre>
+
+<p>
+Hit IDs are identified as <code>path:lineStart-lineEnd</code>; line-level and paragraph-level Hit IDs use the same format,
+so when a single line is also an entire section, scores from both indexes are merged.
+</p>
+
+<h3>Degradation strategy</h3>
+
+<p>
+<code>NewHybrid</code> (<code>hybrid.go:22–28</code>) builds the semantic index on a best-effort basis at construction time —
+if <code>BuildSemantic</code> returns an error (e.g., the embedding service is unavailable), <code>h.sem</code> stays <code>nil</code>,
+and Recall uses only the trigram list without returning an error to the caller. Query-time semantic failure degrades silently in the same way:
+</p>
+
+<pre><code><span class="cm">// hybrid.go:41–47</span>
+if h.sem != nil {
+    if semHits, err := h.sem.Search(ctx, query, n); err == nil {
+        lists = append(lists, semHits)
+    }
+    <span class="cm">// query-time embedding failure: drop semantic, keep trigram (degrade gracefully)</span>
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">Invariant</span>
+  <p>Recall never returns an error due to embedding service failure. In the worst case it degrades to pure trigram retrieval,
+  which covers exact-vocabulary-match scenarios. See test <code>TestHybridDegradesWhenEmbeddingFails</code> (<code>hybrid_test.go</code>).</p>
+</div>
+
+<h3>Complementary blind spots of each strategy</h3>
+
+<div class="cmp">
+  <div class="col good">
+    <h4>Where Trigram excels</h4>
+    <ul>
+      <li>Exact tokens (e.g., <code>xq7z9</code>, API key fragments)</li>
+      <li>Works without an embedding service</li>
+      <li>Short files, exact-spelling scenarios</li>
+      <li>Zero added latency (pure in-memory)</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Where Semantic excels</h4>
+    <ul>
+      <li>Phrases distributed across multiple lines (words spread over three lines)</li>
+      <li>Synonyms / near-equivalent descriptions ("目标" ≈ "goals")</li>
+      <li>Cross-lingual semantic relatedness</li>
+      <li>Vague queries where the exact original wording is unknown</li>
+    </ul>
+  </div>
+</div>
+
+<table>
+  <thead><tr><th>Query type</th><th>Trigram</th><th>Semantic</th></tr></thead>
+  <tbody>
+    <tr><td>Exact token (e.g., <code>xq7z9</code>)</td><td>Strong (exact substring)</td><td>Weak (rare-word vectors are unstable)</td></tr>
+    <tr><td>Cross-line semantic phrase (words spread across lines)</td><td>No match</td><td>Strong (paragraph vector captures distributed vocabulary)</td></tr>
+    <tr><td>Synonyms / near-equivalent descriptions</td><td>No match</td><td>Strong</td></tr>
+    <tr><td>No embedding service</td><td>Works normally</td><td>Degrades (ignored)</td></tr>
+  </tbody>
+</table>
+
+<!-- ────────────────────────────────────────────── §5 SHA read cache -->
+<h2 id="s5">5. Content-fingerprint read cache</h2>
+
+<p>
+<code>cache.Cache</code> (<code>cache.go:13–16</code>) is a minimal string KV interface:
+</p>
+
+<pre><code>type Cache interface {
+    Get(key string) (string, bool)
+    Put(key, val string)
+}</code></pre>
+
+<p>
+All cache keys in Engram are content hashes, so a <strong>cache hit is equivalent to recomputing the value</strong> —
+there is no stale-value problem. The only form of "invalidation" is LRU eviction under memory pressure, which affects hit rate but not correctness.
+</p>
+
+<p>
+<code>LRU</code> (<code>cache.go:23–69</code>):
+</p>
+<ul>
+  <li>A single <code>sync.Mutex</code> guards all operations — <code>Get</code> needs to update the recency list (<code>MoveToFront</code>), so an RWMutex cannot be used;</li>
+  <li>Capacity is bounded by entry count; the oldest entry is evicted when the limit is exceeded;</li>
+  <li>A repeated <code>Put</code> for the same key refreshes recency without adding an entry.</li>
+</ul>
+
+<p>
+The Session layer has two separate cache instances (see the comment at <code>router.go:40</code>: <em>"they MUST be different instances"</em>):
+</p>
+<ul>
+  <li><strong><code>sysCache</code></strong> — <code>cache.NewLRU(1024)</code>, caches the assembled <code>system/</code> content; see report <a href="02-request-path.html">②</a>;</li>
+  <li><strong><code>embCache</code></strong> — <code>cache.NewTiered(LRU, ObjCache)</code>, caches embedding vectors; see §6.</li>
+</ul>
+
+<div class="callout invariant">
+  <span class="tag">Invariant</span>
+  <p><code>sysCache</code> and <code>embCache</code> are distinct instances pointing to different backing ObjStore directories.
+  System content is never written into the embedding store, and embedding vectors never pollute the system cache.</p>
+</div>
+
+<!-- ────────────────────────────────────────────── §6 Embedding persistence -->
+<h2 id="s6">6. Persisting expensive vectors (L4b)</h2>
+
+<p>
+Voyage API calls carry both latency and cost, yet a section's content is immutable once written (content-addressed) —
+the vector computed for the same section is identical at any time, on any worker.
+L4b persists embedding vectors to a separate content-addressed ObjStore,
+turning "expensive network embedding calls" into "cheap disk/S3 reads."
+</p>
+
+<p>
+The key elegance of the design: <strong>the code that computes vectors (<code>BuildSemantic</code>) is unchanged by a single line</strong>;
+persistence is achieved purely by swapping in a different cache implementation — dependency injection, zero intrusion.
+</p>
+
+<h3>ObjCache: the persistence layer</h3>
+
+<pre><code><span class="cm">// objcache.go:21–36</span>
+func safeKey(key string) string {
+    sum := sha256.Sum256([]byte(key))
+    return hex.EncodeToString(sum[:])   <span class="cm">// pure hex, safe for file paths and S3 keys</span>
+}
+
+func (o *ObjCache) Get(key string) (string, bool) {
+    data, err := o.objs.Get(context.Background(), safeKey(key))
+    if err != nil { return "", false }   <span class="cm">// error = miss, best-effort</span>
+    return string(data), true
+}
+
+func (o *ObjCache) Put(key, val string) {
+    _ = o.objs.Put(context.Background(), safeKey(key), []byte(val))   <span class="cm">// errors ignored</span>
+}</code></pre>
+
+<p>
+<code>embKey</code> is already a base64 string (containing <code>:</code>), which is unsafe to use directly as a file path;
+<code>safeKey</code> applies another sha256 + hex encoding. The key is "the hash of the key," not "the hash of the value,"
+but uniqueness is guaranteed by <code>embKey</code>'s internal <code>sha256(model+text)</code>.
+</p>
+
+<h3>Tiered: memory layer in front, persistence layer behind</h3>
+
+<pre><code><span class="cm">// tiered.go:11–25</span>
+func (t *Tiered) Get(key string) (string, bool) {
+    if v, ok := t.front.Get(key); ok { return v, true }   <span class="cm">// check LRU first</span>
+    if v, ok := t.back.Get(key); ok {
+        t.front.Put(key, v)   <span class="cm">// promote from disk to memory</span>
+        return v, true
+    }
+    return "", false
+}
+
+func (t *Tiered) Put(key, val string) {
+    t.front.Put(key, val)   <span class="cm">// synchronous dual write</span>
+    t.back.Put(key, val)
+}</code></pre>
+
+<p>
+On read, the LRU is checked first (fast); on LRU miss the ObjCache (disk/S3) is queried, and a hit is promoted to LRU for the next warm read.
+Writes go synchronously to both layers, keeping persistence and in-memory cache consistent.
+</p>
+
+<h3>Two-tier cache structure</h3>
+
+<div class="figure">
+<svg viewBox="0 0 580 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <!-- BuildSemantic caller -->
+  <rect x="10" y="80" width="110" height="60" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="65" y="105" text-anchor="middle" font-weight="600" fill="#201e18">BuildSemantic</text>
+  <text x="65" y="122" text-anchor="middle" fill="#7c766c" font-size="11">cache.Cache</text>
+
+  <!-- Tiered layer -->
+  <rect x="160" y="60" width="130" height="100" rx="12" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="225" y="88" text-anchor="middle" font-weight="650" fill="#9d4a2d" font-size="13.5">Tiered</text>
+  <!-- inner LRU -->
+  <rect x="173" y="96" width="104" height="28" rx="7" fill="#fff" stroke="#e9e3d6" stroke-width="1"/>
+  <text x="225" y="115" text-anchor="middle" fill="#46413a" font-size="12">LRU (4096)</text>
+  <!-- inner ObjCache -->
+  <rect x="173" y="130" width="104" height="22" rx="7" fill="#fff" stroke="#e9e3d6" stroke-width="1"/>
+  <text x="225" y="146" text-anchor="middle" fill="#46413a" font-size="12">ObjCache</text>
+
+  <!-- ObjStore -->
+  <rect x="340" y="80" width="120" height="60" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="400" y="104" text-anchor="middle" font-weight="600" fill="#201e18">ObjStore</text>
+  <text x="400" y="122" text-anchor="middle" fill="#7c766c" font-size="11">Local / S3</text>
+
+  <!-- Voyage API -->
+  <rect x="480" y="80" width="90" height="60" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="525" y="104" text-anchor="middle" font-weight="600" fill="#201e18">Voyage</text>
+  <text x="525" y="122" text-anchor="middle" fill="#7c766c" font-size="11">API</text>
+
+  <!-- arrow: BuildSemantic → Tiered -->
+  <line x1="120" y1="110" x2="158" y2="110" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- arrow: ObjCache ↔ ObjStore -->
+  <line x1="277" y1="141" x2="338" y2="115" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- arrow: miss → Voyage -->
+  <line x1="460" y1="110" x2="478" y2="110" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arry)"/>
+
+  <!-- annotation: miss path -->
+  <text x="390" y="76" text-anchor="middle" fill="#a9741f" font-size="11">cache miss → Embed</text>
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="arry" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#a9741f"/>
+    </marker>
+  </defs>
+</svg>
+<p class="figcap">
+  <code>cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))</code><br>
+  <code>cmd/api/main.go:84</code> · <code>cmd/maintenance/main.go:136</code>
+</p>
+</div>
+
+<h3>Injection: BuildSemantic is unaware of persistence</h3>
+
+<pre><code><span class="cm">// cmd/api/main.go:80–85</span>
+embObjRoot := env("ENGRAM_EMB_OBJ", "./engram-embeddings")
+if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
+    log.Fatalf("ENGRAM_EMB_OBJ and ENGRAM_OBJ must be different directories (got %q)", embObjRoot)
+}
+embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
+router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024), embCache, emb)</code></pre>
+
+<p>
+<code>BuildSemantic</code> accepts a <code>cache.Cache</code> interface and has no knowledge of whether the backing store is an LRU, ObjCache, or Tiered.
+<code>semantic.go</code> is unchanged; persistence is delivered entirely through dependency injection.
+</p>
+
+<div class="callout win">
+  <span class="tag">Win</span>
+  <p>When a Session opens for the first time, if the reindex worker has already pre-warmed embeddings, every section hits the ObjCache and Voyage API calls are zero.
+  Across Session restarts, pod migrations, and process restarts, embedding persistence is transparently effective — the behavior of <code>BuildSemantic</code> does not change at all.</p>
+</div>
+
+<!-- ────────────────────────────────────────────── §7 Incremental reindex -->
+<h2 id="s7">7. Incremental updates: background pre-warming, zero network at session open</h2>
+
+<p>
+<code>maintenance.Reindex</code> (<code>reindex.go:23–46</code>) is the maintenance-side component of L4b:
+it materializes the agent HEAD's <strong>complete tree</strong> (not just <code>system/</code> — search indexes all files),
+calls <code>BuildSemantic</code>, and its primary purpose is to trigger the Put side-effect —
+writing every section's embedding into the persistent <code>embCache</code>.
+The returned <code>*SemanticIndex</code> is discarded.
+</p>
+
+<pre><code><span class="cm">// reindex.go:41–44</span>
+<span class="cm">// BuildSemantic persists missing embeddings into embCache as a side-effect.</span>
+if _, err := search.BuildSemantic(ctx, emb, embCache, files); err != nil {
+    return fmt.Errorf("maintenance: reindex build semantic: %w", err)
+}</code></pre>
+
+<h3>Why no diff is needed</h3>
+
+<p>
+Content addressing makes incremental updates naturally free — no diff computation required:
+</p>
+
+<ol class="steps">
+  <li><span class="st">Compute embKey for each section.</span><span class="sd"><code>embKey(model, text)</code> = sha256(model+text); identical content produces identical key.</span></li>
+  <li><span class="st">Check embCache.</span><span class="sd">Already-persisted sections hit immediately, skipping the <code>Embed</code> call.</span></li>
+  <li><span class="st">Only new or modified sections touch the network.</span><span class="sd">The Voyage API is called only when the key does not exist (the section is new or its content has changed).</span></li>
+  <li><span class="st">A second reindex makes zero network calls.</span><span class="sd">For the same HEAD, all sections are already persisted; the Embed call count is zero.</span></li>
+</ol>
+
+<p>
+This behavior is precisely verified with a <code>countingEmbedder</code>:
+</p>
+
+<pre><code><span class="cm">// reindex_test.go:46–52</span>
+<span class="cm">// Second reindex: every chunk's embedding is already persisted → 0 new embeds.</span>
+if err := Reindex(ctx, store, ce, embCache, agentID); err != nil { ... }
+if ce.calls != first {
+    t.Fatalf("second reindex embedded %d more texts, want 0 (incremental persistence broken)",
+        ce.calls-first)
+}</code></pre>
+
+<h3>Frontend Session and background worker share the same vector store</h3>
+
+<p>
+Both sides (<code>cmd/api</code> and <code>cmd/maintenance</code>) each build an ObjStore pointing to the <strong>same directory</strong> (<code>ENGRAM_EMB_OBJ</code>),
+then each wraps it in a Tiered(LRU + ObjCache).
+The LRU is in-process and not shared; the ObjStore is disk/S3 and is shared naturally.
+</p>
+
+<div class="callout gotcha">
+  <span class="tag">Gotcha</span>
+  <p>
+  Both sides must use the <strong>same embedding model</strong> (<code>ENGRAM_EMBEDDER</code> environment variable).
+  <code>embKey</code> carries the <code>model</code> prefix; different models produce different keys, making the vector store useless —
+  embeddings pre-warmed by maintenance are completely invisible to the Session, which falls back to calling Voyage on every open.
+  </p>
+  <p>
+  <code>ENGRAM_PROVIDER</code> (LLM inference provider) and <code>ENGRAM_EMBEDDER</code> (vector model) are two independent variables;
+  do not conflate them when configuring. In production both sides should be hardcoded to <code>voyage</code>.
+  </p>
+</div>
+
+<h3>Background pre-warm → session zero-network sequence</h3>
+
+<div class="figure">
+<svg viewBox="0 0 640 290" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <!-- lifelines -->
+  <text x="80"  y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">Maintenance</text>
+  <text x="240" y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">embCache (Tiered)</text>
+  <text x="400" y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">Voyage API</text>
+  <text x="550" y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">Session (Open)</text>
+
+  <line x1="80"  y1="35" x2="80"  y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="240" y1="35" x2="240" y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="400" y1="35" x2="400" y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="550" y1="35" x2="550" y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <!-- Phase 1: background pre-warm -->
+  <text x="10" y="60" fill="#7c766c" font-size="11">background pre-warm</text>
+
+  <!-- Maintenance → embCache: BuildSemantic (miss) -->
+  <line x1="80" y1="70" x2="235" y2="70" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#a4)"/>
+  <text x="155" y="65" text-anchor="middle" fill="#bf5e3c" font-size="11">BuildSemantic(files)</text>
+
+  <!-- embCache → Voyage: Embed(chunks) miss -->
+  <line x1="240" y1="90" x2="395" y2="90" stroke="#a9741f" stroke-width="1.5" marker-end="url(#a4y)"/>
+  <text x="318" y="85" text-anchor="middle" fill="#a9741f" font-size="11">Embed(chunks) cache miss</text>
+
+  <!-- Voyage → embCache: vectors -->
+  <line x1="400" y1="110" x2="245" y2="110" stroke="#a9741f" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#a4y)"/>
+  <text x="318" y="105" text-anchor="middle" fill="#a9741f" font-size="11">vectors</text>
+
+  <!-- embCache persist -->
+  <rect x="200" y="120" width="80" height="20" rx="5" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1"/>
+  <text x="240" y="133" text-anchor="middle" fill="#9d4a2d" font-size="11">Put → disk/S3</text>
+
+  <!-- Maintenance discards index -->
+  <text x="80" y="155" text-anchor="middle" fill="#7c766c" font-size="10">discard SemanticIndex</text>
+
+  <!-- divider -->
+  <line x1="20" y1="170" x2="620" y2="170" stroke="#e9e3d6" stroke-width="1" stroke-dasharray="2 4"/>
+  <text x="10" y="185" fill="#7c766c" font-size="11">foreground session</text>
+
+  <!-- Session → embCache: BuildSemantic -->
+  <line x1="550" y1="195" x2="245" y2="195" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#a4g)"/>
+  <text x="398" y="190" text-anchor="middle" fill="#5f7a4e" font-size="11">BuildSemantic(same files)</text>
+
+  <!-- embCache: Get → disk hit -->
+  <rect x="200" y="205" width="80" height="20" rx="5" fill="#eef2e6" stroke="#c2d5b0" stroke-width="1"/>
+  <text x="240" y="218" text-anchor="middle" fill="#5f7a4e" font-size="11">Get → disk hit</text>
+
+  <!-- embCache → Session: SemanticIndex -->
+  <line x1="240" y1="230" x2="545" y2="230" stroke="#5f7a4e" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#a4g)"/>
+  <text x="393" y="225" text-anchor="middle" fill="#5f7a4e" font-size="11">SemanticIndex (zero Voyage calls)</text>
+
+  <defs>
+    <marker id="a4"  markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/></marker>
+    <marker id="a4y" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#a9741f"/></marker>
+    <marker id="a4g" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#5f7a4e"/></marker>
+  </defs>
+</svg>
+<p class="figcap">
+  The background worker computes and persists each section's vector via a network call on the first pass; subsequent Session opens find all vectors on disk, making zero Voyage API calls.
+</p>
+</div>
+
+<!-- ────────────────────────────────────────────── §8 GC isolation -->
+<h2 id="s8">8. Isolation from GC</h2>
+
+<p>
+Engram's GC (L5a, <code>maintenance/gc.go</code>) sweeps unreferenced git objects via reachability analysis.
+GC operates on the <strong>git object store</strong> (<code>ENGRAM_OBJ</code>);
+embedding vectors are stored in a <strong>separate directory</strong> (<code>ENGRAM_EMB_OBJ</code>, default <code>./engram-embeddings</code>).
+These are different <code>objstore.NewLocal</code> instances; the GC reachability computation never touches the embedding store.
+</p>
+
+<p>
+Both commands enforce directory separation at startup:
+</p>
+
+<pre><code><span class="cm">// cmd/api/main.go:81–83</span>
+if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
+    log.Fatalf("ENGRAM_EMB_OBJ and ENGRAM_OBJ must be different directories (got %q)", embObjRoot)
+}
+
+<span class="cm">// cmd/maintenance/main.go:133–135</span>
+if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
+    log.Fatal("ENGRAM_EMB_OBJ must differ from ENGRAM_OBJ (GC must never sweep the embedding store)")
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">Invariant</span>
+  <p>GC never sweeps embedding vectors. The embedding store is an append-only content-addressed store:
+  vectors for old sections are not referenced by the current HEAD, but they are also not in the git object store, so GC cannot reach them.
+  The hard path-equality check at startup is a second layer of defense.</p>
+  <p>Expiry management for embeddings (if ever needed) is a problem independent of git GC, and is not currently implemented (acceptable: memory footprint is small, vector accumulation rate is slow).</p>
+</div>
+
+<p>
+A full analysis of git GC is in report <a href="03-storage-consistency.html">③ Storage &amp; Consistency</a>.
+</p>
+
+<!-- ────────────────────────────────────────────── Summary -->
+<h2 id="summary">Design summary</h2>
+
+<div class="cardgrid">
+  <div class="card">
+    <div class="num">L4 core</div>
+    <h3>Hybrid = Trigram + Semantic</h3>
+    <p>Lexical precision + semantic fuzziness, fused by RRF(k=60); silently degrades to pure trigram on embedding failure — Recall never errors.</p>
+  </div>
+  <div class="card">
+    <div class="num">L4b win</div>
+    <h3>Embedding Persistence</h3>
+    <p>Tiered(LRU + ObjCache) injected into <code>BuildSemantic</code>; <code>semantic.go</code> unchanged, Voyage calls drastically reduced.</p>
+  </div>
+  <div class="card">
+    <div class="num">Incremental free</div>
+    <h3>Content-addressed Keys</h3>
+    <p><code>embKey = sha256(model + text)</code>; already-persisted sections naturally hit the cache, no diff needed — a second reindex makes zero network calls (verified by a counting test).</p>
+  </div>
+  <div class="card">
+    <div class="num">Safe isolation</div>
+    <h3>GC never touches the Embedding Store</h3>
+    <p>Separate ObjStore root directory + hard path-equality check at startup — double protection.</p>
+  </div>
+</div>
+
+<h3>Key file index</h3>
+
+<table>
+  <thead><tr><th>File</th><th>Responsibility</th><th>Key symbols</th></tr></thead>
+  <tbody>
+    <tr><td><code>internal/search/search.go</code></td><td>Interface definitions</td><td><code>Hit</code>, <code>Search</code></td></tr>
+    <tr><td><code>internal/search/grep.go</code></td><td>L2 stub (directory-walk substring scan)</td><td><code>GrepSearch</code></td></tr>
+    <tr><td><code>internal/search/trigram.go</code></td><td>Line-level trigram inverted index</td><td><code>trigrams</code>, <code>BuildTrigram</code>, <code>candidates</code>, <code>Search</code></td></tr>
+    <tr><td><code>internal/search/semantic.go</code></td><td>Paragraph vector index</td><td><code>sectionize</code>, <code>embKey</code>, <code>BuildSemantic</code>, <code>cosine</code></td></tr>
+    <tr><td><code>internal/search/hybrid.go</code></td><td>RRF fusion + degradation</td><td><code>NewHybrid</code>, <code>Recall</code>, <code>rrf</code></td></tr>
+    <tr><td><code>internal/search/embedder.go</code></td><td>Embedder interface + FakeEmbedder</td><td><code>Embedder</code>, <code>FakeEmbedder</code></td></tr>
+    <tr><td><code>internal/search/voyage.go</code></td><td>Voyage AI adapter</td><td><code>VoyageEmbedder</code>, <code>NewVoyage</code></td></tr>
+    <tr><td><code>internal/cache/cache.go</code></td><td>Cache interface + LRU</td><td><code>Cache</code>, <code>LRU</code></td></tr>
+    <tr><td><code>internal/cache/objcache.go</code></td><td>Persistent Cache over ObjStore</td><td><code>ObjCache</code>, <code>safeKey</code></td></tr>
+    <tr><td><code>internal/cache/tiered.go</code></td><td>Two-tier cache composition</td><td><code>Tiered</code></td></tr>
+    <tr><td><code>internal/maintenance/reindex.go</code></td><td>Full-tree materialization + persistence side-effect</td><td><code>Reindex</code>, <code>readAllFiles</code></td></tr>
+    <tr><td><code>internal/agent/router.go</code></td><td>Builds HybridSearch when Session opens</td><td><code>NewRouter</code>, <code>Open</code></td></tr>
+    <tr><td><code>cmd/api/main.go</code></td><td>Request-path wiring</td><td><code>ENGRAM_EMBEDDER</code>, <code>ENGRAM_EMB_OBJ</code></td></tr>
+    <tr><td><code>cmd/maintenance/main.go</code></td><td>Maintenance worker wiring</td><td><code>ENGRAM_EMBEDDER</code>, <code>ENGRAM_EMB_OBJ</code></td></tr>
+  </tbody>
+</table>
+
+</main>
+<footer>Engram deep dives · hand-built SVG/HTML, readable offline · based on the main branch (L1–L5d)</footer>
+</body></html>

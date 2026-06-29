@@ -56,6 +56,8 @@ body {
 .topnav a { color: var(--muted); text-decoration: none; padding: 4px 10px; border-radius: 7px; transition: .15s; }
 .topnav a:hover { background: var(--clay-soft); color: var(--clay-deep); }
 .topnav a.active { color: var(--clay-deep); font-weight: 600; }
+.topnav .lang { margin-left: auto; border: 1px solid var(--line-2); border-radius: 999px; padding: 3px 12px; color: var(--muted); }
+.topnav .lang:hover { background: var(--clay-soft); color: var(--clay-deep); border-color: var(--clay-line); }
 
 /* ── layout & type ───────────────────────────────────────── */
 main { max-width: var(--maxw); margin: 0 auto; padding: 52px 24px 96px; }

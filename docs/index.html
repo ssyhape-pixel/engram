@@ -1,12 +1,19 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="0; url=reports/index.html">
-<link rel="canonical" href="reports/index.html">
-<title>Engram · 深入解析</title>
+<title>Engram · Deep Dives</title>
+<script>
+  // Send Chinese-locale browsers to the 中文 reports, everyone else to English.
+  var lang = (navigator.language || navigator.userLanguage || "en").toLowerCase();
+  var target = lang.indexOf("zh") === 0 ? "reports/cn/index.html" : "reports/en/index.html";
+  location.replace(target);
+</script>
 </head>
 <body>
-<p>正在前往 <a href="reports/index.html">Engram 深入解析报告</a>……</p>
+<p>Redirecting… choose a language:
+  <a href="reports/en/index.html">English</a> ·
+  <a href="reports/cn/index.html">简体中文</a>
+</p>
 </body>
 </html>

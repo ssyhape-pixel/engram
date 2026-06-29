@@ -120,10 +120,11 @@ Full environment-variable reference is in [`CLAUDE.md`](CLAUDE.md).
 ## Deep dives
 
 - **[`docs/architecture.md`](docs/architecture.md)** — the authoritative design, with diagrams.
-- **`docs/reports/index.html`** — six illustrated, self-contained deep-dive reports
-  (architecture, request path, storage & consistency, search & index, maintenance,
-  build journey). Hand-built SVG/HTML, no dependencies — open `index.html` locally,
-  or enable GitHub Pages on `docs/` to read them online.
+- **[Six illustrated deep-dive reports](https://ssyhape-pixel.github.io/engram/)** (live on
+  GitHub Pages — auto-detects your language; also at [`docs/reports/en/`](docs/reports/en/index.html)
+  in English / [`docs/reports/cn/`](docs/reports/cn/index.html) in 中文): architecture, request
+  path, storage & consistency, search & index, maintenance, build journey. Hand-built SVG/HTML,
+  no dependencies, readable offline.
 - **[`docs/onboarding.md`](docs/onboarding.md)** — a plain-language tour for newcomers.
 
 ## Tech stack

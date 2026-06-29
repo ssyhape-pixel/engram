@@ -111,9 +111,10 @@ go run ./cmd/maintenance
 ## 深入阅读
 
 - **[`docs/architecture.md`](docs/architecture.md)** —— 权威设计,带图。
-- **`docs/reports/index.html`** —— 六份图文、自包含的深入解析报告(架构总览、请求路径、
-  存储与一致性、搜索与索引、维护管线、构建历程)。纯手工 SVG/HTML、零依赖——本地直接打开
-  `index.html`,或对 `docs/` 开启 GitHub Pages 在线阅读。
+- **[六份图文深入解析报告](https://ssyhape-pixel.github.io/engram/)**(已上 GitHub Pages,
+  按浏览器语言自动跳;也可直接看 [`docs/reports/cn/`](docs/reports/cn/index.html) 中文 /
+  [`docs/reports/en/`](docs/reports/en/index.html) English):架构总览、请求路径、存储与一致性、
+  搜索与索引、维护管线、构建历程。纯手工 SVG/HTML、零依赖、离线可读。
 - **[`docs/onboarding.md`](docs/onboarding.md)** —— 给新人的通俗导览。
 
 ## 技术栈

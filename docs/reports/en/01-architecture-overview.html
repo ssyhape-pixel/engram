@@ -1,0 +1,492 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · Architecture overview</title>
+<link rel="stylesheet" href="../style.css">
+</head><body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html">Index</a>
+  <a href="01-architecture-overview.html" class="active">Architecture</a>
+  <a href="02-request-path.html">Request Path</a>
+  <a href="03-storage-consistency.html">Storage</a>
+  <a href="04-search-index.html">Search</a>
+  <a href="05-maintenance-pipeline.html">Maintenance</a>
+  <a href="06-build-journey.html">Build Journey</a>
+  <a class="lang" href="../cn/01-architecture-overview.html">中文</a>
+</nav>
+<main>
+
+<p class="meta">Based on the main branch · L1–L5d all merged · Source: docs/architecture.md · CLAUDE.md</p>
+<h1>Architecture Overview</h1>
+<p class="lead">Engram is a "cloud-side notebook" for agents — it stores memory using the git object model, guarantees consistency with a single small lock in Postgres, and scales horizontally with stateless workers. This page is the global map; subsystem details live in <a href="02-request-path.html">Request Path</a>, <a href="03-storage-consistency.html">Storage &amp; Consistency</a>, <a href="04-search-index.html">Search &amp; Index</a>, <a href="05-maintenance-pipeline.html">Maintenance Pipeline</a>.</p>
+
+<!-- ──────────────────────────────────────────────────── §1 -->
+<h2>1. What We Are Building</h2>
+
+<p>Every LLM conversation starts from a blank slate — the model has no idea what you said last time, no memory of what it wrote before. That is exactly what Engram is here to fix: give each agent a memory repository that it can read and write across sessions, with full version history, multi-tenant isolation, deployed in the cloud, and served on demand by stateless workers.</p>
+
+<p>The starting point is MemFS (the git-backed local memory filesystem from the Letta project), but we've moved it from "single-machine local" to "multi-tenant cloud." Each agent owns its own git repository — files are Markdown memory fragments, history is git commits, and content addressing is the SHA of git objects. The cloud-scale challenges are: many agents writing concurrently, pods crashing at any moment, stateless workers, and no single-point bottleneck.</p>
+
+<div class="callout win">
+  <span class="tag">Core Philosophy — Memory Is Fetched on Demand, Not Stuffed Into the Model</span>
+  <p>Before each inference turn, only <code>system/</code> (resident key facts) and a lightweight tree index (filenames + description fields) are loaded into context. The long tail — memories that exist but are not frequently needed — is pulled <strong>on demand</strong> by the model mid-loop via the <code>recall</code> / <code>read</code> tools. There is no automatic top-k dump, no pre-loading of "potentially useful" content into the prompt. This principle dramatically reduces per-turn token cost while preserving full memory reachability.</p>
+</div>
+
+<p>The overall design is deliberately lightweight: <strong>stateless compute + content-addressed object storage + a single Postgres as the coordination hub</strong>, with no Temporal or Kafka (see §5 for why). Minimal infrastructure: one object-storage bucket + Postgres + pods with no local persistence.</p>
+
+<!-- ──────────────────────────────────────────────────── §2 -->
+<h2>2. The Four Zones</h2>
+
+<p>The architecture is logically divided into four zones (<code>architecture.md §3</code>). Read paths flow top-down through the acceleration layers; the write path (commit) goes directly to canonical storage; maintenance is fully async and never on the critical path.</p>
+
+<!-- Hand-built SVG four-zone diagram -->
+<div class="figure">
+<svg viewBox="0 0 680 420" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
+
+  <!-- Zone colours (faint fills) -->
+  <!-- Z1 request path -->
+  <rect x="20" y="14" width="640" height="96" rx="12"
+        fill="#fdf3ee" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="36" y="34" font-size="11" font-weight="700" fill="#bf5e3c" letter-spacing=".07em">① Request Path</text>
+
+  <!-- Z2 read accelerators -->
+  <rect x="20" y="126" width="300" height="84" rx="12"
+        fill="#f5f9f0" stroke="#c9d9be" stroke-width="1.2"/>
+  <text x="36" y="146" font-size="11" font-weight="700" fill="#5f7a4e" letter-spacing=".07em">② Read Accelerators</text>
+
+  <!-- Z3 canonical store -->
+  <rect x="20" y="228" width="640" height="84" rx="12"
+        fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.2"/>
+  <text x="36" y="248" font-size="11" font-weight="700" fill="#46413a" letter-spacing=".07em">③ Canonical Store (Authoritative)</text>
+
+  <!-- Z4 maintenance -->
+  <rect x="20" y="330" width="640" height="72" rx="12"
+        fill="#fffbf5" stroke="#e9e3d6" stroke-width="1.2"/>
+  <text x="36" y="350" font-size="11" font-weight="700" fill="#a9741f" letter-spacing=".07em">④ Maintenance</text>
+
+  <!-- ── Z1 nodes ── -->
+  <!-- Session Router -->
+  <rect x="52" y="46" width="140" height="50" rx="9"
+        fill="#fff" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="122" y="68" text-anchor="middle" font-weight="650" fill="#201e18">Session Router</text>
+  <text x="122" y="84" text-anchor="middle" font-size="11.5" fill="#7c766c">serializes writes per agent_id</text>
+
+  <!-- arrow -->
+  <line x1="192" y1="71" x2="220" y2="71" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- Agent Worker -->
+  <rect x="220" y="46" width="140" height="50" rx="9"
+        fill="#fdf3ee" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="290" y="68" text-anchor="middle" font-weight="650" fill="#201e18">Agent Worker</text>
+  <text x="290" y="84" text-anchor="middle" font-size="11.5" fill="#7c766c">stateless pod · runs loop</text>
+
+  <!-- arrow -->
+  <line x1="360" y1="71" x2="388" y2="71" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- LLM -->
+  <rect x="388" y="46" width="140" height="50" rx="9"
+        fill="#fff" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="458" y="68" text-anchor="middle" font-weight="650" fill="#201e18">LLM Provider</text>
+  <text x="458" y="84" text-anchor="middle" font-size="11.5" fill="#7c766c">pure inference · stateless</text>
+
+  <!-- ── Z2 nodes ── -->
+  <!-- Memory Cache -->
+  <rect x="40" y="154" width="122" height="44" rx="9"
+        fill="#fff" stroke="#c9d9be" stroke-width="1.2"/>
+  <text x="101" y="174" text-anchor="middle" font-weight="650" fill="#201e18">Memory Cache</text>
+  <text x="101" y="190" text-anchor="middle" font-size="11" fill="#7c766c">keyed by commit SHA</text>
+
+  <!-- Search Service -->
+  <rect x="178" y="154" width="122" height="44" rx="9"
+        fill="#fff" stroke="#c9d9be" stroke-width="1.2"/>
+  <text x="239" y="174" text-anchor="middle" font-weight="650" fill="#201e18">Search Service</text>
+  <text x="239" y="190" text-anchor="middle" font-size="11" fill="#7c766c">local trigram + embeddings</text>
+
+  <!-- ── Z3 nodes ── -->
+  <!-- Object Storage -->
+  <rect x="52" y="254" width="152" height="44" rx="9"
+        fill="#fff" stroke="#ddd5c5" stroke-width="1.2"/>
+  <text x="128" y="274" text-anchor="middle" font-weight="650" fill="#201e18">Object Storage</text>
+  <text x="128" y="290" text-anchor="middle" font-size="11" fill="#7c766c">content-addressed · S3/local</text>
+
+  <!-- Postgres -->
+  <rect x="226" y="254" width="152" height="44" rx="9"
+        fill="#fff" stroke="#ddd5c5" stroke-width="1.2"/>
+  <text x="302" y="274" text-anchor="middle" font-weight="650" fill="#201e18">Postgres</text>
+  <text x="302" y="290" text-anchor="middle" font-size="11" fill="#7c766c">HEAD CAS · job queue</text>
+
+  <!-- ── Z4 node ── -->
+  <rect x="52" y="354" width="260" height="36" rx="9"
+        fill="#fff" stroke="#e9e3d6" stroke-width="1.2"/>
+  <text x="182" y="373" text-anchor="middle" font-weight="650" fill="#201e18">Go Maintenance Worker — GC · Reflection · Defrag · Reaper</text>
+
+  <!-- ── Flow arrows ── -->
+  <!-- Worker → Cache (read system/ + tree index) -->
+  <line x1="290" y1="96" x2="112" y2="154" stroke="#5f7a4e" stroke-width="1.4"
+        stroke-dasharray="5,3" marker-end="url(#arrsage)"/>
+  <text x="172" y="134" font-size="10.5" fill="#5f7a4e">read system/ + tree index</text>
+
+  <!-- Worker → Search (recall) -->
+  <line x1="310" y1="96" x2="248" y2="154" stroke="#5f7a4e" stroke-width="1.4"
+        stroke-dasharray="5,3" marker-end="url(#arrsage)"/>
+  <text x="316" y="130" font-size="10.5" fill="#5f7a4e">recall tool</text>
+
+  <!-- Cache → ObjStore (cache miss) -->
+  <line x1="101" y1="198" x2="110" y2="254" stroke="#7c766c" stroke-width="1.2"
+        stroke-dasharray="4,3" marker-end="url(#arrmuted)"/>
+  <text x="54" y="230" font-size="10" fill="#7c766c">miss→fetch</text>
+
+  <!-- Worker → ObjStore (commit: write objects first) -->
+  <line x1="270" y1="96" x2="150" y2="254" stroke="#bf5e3c" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+  <text x="170" y="190" font-size="10.5" fill="#bf5e3c">write objects first</text>
+
+  <!-- Worker → Postgres (commit: CAS + enqueue) -->
+  <line x1="310" y1="96" x2="290" y2="254" stroke="#bf5e3c" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+  <text x="315" y="180" font-size="10.5" fill="#bf5e3c">then CAS+enqueue</text>
+  <text x="315" y="193" font-size="10" fill="#bf5e3c">(single Postgres tx)</text>
+
+  <!-- Maintenance ↔ Postgres -->
+  <line x1="182" y1="354" x2="290" y2="298" stroke="#a9741f" stroke-width="1.3"
+        stroke-dasharray="5,3" marker-end="url(#arramber)"/>
+  <text x="248" y="330" font-size="10" fill="#a9741f">poll/dequeue</text>
+
+  <!-- Maintenance → ObjStore (GC) -->
+  <line x1="130" y1="354" x2="128" y2="298" stroke="#a9741f" stroke-width="1.3"
+        stroke-dasharray="5,3" marker-end="url(#arramber)"/>
+  <text x="56" y="332" font-size="10" fill="#a9741f">GC sweep</text>
+
+  <!-- arrowhead markers -->
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="arrsage" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#5f7a4e"/>
+    </marker>
+    <marker id="arrmuted" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#7c766c"/>
+    </marker>
+    <marker id="arramber" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#a9741f"/>
+    </marker>
+  </defs>
+</svg>
+<p class="figcap">Four-zone topology. Solid red lines = write path (objects first, then CAS); dashed green lines = read path (cache/index first); dashed orange lines = async maintenance.</p>
+</div>
+
+<div class="cardgrid">
+  <div class="card">
+    <div class="num">① Request Path</div>
+    <h3>Session Router → Agent Worker → LLM</h3>
+    <p>The Router serializes writes per <code>agent_id</code> (sticky routing or a per-agent lock). The Worker is a stateless pod: it mounts a working tree, assembles context, runs the tool loop, and commits. The LLM is pure inference, stateless.</p>
+    <p>→ Deep dive: <a href="02-request-path.html">Request Path</a>.</p>
+  </div>
+  <div class="card">
+    <div class="num">② Read Accelerators</div>
+    <h3>SHA Cache + Hybrid Search</h3>
+    <p>The Memory Cache is keyed by the <code>system/</code> subtree hash — no invalidation needed (the same SHA always maps to the same content). The Search Service holds full file contents locally (Variant A), so queries require zero object-storage access.</p>
+    <p>→ Deep dive: <a href="04-search-index.html">Search &amp; Index</a>.</p>
+  </div>
+  <div class="card">
+    <div class="num">③ Canonical Store</div>
+    <h3>Object Storage + Postgres</h3>
+    <p>Object storage holds content-addressed immutable objects (<code>objects/&lt;hash&gt;</code>). Postgres is the system's single strong-consistency coordination point: it owns the <code>agent_id→HEAD</code> CAS ref and the <code>memory_jobs</code> job queue.</p>
+    <p>→ Deep dive: <a href="03-storage-consistency.html">Storage &amp; Consistency</a>.</p>
+  </div>
+  <div class="card">
+    <div class="num">④ Maintenance</div>
+    <h3>Single Go Maintenance Worker</h3>
+    <p>A separate process that runs periodically: GC (mark-and-sweep unreachable objects), Reflection (history consolidation), Defrag (split oversized files), Reindex (incremental index updates), Reaper (reclaim stalled jobs). Fully async — never blocks the foreground.</p>
+    <p>→ Deep dive: <a href="05-maintenance-pipeline.html">Maintenance Pipeline</a>.</p>
+  </div>
+</div>
+
+<!-- ──────────────────────────────────────────────────── §3 -->
+<h2>3. Three Rules That Run Through Everything</h2>
+
+<p>The three invariants below are the spine of the entire architecture (<code>architecture.md §2</code>, <code>CLAUDE.md core invariants</code>). They derive from one another: the first makes caching and GC possible; the second gives the whole system a single arbiter; the third lets you throw away and rebuild any derived view at any time.</p>
+
+<div class="callout invariant">
+  <span class="tag">Invariant ① — Every piece of content is immutable, stored by its fingerprint</span>
+  <p>File contents, tree objects, commit objects — all are keyed by the <strong>SHA of their own content</strong> and stored in object storage. <strong>Objects are never modified; only new objects are appended.</strong> Changing memory = producing new objects + a new commit.</p>
+  <p>Three things follow from this rule:</p>
+  <ul>
+    <li><strong>Cache entries never need invalidation.</strong> <code>sha → materialized content</code> is an immutable mapping. LRU eviction is about saving space, not freshness. New content = new SHA = new key = cache miss = re-populate — that's "natural invalidation."</li>
+    <li><strong>Deduplication across versions.</strong> If the same content is written twice, only one object is stored; the object store deduplicates for free.</li>
+    <li><strong>Mark-and-sweep GC is safe.</strong> The same hash can never point to two different pieces of content, so "objects not reachable from HEAD" are garbage and can be swept periodically without any risk of deleting live data.</li>
+  </ul>
+</div>
+
+<div class="callout invariant">
+  <span class="tag">Invariant ② — The only mutable thing is the HEAD pointer, protected by a single "check before you change" lock</span>
+  <p>The <strong>only mutable pointer</strong> in the system is <code>agent_id → HEAD</code>, stored in the <code>agent_refs</code> table in Postgres. <strong>All concurrency control, ordering guarantees, and consistency are funneled through this single CAS operation — the sole arbiter for the entire system.</strong></p>
+  <p>The SQL primitive (<code>architecture.md §9</code>):</p>
+  <pre><code>UPDATE agent_refs SET head=$new, updated_at=now()
+WHERE agent_id=$id AND head=$expected_parent;</code></pre>
+  <p>Zero rows returned → HEAD has already moved → caller reconciles and retries. This single serialization point replaces any external lock service. Object storage needs no conditional writes because it stores only immutable objects.</p>
+  <p>This maps exactly to lakeFS's design (<code>architecture.md §15.1</code>, validation 3-0): lakeFS stores committed metadata in object storage and protects branch pointers with a KV-store <code>SetIf()</code> CAS, for precisely the same reason — object stores have no conditional-write primitive.</p>
+</div>
+
+<div class="callout invariant">
+  <span class="tag">Invariant ③ — Everything else is a disposable, recomputable derived view</span>
+  <p>Caches, the trigram index, the embedding vector index, working-tree copies — all are views derived from objects + refs, and therefore stateless and disposable.</p>
+  <ul>
+    <li><strong>Cache:</strong> Pod crashes → on restart, repopulate from object storage. Zero data loss.</li>
+    <li><strong>Search index:</strong> Eventually consistent; memory written moments ago may not be searchable for a few seconds — acceptable, because the current turn's content is already in context.</li>
+    <li><strong>Working tree:</strong> A temporary directory mounted on worker scratch / tmpfs, re-materializable from any SHA at any time.</li>
+  </ul>
+</div>
+
+<div class="callout gotcha">
+  <span class="tag">Common Pitfall</span>
+  <p>Do not treat the cache, search index, or working tree as a source of truth. They are derived products — disposable. Objects + refs are authoritative (<code>CLAUDE.md guardrails</code>). Once you start treating derived views as the source of truth, you'll start worrying about "what if the cache is out of sync with storage" — and the correct answer is: when a derived view is inconsistent, throw it away and rebuild.</p>
+</div>
+
+<!-- ──────────────────────────────────────────────────── §4 -->
+<h2>4. From One Request to One Commit</h2>
+
+<p>From a user message arriving, to an agent editing memory, committing, and triggering background maintenance — a full lifecycle walkthrough (<code>architecture.md §8</code>).</p>
+
+<ol class="steps">
+  <li>
+    <span class="st">Load resident facts + directory</span>
+    <span class="sd">The Router serializes by agent_id and hands the request to a Worker. The Worker reads the current HEAD from Postgres and queries the Memory Cache with <code>Get(agentID, systemTreeSHA)</code>. Hit → immediately returns the materialized <code>system/</code> content + tree index (filenames, descriptions); miss → fetches objects from object storage and populates the cache. Context assembly: resident facts + tree index + user message, sent to the LLM.</span>
+  </li>
+  <li>
+    <span class="st">Agent loop — the model decides what to fetch</span>
+    <span class="sd">The LLM receives its context and enters a tool-call loop. It may call <code>recall(query)</code> (sends a trigram+vector hybrid query to the Search Service, returns matching line-number ranges — not entire files), <code>read(path)</code> (reads a file from the working tree or object storage), or <code>edit(path, content)</code> (writes a modification into the working tree). All of this happens during inference; the model autonomously decides which memories to retrieve — no pre-stuffing of context.</span>
+  </li>
+  <li>
+    <span class="st">Commit — write objects first, then advance HEAD, enqueue jobs in the same transaction</span>
+    <span class="sd">The Worker calls <code>CommitWithCAS</code>: ① write all new content from the working tree as content-addressed objects, idempotent PUT to object storage (this step can crash, leaving only garbage objects that GC will clean); ② in a <strong>single Postgres transaction</strong>, execute the CAS <code>HEAD: parent → new</code> + <code>INSERT memory_jobs</code>. Atomicity guarantees: job is enqueued if and only if the commit committed. CAS failure (HEAD already moved) → returns <code>ErrCASConflict</code> → caller reconciles and retries.</span>
+  </li>
+  <li>
+    <span class="st">Background digestion — async maintenance, never blocks the foreground</span>
+    <span class="sd">The Maintenance Worker dequeues <code>memory_jobs</code> with <code>FOR UPDATE SKIP LOCKED</code> and runs Reflection (history consolidation), Defrag (split oversized files), GC (mark-and-sweep unreachable objects), and Reindex (incremental search-index update) in an isolated git worktree. This never interferes with SHA snapshots currently being read by foreground Workers. Timed-out jobs are reclaimed by the Reaper; poison jobs (those that repeatedly crash workers) enter a <code>failed</code> state after <code>maxAttempts</code> attempts (L5d).</span>
+  </li>
+</ol>
+
+<h3>Crash Safety of the Write Order</h3>
+
+<p><code>architecture.md §6.2</code> is explicit: <strong>write objects to object storage first (idempotent), then CAS in Postgres.</strong> Crashing before the CAS leaves only unreachable garbage objects, which GC cleans up after a grace window — it never produces a dangling ref pointing to an incomplete commit. The reverse order — CAS first, then write objects — would leave a HEAD pointing to objects that do not yet exist, which is a serious consistency flaw.</p>
+
+<!-- ──────────────────────────────────────────────────── §5 -->
+<h2>5. Key Trade-offs</h2>
+
+<h3>Single-writer vs. optimistic multi-writer</h3>
+<div class="cmp">
+  <div class="col good">
+    <h4>Chosen: single writer per agent, Router serializes</h4>
+    <p>The Router uses sticky routing or a per-agent lock to ensure only one Worker is writing for a given agent at any moment. Simple, correct, and well-matched to how agents access memory — sequentially, one turn at a time.</p>
+  </div>
+  <div class="col bad">
+    <h4>Rejected: optimistic multi-writer + automatic merge</h4>
+    <p>Three-way merge works fine for structured data (JSON, code); it does not work for Markdown prose — any automatic merge is lossy, potentially stitching unrelated memory fragments in the wrong place or silently overwriting content.</p>
+  </div>
+</div>
+
+<h3>Commit as a single database transaction, replacing heavy message middleware</h3>
+<div class="cmp">
+  <div class="col good">
+    <h4>Chosen: single Postgres transaction — CAS + enqueue</h4>
+    <p>CAS and <code>INSERT memory_jobs</code> commit in the same transaction, guaranteeing atomically that "job is enqueued iff commit committed." No orphaned jobs, no commit/emit race.</p>
+  </div>
+  <div class="col bad">
+    <h4>Rejected: Kafka outbox / dual write</h4>
+    <p>Write DB then write Kafka: if the Kafka write fails, the job is lost. Write Kafka first: if the DB write fails, the job is already enqueued but the commit never happened. Either order has an inconsistency window. Closing that window requires a complex outbox table.</p>
+  </div>
+</div>
+
+<h3>Local search: queries never touch object storage</h3>
+<div class="cmp">
+  <div class="col good">
+    <h4>Chosen: Variant A — index stores full file content locally</h4>
+    <p>Zero object-storage access at query time; low latency, no dependencies. Memory files are small Markdown; the content duplication is negligible. L4 layers embedding vectors on top of this, enabling trigram lexical + semantic hybrid recall.</p>
+  </div>
+  <div class="col bad">
+    <h4>Variant B — index stores only offsets + Range GET</h4>
+    <p>Queries require Range GETs against object storage, adding cross-AZ network round-trips and potentially hitting object-storage rate limits under high concurrency. Only worth considering when memory files are large — not the case here.</p>
+  </div>
+</div>
+
+<h3>Why not Temporal and Kafka (<code>architecture.md §12</code>)</h3>
+
+<div class="callout gotcha">
+  <span class="tag">Guardrail — Do not introduce Temporal or Kafka</span>
+  <p><strong>Temporal</strong> solves "long-running, crash-recoverable, multi-step workflows." Our maintenance jobs are idempotent, re-derivable from state, and complete in seconds — "retry from scratch" is acceptable, so the overhead of durable mid-flight resume is pure waste.<br><br>
+  <strong>Kafka</strong> solves "decoupling the write path, fanning out to multiple consumers." We have exactly one consumer (the Maintenance Worker), and the same-transaction Postgres enqueue provides that decoupling with zero dual-write risk.<br><br>
+  Revisit only if jobs become genuinely long and complex (→ then Temporal) or consumers multiply and need replay (→ then Kafka). M5 plans to upgrade to River (same Postgres, richer retry semantics), but no need to cross over to Kafka.</p>
+</div>
+
+<!-- ──────────────────────────────────────────────────── §6 -->
+<h2>6. The Nine-Layer Map (L1–L5d)</h2>
+
+<p>The project is built in layer order, each layer adding a new set of guarantees on top of the previous one. As of the main branch, L1–L5d are all merged (<code>CLAUDE.md Build/test/run status</code>).</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Layer</th>
+      <th>What It Adds</th>
+      <th>Core Guarantee</th>
+      <th>Deep-dive Report</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>L1</strong></td>
+      <td>MemStore core: local-FS object backend + Postgres refs + CAS; <code>CommitWithCAS</code>; single-writer routing</td>
+      <td>Agent can read/edit/commit memory with versioned, diffable history</td>
+      <td><a href="03-storage-consistency.html">Storage &amp; Consistency</a></td>
+    </tr>
+    <tr>
+      <td><strong>L2</strong></td>
+      <td>Agent loop + Session; tool set (recall / read / edit); context assembly; fake/anthropic LLM backends</td>
+      <td>Full infer-edit-commit cycle runs end-to-end</td>
+      <td><a href="02-request-path.html">Request Path</a></td>
+    </tr>
+    <tr>
+      <td><strong>L3</strong></td>
+      <td>SHA-keyed LRU read cache; <code>assembleSystem</code> cache backing; Router/cmd injects shared cache instance</td>
+      <td><code>system/</code> content hits cache across turns with no repeated object-storage reads; cache never needs invalidation</td>
+      <td><a href="02-request-path.html">Request Path</a></td>
+    </tr>
+    <tr>
+      <td><strong>L4</strong></td>
+      <td>Hybrid search (trigram lexical + embedding semantic); Recall tool returns line ranges; Search Variant A (local content)</td>
+      <td>Zero object-storage access at query time; hybrid signals outperform pure lexical (§15.2 validation 3-0)</td>
+      <td><a href="04-search-index.html">Search &amp; Index</a></td>
+    </tr>
+    <tr>
+      <td><strong>L4b</strong></td>
+      <td>Embedding index persistence (embedding store independent of GC); incremental reindex (git-diff driven)</td>
+      <td>Embeddings survive worker restarts; reindex processes only the changed delta</td>
+      <td><a href="04-search-index.html">Search &amp; Index</a></td>
+    </tr>
+    <tr>
+      <td><strong>L5a</strong></td>
+      <td>GC Worker: mark-and-sweep unreachable objects; grace window prevents accidental deletion of newly written objects</td>
+      <td>Garbage objects (pre-CAS crash remnants) are periodically swept; object storage does not grow unboundedly</td>
+      <td><a href="05-maintenance-pipeline.html">Maintenance Pipeline</a></td>
+    </tr>
+    <tr>
+      <td><strong>L5b</strong></td>
+      <td><code>memory_jobs</code> consumer; Reflection (history consolidation); reconcile loop + Postgres polling</td>
+      <td>Each maintenance round: GC → dequeue memory_jobs (reflection + reindex); jobs deduplicated per agent</td>
+      <td><a href="05-maintenance-pipeline.html">Maintenance Pipeline</a></td>
+    </tr>
+    <tr>
+      <td><strong>L5c</strong></td>
+      <td>Deterministic Defrag: splits oversized Markdown files by top-level heading (<code>ENGRAM_DEFRAG_MAX_BYTES</code>)</td>
+      <td>Convergence: repeated runs produce identical results; <code>system/</code> files do not grow without bound</td>
+      <td><a href="05-maintenance-pipeline.html">Maintenance Pipeline</a></td>
+    </tr>
+    <tr>
+      <td><strong>L5d</strong></td>
+      <td>Stalled-job Reaper: <code>claimed_at</code> field migration; <code>ReapStaleJobs</code> returns timed-out <code>running</code> jobs to <code>pending</code>; poison-job protection (<code>maxAttempts</code>)</td>
+      <td>Worker crashes do not permanently block jobs; poison jobs exceeding the retry limit enter <code>failed</code> state (§14 resolved)</td>
+      <td><a href="05-maintenance-pipeline.html">Maintenance Pipeline</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout win">
+  <span class="tag">Milestone Completion Status</span>
+  <p>All features on the M1–M4 design roadmap are implemented and merged into the main branch (L1–L5d). Next directions: M5 River queue upgrade (richer retry semantics) and a warm per-agent sidecar (improve grep fidelity, to be considered when grep latency or precision becomes a bottleneck).</p>
+</div>
+
+<!-- ──────────────────────────────────────────────────── §7 -->
+<h2>7. Tech Stack</h2>
+
+<div class="cardgrid">
+  <div class="card">
+    <div class="num">Language</div>
+    <h3>Go</h3>
+    <ul>
+      <li>All I/O functions take <code>context.Context</code> as their first argument</li>
+      <li>Errors are wrapped with <code>%w</code> for full, traceable call chains</li>
+      <li>No global mutable state; small interfaces at package boundaries</li>
+      <li>Table-driven tests; Postgres-dependent tests auto-<code>t.Skip</code> when <code>ENGRAM_TEST_DB</code> is unset</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="num">Database</div>
+    <h3>Postgres + pgx</h3>
+    <ul>
+      <li><code>agent_refs</code>: refs CAS — the sole strong-consistency coordination point</li>
+      <li><code>memory_jobs</code>: job queue, dequeued with <code>FOR UPDATE SKIP LOCKED</code>, deduplicated per agent+kind</li>
+      <li><code>maintenance_cursor</code>: reconcile loop cursor</li>
+      <li>Migrations via <code>golang-migrate</code>, expand-contract strategy, never destructive in a single step</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="num">Object Storage</div>
+    <h3>S3 / Local FS</h3>
+    <ul>
+      <li>Always hidden behind the <code>ObjStore</code> interface; upper layers swap backends transparently</li>
+      <li>Production: S3/OSS; development/tests: local FS backend (<code>ENGRAM_OBJ</code>)</li>
+      <li>Requires read-after-write strong consistency from the bucket (S3 satisfies this since 2020)</li>
+      <li>Embedding store is independent of the git object store; GC does not scan the former</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="num">Git Layer</div>
+    <h3>go-git + custom Storer</h3>
+    <ul>
+      <li>go-git's <code>Storer</code> interface is backed by an <code>ObjStore</code> implementation</li>
+      <li>Services <strong>never shell out</strong> to the <code>git</code> binary — shelling out is unreliable and hard to test in a service</li>
+      <li>Working-tree materialization uses <code>osfs</code>; tests can swap in <code>memfs</code>, no disk required</li>
+      <li>Future path: fully in-memory billy <code>Filesystem</code>, making workers disk-free (§10.1, not yet implemented)</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Core Interface Summary (<code>architecture.md §11</code>)</h3>
+
+<pre><code>type MemStore interface {
+    // ResolveHead reads the agent's current HEAD (cheap ref read, no object-storage access)
+    ResolveHead(ctx context.Context, agentID string) (CommitHash, error)
+
+    // Materialize checks out the tree at `at` into dir (a disposable working copy)
+    Materialize(ctx context.Context, agentID string, at CommitHash, dir string) error
+
+    // CommitWithCAS writes objects, builds a commit, atomically advances HEAD and
+    // enqueues jobs in the same DB tx. Returns ErrCASConflict if HEAD has moved.
+    CommitWithCAS(ctx context.Context, agentID string, parent CommitHash,
+        dir string, jobs []Job) (CommitHash, error)
+}
+
+type SystemCache interface {
+    Get(ctx context.Context, agentID string, sha CommitHash) (*Resident, error)
+}
+
+type Search interface {
+    Recall(ctx context.Context, agentID, query string, k int) ([]Hit, error)
+    Reindex(ctx context.Context, agentID string, from, to CommitHash) error
+}</code></pre>
+
+<h3>Repository Layout</h3>
+
+<pre><code>cmd/
+  api/            # request-path service: router + agent-worker host
+  maintenance/    # background Go worker (reconcile loop)
+internal/
+  memstore/       # MemStore authoritative store (ObjStore + refs + gitfs)
+    objstore/     # content-addressed object backend (S3 | local FS)
+    refs/         # Postgres refs + CAS + job queue
+    gitfs/        # go-git Storer over objstore; materialize working trees
+  cache/          # SHA-keyed memory cache (system/ + tree index)
+  search/         # trigram index + embeddings: build + query
+  agent/          # agent loop: assemble context, tools (recall/read/edit), commit
+  maintenance/    # reflection / defrag / gc / reaper job implementations
+docs/
+  architecture.md # authoritative design document (§1–§15)
+  architecture.html
+  reports/        # this series of deep-dive reports (01–06)</code></pre>
+
+</main>
+<footer>Engram deep dives · hand-built SVG/HTML, readable offline · based on the main branch (L1–L5d)</footer>
+</body></html>

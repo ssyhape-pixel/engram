@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · Deep Dives</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html" class="active">Index</a>
+  <a href="01-architecture-overview.html">Architecture</a>
+  <a href="02-request-path.html">Request Path</a>
+  <a href="03-storage-consistency.html">Storage</a>
+  <a href="04-search-index.html">Search</a>
+  <a href="05-maintenance-pipeline.html">Maintenance</a>
+  <a href="06-build-journey.html">Build Journey</a>
+  <a class="lang" href="../cn/index.html">中文</a>
+</nav>
+<main>
+  <h1>Engram, in depth</h1>
+  <p class="lead">How a "cloud-side memory system for AI agents" grows from nothing — from immutable blocks of storage all the way to the worker that quietly tidies the memory in the background.</p>
+  <p class="meta">Based on the <code>main</code> branch · all nine layers built and merged · six reports + this index</p>
+
+  <p>Picture every AI agent owning a notebook that's all its own. It can flip back to a few resident pages of essentials, fetch long-tail details only when it needs them, and <strong>durably write new things back</strong> so it still remembers next time it wakes up. Engram is the system that gives thousands of agents that notebook, on the server side.</p>
+
+  <p>Its approach is deliberately simple: <strong>every block you write is immutable</strong> (to change something, you write a new block), and the one pointer that does change — "which page is current" — lives in a database, guarded by a small "check-before-you-change" lock. Everything else — caches, the search index, working copies — is <strong>disposable and rebuildable at any time</strong>. That's how the system stays stateless and horizontally scalable while still being strongly consistent.</p>
+
+  <blockquote>The soul of it in one line: <strong>memory is something the agent "goes and fetches", not something dumped on the model.</strong> Before it starts reasoning, it loads only the resident essentials and a thin index of what exists; the real details, the model decides for itself whether to go pull.</blockquote>
+
+  <figure class="figure">
+    <svg viewBox="0 0 680 452" font-family="ui-sans-serif, -apple-system, system-ui, sans-serif" aria-label="Engram at a glance">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#bf5e3c"/>
+        </marker>
+        <marker id="ahg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#b6ada0"/>
+        </marker>
+      </defs>
+
+      <text x="28" y="34" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">1 · request path</text>
+      <rect x="20" y="42" width="404" height="92" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <rect x="34" y="66" width="78" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="73" y="93" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">client</text>
+      <rect x="150" y="66" width="124" height="44" rx="10" fill="#f4e6dd" stroke="#e7c9ba"/>
+      <text x="212" y="86" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">Router · Session</text>
+      <text x="212" y="101" text-anchor="middle" font-size="10.5" fill="#7c766c">one writer · runs the loop</text>
+      <rect x="332" y="66" width="78" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="371" y="93" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">LLM</text>
+      <line x1="112" y1="88" x2="148" y2="88" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#ah)"/>
+      <line x1="274" y1="88" x2="330" y2="88" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#ah)"/>
+
+      <text x="448" y="34" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">2 · read accelerators</text>
+      <rect x="440" y="42" width="220" height="92" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <rect x="454" y="66" width="92" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="500" y="86" text-anchor="middle" font-size="12.5" font-weight="600" fill="#201e18">read cache</text>
+      <text x="500" y="101" text-anchor="middle" font-size="10.5" fill="#7c766c">by content hash</text>
+      <rect x="554" y="66" width="92" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="600" y="86" text-anchor="middle" font-size="12.5" font-weight="600" fill="#201e18">search</text>
+      <text x="600" y="101" text-anchor="middle" font-size="10.5" fill="#7c766c">local index</text>
+      <line x1="424" y1="100" x2="438" y2="100" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+
+      <text x="28" y="178" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">3 · canonical store</text>
+      <rect x="20" y="186" width="640" height="86" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <rect x="38" y="210" width="290" height="48" rx="10" fill="#f4e6dd" stroke="#e7c9ba"/>
+      <text x="183" y="231" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">object store</text>
+      <text x="183" y="247" text-anchor="middle" font-size="10.5" fill="#7c766c">content-addressed · immutable · dedup/GC</text>
+      <rect x="352" y="210" width="290" height="48" rx="10" fill="#f4e6dd" stroke="#e7c9ba"/>
+      <text x="497" y="231" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">Postgres</text>
+      <text x="497" y="247" text-anchor="middle" font-size="10.5" fill="#7c766c">the one mutable pointer HEAD via CAS + job queue</text>
+
+      <text x="28" y="316" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">4 · maintenance worker · each round</text>
+      <rect x="20" y="324" width="640" height="104" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <g font-size="12.5" font-weight="600" fill="#201e18">
+        <rect x="40" y="360" width="120" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="100" y="385" text-anchor="middle">GC</text>
+        <rect x="192" y="360" width="120" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="252" y="385" text-anchor="middle">reap stuck jobs</text>
+        <rect x="344" y="360" width="120" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="404" y="385" text-anchor="middle">defrag scan</text>
+        <rect x="496" y="360" width="144" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="568" y="385" text-anchor="middle">drain job queue</text>
+      </g>
+      <line x1="160" y1="380" x2="190" y2="380" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+      <line x1="312" y1="380" x2="342" y2="380" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+      <line x1="464" y1="380" x2="494" y2="380" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+
+      <line x1="200" y1="134" x2="200" y2="208" stroke="#bf5e3c" stroke-width="1.7" marker-end="url(#ah)"/>
+      <text x="208" y="174" font-size="11" fill="#9d4a2d">write objects first, then CAS the HEAD (one tx)</text>
+      <line x1="540" y1="272" x2="540" y2="322" stroke="#bf5e3c" stroke-width="1.7" marker-end="url(#ah)"/>
+      <text x="548" y="300" font-size="11" fill="#9d4a2d">enqueue only if the commit committed</text>
+      <path d="M 360 358 C 320 320, 300 300, 240 262" fill="none" stroke="#b6ada0" stroke-width="1.5" marker-end="url(#ahg)"/>
+      <text x="250" y="318" font-size="11" fill="#7c766c">tidied results written back (still new objects + CAS)</text>
+    </svg>
+    <figcaption>Four zones, each with one job: the request path runs the agent in the foreground; the canonical store is the single source of truth; the read accelerators and the maintenance worker are both derived from it and can be rebuilt at any time.</figcaption>
+  </figure>
+
+  <h2>The six reports</h2>
+  <div class="cardgrid">
+    <div class="card">
+      <div class="num">Report 1</div>
+      <h3><a href="01-architecture-overview.html">Architecture overview</a></h3>
+      <p>The four zones, the three rules that run through everything, the full path from one request to one commit, and why the heavy middleware is left out. Read this first for the big picture.</p>
+    </div>
+    <div class="card">
+      <div class="num">Report 2</div>
+      <h3><a href="02-request-path.html">Request path</a></h3>
+      <p>One writer per agent: the in-process lock, the cross-machine backstop, how the model "goes and fetches" memory, and what happens when two commits collide.</p>
+    </div>
+    <div class="card">
+      <div class="num">Report 3</div>
+      <h3><a href="03-storage-consistency.html">Storage &amp; consistency</a></h3>
+      <p>The heart of the system: why every block is stored by its fingerprint, how the one mutable pointer is guarded, "a commit is one database transaction", and how garbage is safely reclaimed.</p>
+    </div>
+    <div class="card">
+      <div class="num">Report 4</div>
+      <h3><a href="04-search-index.html">Search &amp; index</a></h3>
+      <p>How keyword and semantic search are fused, how the expensive vectors are computed once and reused, and how the background quietly keeps them ready.</p>
+    </div>
+    <div class="card">
+      <div class="num">Report 5</div>
+      <h3><a href="05-maintenance-pipeline.html">Maintenance pipeline</a></h3>
+      <p>What the background worker does each round: grabbing jobs without clashing, reflecting and consolidating, splitting big files, recovering stranded work — and how they reuse one mechanism.</p>
+    </div>
+    <div class="card">
+      <div class="num">Report 6</div>
+      <h3><a href="06-build-journey.html">Build journey</a></h3>
+      <p>How it was built layer by layer — each layer goes through brainstorm → design → plan → implement → two-stage review → merge — and the real bugs the review chain actually caught.</p>
+    </div>
+  </div>
+
+  <h2>The nine-layer map</h2>
+  <table>
+    <thead><tr><th>Layer</th><th>Adds</th><th>Guarantee</th><th>Deep dive</th></tr></thead>
+    <tbody>
+      <tr><td><strong>L1</strong></td><td>Storage core: content-addressed objects + DB-guarded pointer</td><td>immutable content · one place arbitrates concurrency · objects-first-then-ref</td><td>Report 3</td></tr>
+      <tr><td><strong>L2</strong></td><td>Agent loop + multi-turn session</td><td>one writer per agent · model fetches memory itself</td><td>Report 2</td></tr>
+      <tr><td><strong>L3</strong></td><td>Content-hash read cache</td><td>a hit always equals recompute; never reads a stale value</td><td>Report 4</td></tr>
+      <tr><td><strong>L4</strong></td><td>Keyword + semantic hybrid search</td><td>two modes fused; still works if one is down</td><td>Report 4</td></tr>
+      <tr><td><strong>L4b</strong></td><td>Vector persistence + incremental reindex</td><td>expensive vectors computed once, shared across sessions</td><td>Report 4</td></tr>
+      <tr><td><strong>L5a</strong></td><td>Background garbage collection</td><td>deletes only objects that are both unreferenced and old enough</td><td>Report 3 / 5</td></tr>
+      <tr><td><strong>L5b</strong></td><td>Job-queue consumer + reflection</td><td>many workers grab jobs cleanly · no self-trigger loop</td><td>Report 5</td></tr>
+      <tr><td><strong>L5c</strong></td><td>Deterministic file splitting</td><td>splits by heading, and provably never grows the count</td><td>Report 5</td></tr>
+      <tr><td><strong>L5d</strong></td><td>Recovering stranded jobs</td><td>work left mid-flight by a crashed worker gets picked back up</td><td>Report 5</td></tr>
+    </tbody>
+  </table>
+
+  <h2>How to read this</h2>
+  <ul>
+    <li><strong>First time, want the big picture</strong> → Report 1 (architecture) + Report 6 (build journey); half an hour for the whole framework.</li>
+    <li><strong>Working on the foreground / request handling</strong> → Report 2 (request path), dipping into Report 3's commit mechanics as needed.</li>
+    <li><strong>Care about consistency, storage, GC</strong> → Report 3 is the heart, worth reading line by line.</li>
+    <li><strong>Doing search / vectors</strong> → Report 4.</li>
+    <li><strong>Doing background / ops</strong> → Report 5 (queue, reflection, splitting, recovery, the per-round loop).</li>
+  </ul>
+
+  <div class="callout win">
+    <div class="tag">Status</div>
+    <p>The whole planned roadmap is done: 10 code modules, 2 runnable processes (one foreground, one background), nine layered merges. The full test suite passes (serialized) and the race detector is clean on the concurrent modules. The one piece deliberately deferred is vector-store eviction — vectors are derived, recomputable, and small, so there's no pressure yet.</p>
+  </div>
+</main>
+<footer>
+  Engram deep dives · six reports + this index · hand-built SVG / HTML figures, no external scripts, readable offline · based on the main branch (L1–L5d)
+</footer>
+</body>
+</html>

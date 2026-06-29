@@ -1,0 +1,814 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · Request path</title>
+<link rel="stylesheet" href="../style.css">
+</head><body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html">Index</a>
+  <a href="01-architecture-overview.html">Architecture</a>
+  <a href="02-request-path.html" class="active">Request Path</a>
+  <a href="03-storage-consistency.html">Storage</a>
+  <a href="04-search-index.html">Search</a>
+  <a href="05-maintenance-pipeline.html">Maintenance</a>
+  <a href="06-build-journey.html">Build Journey</a>
+  <a class="lang" href="../cn/02-request-path.html">中文</a>
+</nav>
+<main>
+
+<p class="meta">② Request Path · L1–L4 · based on the main branch</p>
+<h1>Request Path: Router · Session · Agent Loop · Tools</h1>
+<p class="lead">From a user message to a durable commit — a two-layer single-writer design, context assembly, tool-driven memory retrieval and writes, and the CAS commit protocol.</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §1  Overview
+     ═══════════════════════════════════════════════════ -->
+<h2 id="overview">1. Overview</h2>
+
+<p>
+Engram's <strong>request path</strong> (architecture zone ①) is the only part of the system that talks directly to an LLM provider.
+Its philosophy fits in one sentence: <em>compute is stateless; state lives in the memory repository</em>.
+</p>
+
+<p>
+Every conversation maps to a <strong>Session</strong>. A Session holds two transient things — chat history and a materialised working directory (workdir) — but neither constitutes persistent state.
+The real persistent state is the agent's memory repository: a git tree in content-addressed object storage, plus a HEAD ref in Postgres.
+When the Session ends the workdir is destroyed. The next time it opens it is re-materialised from HEAD — no state leaks.
+</p>
+
+<p>The diagram below shows the relationships and data-flow between components in the request path:</p>
+
+<div class="figure">
+<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <!-- cmd/api -->
+  <rect x="20" y="130" width="100" height="52" rx="10" fill="#fcfbf7" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="70" y="152" text-anchor="middle" font-weight="600" fill="#201e18">cmd/api</text>
+  <text x="70" y="168" text-anchor="middle" fill="#7c766c" font-size="11">stdin harness</text>
+
+  <!-- Router -->
+  <rect x="158" y="108" width="116" height="74" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="216" y="132" text-anchor="middle" font-weight="700" fill="#9d4a2d">Router</text>
+  <text x="216" y="148" text-anchor="middle" fill="#7c766c" font-size="11">claim / free</text>
+  <text x="216" y="163" text-anchor="middle" fill="#7c766c" font-size="11">sync.Mutex + active map</text>
+
+  <!-- Session -->
+  <rect x="318" y="88" width="120" height="96" rx="10" fill="#fcfbf7" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="378" y="112" text-anchor="middle" font-weight="700" fill="#201e18">Session</text>
+  <text x="378" y="128" text-anchor="middle" fill="#7c766c" font-size="11">history · dirty</text>
+  <text x="378" y="144" text-anchor="middle" fill="#7c766c" font-size="11">head · workdir</text>
+  <text x="378" y="160" text-anchor="middle" fill="#7c766c" font-size="11">maxSteps=16</text>
+
+  <!-- Toolset -->
+  <rect x="318" y="210" width="120" height="52" rx="10" fill="#fcfbf7" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="378" y="232" text-anchor="middle" font-weight="600" fill="#201e18">Toolset</text>
+  <text x="378" y="248" text-anchor="middle" fill="#7c766c" font-size="11">list / read / recall / edit</text>
+
+  <!-- LLMProvider -->
+  <rect x="478" y="108" width="108" height="52" rx="10" fill="#fcfbf7" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="532" y="130" text-anchor="middle" font-weight="600" fill="#201e18">LLMProvider</text>
+  <text x="532" y="146" text-anchor="middle" fill="#7c766c" font-size="11">Generate(req)</text>
+
+  <!-- Fake / Anthropic -->
+  <rect x="478" y="178" width="108" height="40" rx="8" fill="#fcfbf7" stroke="#e9e3d6" stroke-width="1" stroke-dasharray="5,3"/>
+  <text x="532" y="195" text-anchor="middle" fill="#7c766c" font-size="11">FakeProvider</text>
+  <text x="532" y="210" text-anchor="middle" fill="#7c766c" font-size="11">AnthropicProvider</text>
+
+  <!-- MemStore -->
+  <rect x="478" y="240" width="108" height="52" rx="10" fill="#fcfbf7" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="532" y="262" text-anchor="middle" font-weight="600" fill="#201e18">MemStore</text>
+  <text x="532" y="278" text-anchor="middle" fill="#7c766c" font-size="11">CommitWithCAS</text>
+
+  <!-- workdir -->
+  <rect x="318" y="278" width="120" height="36" rx="8" fill="#eef2e6" stroke="#c7d8b0" stroke-width="1"/>
+  <text x="378" y="300" text-anchor="middle" fill="#5f7a4e" font-size="11.5" font-weight="600">workdir (materialised tree)</text>
+
+  <!-- arrows -->
+  <!-- cmd/api -> Router -->
+  <line x1="120" y1="156" x2="156" y2="145" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="138" y="143" text-anchor="middle" fill="#7c766c" font-size="10">Open/Send/Close</text>
+
+  <!-- Router -> Session -->
+  <line x1="274" y1="136" x2="316" y2="136" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="295" y="128" text-anchor="middle" fill="#7c766c" font-size="10">claim+</text>
+  <text x="295" y="140" text-anchor="middle" fill="#7c766c" font-size="10">Materialize</text>
+
+  <!-- Session -> LLMProvider -->
+  <line x1="438" y1="128" x2="476" y2="128" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="457" y="120" text-anchor="middle" fill="#7c766c" font-size="10">Generate</text>
+
+  <!-- Session -> Toolset -->
+  <line x1="378" y1="184" x2="378" y2="208" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="394" y="200" fill="#7c766c" font-size="10">Dispatch</text>
+
+  <!-- Toolset -> workdir -->
+  <line x1="378" y1="262" x2="378" y2="276" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+  <!-- Session -> MemStore -->
+  <path d="M438 164 Q462 164 462 264 L476 264" fill="none" stroke="#bf5e3c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>
+  <text x="464" y="222" fill="#7c766c" font-size="10" text-anchor="middle">dirty→commit</text>
+
+  <!-- LLMProvider -> Fake/Anthropic -->
+  <line x1="532" y1="160" x2="532" y2="176" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4,3"/>
+
+  <defs>
+    <marker id="arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="arr2" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#5f7a4e"/>
+    </marker>
+  </defs>
+</svg>
+<p class="figcap">Figure 1: Request path component diagram. Solid arrows are control flow; dashed lines are conditional paths (dirty commit / provider implementation selection).</p>
+</div>
+
+<div class="callout invariant">
+  <span class="tag">Core invariant</span>
+  <strong>At most one active Session per agentID at any time.</strong>
+  The Router uses <code>sync.Mutex + active map[string]bool</code> to quickly block same-process concurrency;
+  the Postgres ref CAS (<code>ErrCASConflict</code>) is the final cross-pod backstop.
+  No lossy automatic Markdown merge is ever performed.
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+     §2  Single-writer: why + two-layer protection
+     ═══════════════════════════════════════════════════ -->
+<h2 id="single-writer">2. Single-writer: why + two-layer protection</h2>
+
+<h3>Why must writes be serialised?</h3>
+
+<p>
+Memory files are structured prose Markdown, not database rows.
+When two writers concurrently modify the same file, any automatic three-way merge (git-merge style) produces <strong>semantic errors</strong> — context is severed, facts are scrambled, and contradictory sentences can be conjured from thin air. This kind of corruption is silent and hard to trace back.
+</p>
+
+<p>
+Engram's answer is: <strong>abandon multi-writer entirely and use single-writer serialisation</strong>.
+The cost is reduced concurrency (only one Session per agent at a time), but memory correctness is guaranteed absolutely.
+The two protection layers each guard a different failure surface:
+</p>
+
+<div class="cmp">
+  <div class="col good">
+    <h4>In-process lock — fast path</h4>
+    <p><strong>Guards against:</strong> concurrent requests within the same pod (multiple threads / goroutines on the same machine).</p>
+    <p><strong>Implementation:</strong> <code>sync.Mutex + active map[string]bool</code> (<span class="fileref">router.go:32-33</span>). Non-blocking admission: if already occupied, immediately returns <code>ErrAgentBusy</code> without queuing.</p>
+    <p><strong>Value:</strong> kills the conflict before the expensive object writes and Postgres transaction, adding zero extra latency.</p>
+  </div>
+  <div class="col good">
+    <h4>Database CAS — cross-machine backstop</h4>
+    <p><strong>Guards against:</strong> sticky routing failures in multi-pod deployments, or out-of-process tools writing directly to Postgres.</p>
+    <p><strong>Implementation:</strong> <code>refs.CommitRef</code> performs an atomic <code>WHERE head=$parent</code> update in a single Postgres transaction; if the parent hash doesn't match it returns <code>ErrCASConflict</code> (<span class="fileref">memstore/memstore.go:65</span>).</p>
+    <p><strong>Value:</strong> even if the process lock is bypassed, the database layer ensures the ref can never be silently overwritten. See <a href="03-storage-consistency.html">③ Storage &amp; Consistency</a> for details.</p>
+  </div>
+</div>
+
+<h3>2.1 Process lock: claim / free</h3>
+
+<p>
+The <code>Router</code> struct (<span class="fileref">internal/agent/router.go:24-34</span>):
+</p>
+
+<pre><code>type Router struct {
+    store    memstore.MemStore
+    prov     LLMProvider
+    scratch  string
+    cache    cache.Cache   // sysCache — L3 system/ read cache
+    embCache cache.Cache   // embCache — L4 vector embedding cache (must be separate)
+    emb      search.Embedder
+
+    mu     sync.Mutex
+    active map[string]bool
+}</code></pre>
+
+<p>
+Both <code>claim</code> and <code>free</code> operate under <code>mu</code> (<span class="fileref">router.go:45-60</span>):
+</p>
+
+<pre><code>func (r *Router) claim(agentID string) bool {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    if r.active[agentID] {
+        return false          // already occupied — reject immediately
+    }
+    r.active[agentID] = true
+    return true
+}
+
+func (r *Router) free(agentID string) {
+    r.mu.Lock()
+    delete(r.active, agentID)
+    r.mu.Unlock()
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">Design choice</span>
+  The lock semantics are <strong>admission</strong>, not <strong>queuing</strong>.
+  <code>ErrAgentBusy</code> means "not now" — the caller decides the retry strategy (return 429 immediately, sleep briefly and retry, or enqueue at a higher layer).
+  The Router itself holds no queuing state, perfectly consistent with the "stateless worker" philosophy.
+</div>
+
+<h3>2.2 sync.Once prevents double-free</h3>
+
+<p>
+<code>Open</code> wraps <code>release</code> in a <code>sync.Once</code> before handing it to the Session (<span class="fileref">router.go:125-131</span>):
+</p>
+
+<pre><code>var once sync.Once
+release := func() {
+    once.Do(func() {
+        os.RemoveAll(workdir)
+        r.free(agentID)
+    })
+}</code></pre>
+
+<p>
+Scenario: the caller executes both <code>defer sess.Close()</code> and an explicit <code>sess.Close()</code>, or both the error path and the happy path trigger a close.
+Without <code>sync.Once</code>, a second <code>free</code> call would delete the active map entry — which might already have been set again by <em>a new Session</em>, causing that Session to be incorrectly "freed."
+<code>sync.Once</code> guarantees <code>RemoveAll + free</code> execute exactly once as an atomic unit, no matter how many times Close is called.
+</p>
+
+<h3>2.3 What each layer guards — side-by-side</h3>
+
+<table>
+  <thead><tr><th>Dimension</th><th>In-process lock (sync.Mutex)</th><th>Database CAS (Postgres)</th></tr></thead>
+  <tbody>
+    <tr><td>Scope</td><td>All goroutines within a single pod</td><td>All pods, all out-of-process writers</td></tr>
+    <tr><td>Trigger point</td><td>Open() entry, before materialisation</td><td>At commit time, after objects are written</td></tr>
+    <tr><td>Conflict signal</td><td><code>ErrAgentBusy</code>, immediate failure</td><td><code>ErrCASConflict</code>, commit failure</td></tr>
+    <tr><td>Side effects</td><td>None (nothing was written)</td><td>Only garbage objects (cleaned up by GC)</td></tr>
+    <tr><td>Cross-pod capability</td><td>No (lock doesn't cross processes)</td><td>Yes (Postgres is the global coordination point)</td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════
+     §3  Session lifecycle
+     ═══════════════════════════════════════════════════ -->
+<h2 id="session-lifecycle">3. The lifecycle of a Session</h2>
+
+<p>
+A Session is the complete lifecycle container for a single conversation (<span class="fileref">internal/agent/session.go:22-34</span>):
+</p>
+
+<pre><code>type Session struct {
+    agentID  string
+    store    memstore.MemStore
+    prov     LLMProvider
+    tools    *Toolset
+    head     memstore.CommitHash  // currently committed HEAD (advances on each commit)
+    workdir  string               // materialised temporary working directory
+    history  []Message            // this Session's chat history (in-memory only)
+    dirty    bool                 // whether this turn had a successful edit
+    maxSteps int                  // guards against runaway loops, default 16
+    release  func()               // called on Close: RemoveAll + free
+    cache    cache.Cache          // L3 SHA-keyed cache; nil means recompute each turn
+}</code></pre>
+
+<p>
+<code>history</code> lives only for the duration of the Session.
+<code>dirty</code> is the write marker for the current <em>turn</em> (a Send call); it is cleared after a successful commit.
+<code>head</code> advances after each successful commit and always corresponds to a real commit in object storage.
+</p>
+
+<h3>3.1 Open: full sequence of steps</h3>
+
+<ol class="steps">
+  <li>
+    <span class="st">claim(agentID)</span>
+    <span class="sd">Checks the active map under mu; returns <code>ErrAgentBusy</code> immediately if already occupied.</span>
+  </li>
+  <li>
+    <span class="st">ResolveHead(agentID)</span>
+    <span class="sd">Reads the current HEAD commit hash from Postgres (<span class="fileref">router.go:96</span>). On failure: free immediately and return the error.</span>
+  </li>
+  <li>
+    <span class="st">MkdirTemp</span>
+    <span class="sd">Creates a temporary working directory under the scratch directory. Any <code>/</code> in the agentID is replaced with <code>_</code> to be compatible with the <code>MkdirTemp</code> pattern (<span class="fileref">router.go:104-106</span>).</span>
+  </li>
+  <li>
+    <span class="st">Materialize(HEAD, workdir)</span>
+    <span class="sd">Calls <code>gitfs.Materialize</code> to write the git tree referenced by the HEAD commit into the working directory (<span class="fileref">router.go:111</span>).</span>
+  </li>
+  <li>
+    <span class="st">readWorkdirFiles + NewHybrid</span>
+    <span class="sd">Reads all workdir files into a <code>map[string][]byte</code> and constructs a <code>search.HybridSearch</code> snapshot (<span class="fileref">router.go:116-122</span>).</span>
+  </li>
+  <li>
+    <span class="st">sync.Once release closure + NewSession</span>
+    <span class="sd">Assembles the release function (wrapped in Once) and returns the <code>*Session</code> (<span class="fileref">router.go:125-132</span>).</span>
+  </li>
+</ol>
+
+<h3>3.2 Send: full timing of one turn</h3>
+
+<p>
+<code>Send</code> (<span class="fileref">session.go:73-117</span>) is the core loop of the request path. It records <code>base := len(s.history)</code> on entry and rolls back to base on failure, ensuring history never holds dangling entries.
+</p>
+
+<ol class="steps">
+  <li>
+    <span class="st">history += user message</span>
+    <span class="sd">Appends <code>Message{Role: RoleUser, Text: userMessage}</code>.</span>
+  </li>
+  <li>
+    <span class="st">assembleSystem(ctx)</span>
+    <span class="sd">Builds the system prompt: resident system/ content + tree index. May hit the L3 cache (see §4).</span>
+  </li>
+  <li>
+    <span class="st">Generate(System, history, Tools)</span>
+    <span class="sd">Calls LLMProvider. Returns <code>ToolCalls</code> (turn not finished) or a final <code>Text</code>.</span>
+  </li>
+  <li>
+    <span class="st">Dispatch each ToolCall</span>
+    <span class="sd">Toolset.Dispatch routes to list / read / recall / edit. A successful edit sets <code>s.dirty = true</code> (<span class="fileref">session.go:98-99</span>).</span>
+  </li>
+  <li>
+    <span class="st">history += assistant-toolcalls + tool-results</span>
+    <span class="sd">Appends two messages, then loops back to step 2. At most maxSteps=16 iterations.</span>
+  </li>
+  <li>
+    <span class="st">Model returns final text, exits loop</span>
+    <span class="sd">When <code>len(resp.ToolCalls) == 0</code>, break; history += assistant text.</span>
+  </li>
+  <li>
+    <span class="st">commit (only when dirty=true)</span>
+    <span class="sd">Calls <code>store.CommitWithCAS</code>: writes objects first, then advances the ref (see §7). On success: <code>head = newHead, dirty = false</code>.</span>
+  </li>
+</ol>
+
+<p>
+<strong>Failure rollback:</strong> if steps 2/3 error, or the loop exhausts maxSteps, execute <code>s.history = s.history[:base]</code>.
+If the commit step (step 7) fails, history is <em>not</em> rolled back and dirty stays true — the next Send call can re-attempt the commit.
+</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §4  Context assembly
+     ═══════════════════════════════════════════════════ -->
+<h2 id="context-assembly">4. Context assembly</h2>
+
+<p>
+Before each Generate call, <code>assembleSystem</code> constructs the complete system prompt string. It is made up of two concatenated parts:
+</p>
+
+<table>
+  <thead><tr><th>Part</th><th>Source</th><th>Cache key (L3)</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Resident system/ content</td>
+      <td>All files under the <code>system/</code> directory in workdir</td>
+      <td><code>sys:&lt;systemSubtree-SHA&gt;</code></td>
+      <td>Core memory the model sees every turn (persona, rules, key facts)</td>
+    </tr>
+    <tr>
+      <td>Tree index</td>
+      <td>walkDir over the full tree, reading each file's frontmatter <code>description:</code></td>
+      <td><code>idx:&lt;rootTree-SHA&gt;</code></td>
+      <td>"path: description" index — lets the model know long-tail files exist so it can recall them on demand</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>4.1 Cache branch vs. direct recompute</h3>
+
+<p>Full logic (<span class="fileref">session.go:141-170</span>):</p>
+
+<pre><code>func (s *Session) assembleSystem(ctx context.Context) (string, error) {
+    if s.cache == nil || s.dirty {
+        return s.buildResident()  // no cache or uncommitted edits: recompute from workdir
+    }
+    rootTree, systemSubtree, err := s.store.TreeKeys(ctx, s.head)
+    if err != nil {
+        return s.buildResident() // TreeKeys read failure is non-fatal; degrade to recompute, don't abort session
+    }
+    sysKey := "sys:" + string(systemSubtree)
+    sys, ok := s.cache.Get(sysKey)
+    if !ok {
+        built, berr := s.buildSystemContent()
+        if berr != nil { return "", berr }
+        sys = built
+        s.cache.Put(sysKey, sys)
+    }
+    idxKey := "idx:" + string(rootTree)
+    idx, ok := s.cache.Get(idxKey)
+    if !ok {
+        built, berr := s.buildTreeIndex()
+        if berr != nil { return "", berr }
+        idx = built
+        s.cache.Put(idxKey, idx)
+    }
+    return sys + idx, nil
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">Cache correctness</span>
+  Cache keys are <strong>immutable git tree hashes</strong>, read directly from object storage by <code>TreeKeys</code> — not routed through Postgres.
+  As long as HEAD hasn't advanced, the <code>system/</code> subtree content is unchanged, and <code>sys:SHA</code> remains valid forever.
+  When <code>dirty=true</code> (workdir has uncommitted edits), the cache is bypassed entirely and recomputed directly from workdir — ensuring the model sees the latest edits rather than a stale cached version.
+  A <code>TreeKeys</code> read failure also silently degrades to recompute, never aborting the session.
+  The underlying L3 cache implementation is described in <a href="04-search-index.html">④ Search &amp; Index</a>.
+</div>
+
+<h3>4.2 buildSystemContent — resident content</h3>
+
+<p>
+(<span class="fileref">session.go:187-213</span>)
+Walks <code>workdir/system/</code>; each file is appended to the builder in <code>## path\ncontent\n</code> format.
+If the <code>system/</code> directory does not exist, <code>WalkDir</code> triggers <code>fs.ErrNotExist</code>, which is converted to <code>fs.SkipAll</code> (silent — returns an empty string).
+<em>Real</em> I/O errors (permission issues, disk failure) are propagated in full — preventing partial content from being cached.
+</p>
+
+<h3>4.3 buildTreeIndex — the cheap directory</h3>
+
+<p>
+(<span class="fileref">session.go:217-238</span>)
+Walks the full workdir tree; for each file it calls <code>frontmatterDescription(path)</code> (<span class="fileref">tools.go:172-192</span>) — a <code>bufio.Scanner</code> that scans line by line, finds the YAML frontmatter <code>---</code> delimiters, and extracts the <code>description:</code> field value.
+This is <strong>read-only frontmatter</strong>: the file body is never read, so token overhead is minimal.
+All lines are sorted then concatenated in <code>path: description</code> format.
+</p>
+
+<div class="callout win">
+  <span class="tag">Design highlight</span>
+  <strong>Memory is agentic, not RAG.</strong>
+  The tree index gives the model only "clues" (path + description) rather than stuffing the full long-tail content into context.
+  The model reasons over the index during inference to decide which files are relevant, then fetches them precisely via the <code>recall</code> / <code>read</code> tools — saving tokens while keeping information semantically accurate.
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+     §5  Tools: recall / read / edit
+     ═══════════════════════════════════════════════════ -->
+<h2 id="tools">5. Tools: how the model "goes and looks things up"</h2>
+
+<p>
+<code>Toolset</code> (<span class="fileref">internal/agent/tools.go:18-25</span>) is bound to a single Session's workdir and is itself stateless.
+All tools are routed through <code>Dispatch(ctx, ToolCall) ToolResult</code>.
+The Session tracks <code>dirty</code>; the Toolset holds no write marker of its own.
+</p>
+
+<h3>5.1 Tool definitions (the schema sent to the model)</h3>
+
+<p>(<span class="fileref">tools.go:30-35</span>) Four tools:</p>
+
+<pre><code>// list — list memory files (includes descriptions, i.e. the tree index)
+{Name: "list",
+ Description: "List memory files with their descriptions (the tree index).",
+ InputSchema: {"type":"object","properties":{}}}
+
+// read — read a file, with an optional 1-based line range
+{Name: "read",
+ Description: "Read a memory file, optionally a 1-based inclusive line range.",
+ InputSchema: {"type":"object",
+   "properties": {"path":{"type":"string"},
+                  "start":{"type":"integer"},   // 1-based, inclusive
+                  "end":  {"type":"integer"}},  // 1-based, inclusive
+   "required": ["path"]}}
+
+// recall — search memory, returns matching line ranges
+{Name: "recall",
+ Description: "Search memory for a query; returns matching line ranges.",
+ InputSchema: {"type":"object",
+   "properties": {"query":{"type":"string"}},
+   "required": ["query"]}}
+
+// edit — write to a memory file (create or overwrite)
+{Name: "edit",
+ Description: "Write content to a memory file (creates or overwrites).",
+ InputSchema: {"type":"object",
+   "properties": {"path":{"type":"string"}, "content":{"type":"string"}},
+   "required": ["path","content"]}}</code></pre>
+
+<h3>5.2 recall — search the long tail, return line ranges</h3>
+
+<p>
+(<span class="fileref">tools.go:140-153</span>)
+<code>doRecall</code> calls <code>t.search.Recall(ctx, t.agentID, query, 8)</code>, returning up to 8 <code>Hit{Path, LineStart, LineEnd, Snippet}</code> values serialised as <code>path:start-end: snippet</code> format back to the model:
+</p>
+
+<pre><code>for _, h := range hits {
+    fmt.Fprintf(&amp;b, "%s:%d-%d: %s\n", h.Path, h.LineStart, h.LineEnd, h.Snippet)
+}</code></pre>
+
+<p>
+L2's backend is GrepSearch (substring scan over workdir); L4 replaces it with HybridSearch (trigram + vector hybrid).
+The <code>Search</code> interface is unchanged; the tool code is unaware of the swap. See <a href="04-search-index.html">④ Search &amp; Index</a> for details.
+</p>
+
+<h3>5.3 read — fetch by line range</h3>
+
+<p>(<span class="fileref">tools.go:110-138</span>)</p>
+
+<pre><code>start, end := intInput(in, "start"), intInput(in, "end")
+if start &lt;= 0 &amp;&amp; end &lt;= 0 {
+    return okResult(callID, string(data))   // no range: return full content
+}
+// after clamping boundaries:
+return okResult(callID, strings.Join(all[start-1:end], "\n"))</code></pre>
+
+<div class="callout gotcha">
+  <span class="tag">Note: 1-based line numbers</span>
+  The <code>start</code>/<code>end</code> parameters of <code>read</code> are a <strong>1-based closed interval</strong>, perfectly aligned with the <code>LineStart</code>/<code>LineEnd</code> values returned by <code>recall</code>.
+  When the model receives <code>notes.md:5-12</code> from recall, it can pass <code>start=5, end=12</code> directly to read and get back exactly those lines — zero conversion needed.
+  The internal implementation is <code>all[start-1 : end]</code> (Go slice, 0-based half-open interval).
+  A 0-based API would require the model to subtract one every time, making off-by-one errors very easy to introduce.
+  <code>start&lt;=0 &amp;&amp; end&lt;=0</code> explicitly means "no range restriction," which is unambiguous with 1-based (valid line numbers are &gt;= 1).
+</div>
+
+<h3>5.4 edit — write to workdir, set dirty</h3>
+
+<p>
+(<span class="fileref">tools.go:155-168</span>)
+<code>doEdit</code> first calls <code>safePath</code> (<span class="fileref">tools.go:47-54</span>) to run <code>filepath.Clean</code> and a prefix check, rejecting any <code>..</code> escape paths.
+Then <code>os.MkdirAll</code> creates the parent directories, and <code>os.WriteFile</code> overwrites (or creates) the file.
+Session's <code>Send</code> checks <code>call.Name == "edit" &amp;&amp; !res.IsError</code> after Dispatch returns and sets <code>s.dirty = true</code> (<span class="fileref">session.go:98-99</span>).
+</p>
+
+<!-- ═══════════════════════════════════════════════════
+     §6  LLMProvider abstraction
+     ═══════════════════════════════════════════════════ -->
+<h2 id="provider">6. The abstraction for talking to models</h2>
+
+<h3>6.1 Interface</h3>
+
+<p>(<span class="fileref">internal/agent/provider.go:62-64</span>)</p>
+
+<pre><code>type LLMProvider interface {
+    Generate(ctx context.Context, req Request) (Response, error)
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">Boundary value</span>
+  This interface is the <strong>sole boundary</strong> between the agent loop and any LLM provider.
+  Session never imports the Anthropic SDK or sends HTTP requests directly.
+  FakeProvider drives all automated tests through this same interface — zero network calls.
+  Swapping providers requires only implementing this interface; no Session or Toolset code changes.
+</div>
+
+<h3>6.2 Protocol types</h3>
+
+<table>
+  <thead><tr><th>Type</th><th>Key fields</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>Request</code></td><td>System, Messages, Tools</td><td>Complete input for a single Generate call</td></tr>
+    <tr><td><code>Response</code></td><td>Text, ToolCalls</td><td>Non-empty ToolCalls = turn not finished; otherwise Text = final reply</td></tr>
+    <tr><td><code>Message</code></td><td>Role, Text, ToolCalls, Results</td><td>Multi-role: user / assistant / tool</td></tr>
+    <tr><td><code>ToolDef</code></td><td>Name, Description, InputSchema</td><td>JSON Schema describing tool input</td></tr>
+    <tr><td><code>ToolCall</code></td><td>ID, Name, Input</td><td>A tool invocation issued by the model</td></tr>
+    <tr><td><code>ToolResult</code></td><td>CallID, Content, IsError</td><td>Execution result, fed back in the next turn</td></tr>
+  </tbody>
+</table>
+
+<h3>6.3 FakeProvider — scripted deterministic driver</h3>
+
+<p>(<span class="fileref">internal/agent/fake.go</span>)</p>
+
+<pre><code>type FakeProvider struct {
+    Steps []func(req Request) Response
+    calls int
+}
+func (f *FakeProvider) Generate(ctx context.Context, req Request) (Response, error) {
+    if f.calls >= len(f.Steps) {
+        return Response{}, fmt.Errorf("fake: no scripted response for call %d (have %d)", f.calls, len(f.Steps))
+    }
+    step := f.Steps[f.calls]
+    f.calls++
+    return step(req), nil
+}</code></pre>
+
+<p>
+Each Step receives the full <code>Request</code> (including the system prompt and history) and can make assertions within it — verifying that context assembly is correct.
+A typical test script: Step 0 returns a recall ToolCall, Step 1 returns an edit ToolCall, Step 2 returns the final text.
+When the call count exceeds the script length an error is returned, preventing a test with missing steps from silently passing.
+</p>
+
+<h3>6.4 AnthropicProvider — real API integration</h3>
+
+<p>(<span class="fileref">internal/agent/anthropic.go</span>)
+Maps the provider-agnostic protocol to the Anthropic Messages API (<code>POST /v1/messages</code>), default model <code>claude-sonnet-4-6</code>, <code>max_tokens=4096</code>, version header <code>anthropic-version: 2023-06-01</code>.
+The HTTP client is injectable (<span class="fileref">anthropic.go:33-36</span>) for substituting a mock RoundTripper in tests.
+</p>
+
+<p>Message format mapping (<span class="fileref">anthropic.go:88-121</span>):</p>
+
+<table>
+  <thead><tr><th>Internal Role</th><th>Anthropic representation</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>RoleUser</code></td>
+      <td>user + text block</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td><code>RoleAssistant</code> (with text)</td>
+      <td>assistant + text block + optional tool_use blocks</td>
+      <td>No text block added when text is empty</td>
+    </tr>
+    <tr>
+      <td><code>RoleAssistant</code> (tool calls only)</td>
+      <td>assistant + tool_use blocks</td>
+      <td>Entire message skipped when blocks are empty (<span class="fileref">anthropic.go:108-110</span>)</td>
+    </tr>
+    <tr>
+      <td><code>RoleTool</code></td>
+      <td>user + tool_result blocks</td>
+      <td>Anthropic requires tool results to be sent back as the user role</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout gotcha">
+  <span class="tag">Two key guards for the Anthropic API</span>
+  <p>
+  (1) The <code>input</code> field of a <code>tool_use</code> block must not be <code>null</code> — a nil map is replaced with an empty map (<span class="fileref">anthropic.go:103-105</span>).
+  </p>
+  <p>
+  (2) An assistant message must have at least one content block, otherwise the API returns 400 — an empty blocks slice causes a <code>continue</code> that skips the entire message (<span class="fileref">anthropic.go:108-110</span>).
+  </p>
+  <p>
+  The <code>system</code> and <code>tools</code> fields of <code>apiRequest</code> are tagged <code>omitempty</code>, so they are not serialised to JSON when empty, avoiding validation errors from the Anthropic API on empty fields.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+     §7  Commit and CAS conflict
+     ═══════════════════════════════════════════════════ -->
+<h2 id="commit-cas">7. Commit and conflict</h2>
+
+<h3>7.1 Two-phase write order: objects before ref</h3>
+
+<p>
+<code>CommitWithCAS</code> (<span class="fileref">memstore/memstore.go:60-68</span>) strictly follows "write objects first, then advance the ref":
+</p>
+
+<div class="flow">
+  <div class="node accent">
+    <span class="t">gitfs.Commit</span>
+    <span class="s">Write blob + tree + commit objects to ObjStore<br>Content-addressed, idempotent</span>
+  </div>
+  <div class="arrow lbl"><span class="al">on success</span></div>
+  <div class="node accent">
+    <span class="t">refs.CommitRef</span>
+    <span class="s">Single Postgres tx:<br>CAS HEAD parent→new<br>+ enqueue reindex + reflect</span>
+  </div>
+</div>
+
+<p>
+If objects write successfully but the Postgres tx fails (or the process crashes at that point), only unreachable garbage objects remain — GC (L5a) handles cleanup, no torn ref is produced.
+The reverse situation (ref advances before objects are flushed) is impossible under this write order.
+</p>
+
+<h3>7.2 Commit enqueues two maintenance jobs</h3>
+
+<pre><code>// session.go:121
+jobs := []memstore.Job{{Kind: "reindex"}, {Kind: "reflect"}}</code></pre>
+
+<p>
+Both jobs are enqueued in the <em>same</em> Postgres transaction as the ref CAS (see <a href="05-maintenance-pipeline.html">⑤ Maintenance Pipeline</a>).
+This guarantees "a job is enqueued if and only if the commit succeeds" — no Kafka needed, no outbox table: the Postgres transaction itself is the atomic unit.
+</p>
+
+<h3>7.3 ErrCASConflict — surface it, don't clobber</h3>
+
+<p>(<span class="fileref">session.go:123-128</span>)</p>
+
+<pre><code>if errors.Is(err, memstore.ErrCASConflict) {
+    // Impossible under single-writer-per-agent (Router lock). If it occurs,
+    // the invariant was violated; surface it rather than silently clobbering
+    // the other writer's tree (no lossy merge). Multi-writer reconciliation is L5.
+    return fmt.Errorf("agent: commit conflict — single-writer invariant violated for %s: %w",
+        s.agentID, err)
+}</code></pre>
+
+<div class="callout invariant">
+  <span class="tag">Design decision: no retry, no clobber</span>
+  <p>
+  Under correct Router single-writer protection, <code>ErrCASConflict</code> should never occur.
+  If it does, it means there was a side-channel write — an out-of-process tool modified Postgres directly, or sticky routing failed in a multi-pod setup.
+  </p>
+  <p>
+  An approach that was considered but rejected: <strong>bounded retry + clobber</strong> (re-materialise the new HEAD, replay this turn's edits, then commit).
+  The fundamental reason for rejection:
+  </p>
+  <ul>
+    <li>"Replaying edits" requires merging this turn's changes onto a file tree that <em>has already been modified by the other writer</em> — for prose Markdown this is a lossy operation that can introduce semantic errors.</li>
+    <li>Discarding the other writer's changes equally violates the "no lossy merge" principle.</li>
+    <li>Multi-writer coordination (reconcile + reflection) is L5's responsibility and should not be silently fixed at the Session layer.</li>
+  </ul>
+  <p>Current behaviour: surface the error transparently so the caller knows the invariant was violated, rather than silently "fixing" a problem that should not be fixed at this layer.</p>
+</div>
+
+<h3>7.4 Commit flow summary</h3>
+
+<table>
+  <thead><tr><th>Step</th><th>Location</th><th>Failure consequence</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>1. gitfs.Commit — write all objects to ObjStore</td>
+      <td><span class="fileref">memstore.go:61</span></td>
+      <td>Only garbage objects; ref unchanged; GC cleans up; Session dirty stays true</td>
+    </tr>
+    <tr>
+      <td>2. refs.CommitRef — CAS HEAD + enqueue jobs (single Postgres tx)</td>
+      <td><span class="fileref">memstore.go:65</span></td>
+      <td><code>ErrCASConflict</code> (single-writer violated) or generic DB error; surfaced to caller</td>
+    </tr>
+    <tr>
+      <td>3. Session updates head, dirty=false</td>
+      <td><span class="fileref">session.go:132-133</span></td>
+      <td>On commit failure dirty stays true; next Send can re-attempt the commit</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════
+     §8  cmd/api wiring
+     ═══════════════════════════════════════════════════ -->
+<h2 id="wiring">8. cmd/api wiring</h2>
+
+<p>
+<span class="fileref">cmd/api/main.go</span> is the interactive development harness that wires the entire request path together:
+</p>
+
+<pre><code>// storage layer
+store := memstore.New(objstore.NewLocal(objRoot), refs.New(pool))
+
+// provider selection
+switch providerName {
+case "anthropic":
+    prov = agent.NewAnthropic(key)
+default:
+    prov = &amp;agent.FakeProvider{Steps: []func(agent.Request) agent.Response{
+        func(r agent.Request) agent.Response {
+            return agent.Response{Text: "(fake) received your message"}
+        },
+    }}
+}
+
+// embedder selection
+switch env("ENGRAM_EMBEDDER", "fake") {
+case "voyage":
+    emb = search.NewVoyage(vkey)
+default:
+    emb = search.NewFakeEmbedder(256)
+}
+
+// embedding cache (tiered: in-memory LRU + persistent ObjCache)
+embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
+
+// defensive check: sysCache and embCache must use different root directories
+if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
+    log.Fatalf("ENGRAM_EMB_OBJ and ENGRAM_OBJ must be different directories")
+}
+
+// Router wiring
+router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024), embCache, emb)</code></pre>
+
+<p>
+The last two lines are critical: <code>sysCache</code> (<code>cache.NewLRU(1024)</code>) and <code>embCache</code> (<code>cache.NewTiered</code>) are <em>different instances</em> with different underlying object root directories.
+Sharing a single instance would cause plain-text system/ content to be written into the vector embedding store, leading to type confusion and backend pollution.
+When <code>embObjRoot == objRoot</code> the program fatals on startup — an active defence of this invariant.
+</p>
+
+<h3>Environment variables</h3>
+
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>ENGRAM_DB</code></td><td><code>postgres://postgres:engram@localhost:5433/engram</code></td><td>Postgres DSN</td></tr>
+    <tr><td><code>ENGRAM_OBJ</code></td><td><code>./engram-objects</code></td><td>Local object store root directory</td></tr>
+    <tr><td><code>ENGRAM_EMB_OBJ</code></td><td><code>./engram-embeddings</code></td><td>Vector embedding persistence directory (must differ from ENGRAM_OBJ)</td></tr>
+    <tr><td><code>ENGRAM_AGENT</code></td><td><code>demo</code></td><td>Agent ID</td></tr>
+    <tr><td><code>ENGRAM_PROVIDER</code></td><td><code>fake</code></td><td><code>fake</code> or <code>anthropic</code></td></tr>
+    <tr><td><code>ANTHROPIC_API_KEY</code></td><td>(required when provider=anthropic)</td><td>Anthropic API key</td></tr>
+    <tr><td><code>ENGRAM_EMBEDDER</code></td><td><code>fake</code></td><td><code>fake</code> or <code>voyage</code></td></tr>
+    <tr><td><code>VOYAGE_API_KEY</code></td><td>(required when embedder=voyage)</td><td>Voyage AI API key</td></tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════
+     §9  Cross-references
+     ═══════════════════════════════════════════════════ -->
+<h2 id="cross-links">9. Cross-references</h2>
+
+<div class="cardgrid">
+  <div class="card">
+    <div class="num">③ Storage &amp; Consistency</div>
+    <h3>MemStore / CAS mechanism</h3>
+    <p>The object write order in <code>CommitWithCAS</code>, Postgres tx atomicity, and the underlying implementation of <code>ErrCASConflict</code> — the details of <code>refs.CommitRef</code> and <code>gitfs.Commit</code> are covered in ③.</p>
+    <a href="03-storage-consistency.html">See ③ →</a>
+  </div>
+  <div class="card">
+    <div class="num">④ Search &amp; Index</div>
+    <h3>L3 cache + L4 HybridSearch</h3>
+    <p>The immutable SHA keys returned by <code>TreeKeys</code>, <code>cache.NewTiered</code> (LRU + ObjCache), and the trigram + vector hybrid implementation of <code>search.NewHybrid</code> — all detailed in ④.</p>
+    <a href="04-search-index.html">See ④ →</a>
+  </div>
+  <div class="card">
+    <div class="num">⑤ Maintenance Pipeline</div>
+    <h3>reindex + reflect job consumption</h3>
+    <p>The <code>reindex</code> and <code>reflect</code> jobs enqueued on commit are consumed asynchronously by the maintenance worker — job queue structure, GC, and consumption logic are in ⑤.</p>
+    <a href="05-maintenance-pipeline.html">See ⑤ →</a>
+  </div>
+</div>
+
+</main>
+<footer>Engram deep dives · hand-built SVG/HTML, readable offline · based on the main branch (L1–L5d)</footer>
+</body></html>

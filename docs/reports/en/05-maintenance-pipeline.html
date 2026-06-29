@@ -1,0 +1,726 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · Maintenance pipeline</title>
+<link rel="stylesheet" href="../style.css">
+</head><body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html">Index</a>
+  <a href="01-architecture-overview.html">Architecture</a>
+  <a href="02-request-path.html">Request Path</a>
+  <a href="03-storage-consistency.html">Storage</a>
+  <a href="04-search-index.html">Search</a>
+  <a href="05-maintenance-pipeline.html" class="active">Maintenance</a>
+  <a href="06-build-journey.html">Build Journey</a>
+  <a class="lang" href="../cn/05-maintenance-pipeline.html">中文</a>
+</nav>
+<main>
+
+<p class="meta">L5a GC · L5b memory_jobs · L5c defrag · L5d reaper · cmd/maintenance · internal/maintenance</p>
+<h1>Maintenance Pipeline</h1>
+<p class="lead">
+  A background Go worker that runs entirely outside the request path: GC, job queue draining, reflection consolidation, defragmentation, and stale-job reaping.
+  Everything is idempotent and re-derivable — no Temporal or Kafka needed.
+</p>
+
+<!-- ─────────────────────────────── §1 what the worker does -->
+<h2 id="s1">1. What the background worker does</h2>
+
+<p>
+<code>cmd/maintenance/main.go</code> is the sole maintenance process. It never runs on the foreground request path —
+agent session commits, LLM calls, and tool executions do not wait on it.
+Everything the worker does satisfies the same precondition:
+</p>
+
+<blockquote>
+Idempotent, fully re-derivable from stored state, and short-lived per execution.
+A crash means restart-and-redo — no irreproducible intermediate state, no heavyweight workflow engine needed.
+</blockquote>
+
+<p>Four tasks run in a fixed sequence to form one "round":</p>
+
+<ul>
+  <li><strong>GC (mark-sweep)</strong>: compute the set of objects reachable from all agent HEADs; delete unreachable content-addressed objects that are past the grace period (L5a).</li>
+  <li><strong>ReapStaleJobs</strong>: move jobs that were left permanently in <code>running</code> due to a worker crash back to <code>pending</code> (L5d).</li>
+  <li><strong>EnqueueDefrag</strong>: scan all agents and idempotently enqueue <code>defrag</code> jobs for agents with splittable <code>.md</code> files (L5c).</li>
+  <li><strong>DrainJobs</strong>: consume <code>pending</code> jobs one by one, dispatching them to the reflect / reindex / defrag handlers (L5b / L5c).</li>
+</ul>
+
+<p>The entire round runs under a Postgres session-level advisory lock (<code>gcLockKey = 1</code>).
+If the lock cannot be acquired the round is skipped, so multiple worker instances automatically degrade to active/standby when scaled horizontally:</p>
+
+<!-- round flow SVG -->
+<div class="figure">
+<svg viewBox="0 0 680 110" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
+  <!-- timer -->
+  <ellipse cx="44" cy="55" rx="38" ry="22" fill="#faf8f3" stroke="#bf5e3c" stroke-width="1.5"/>
+  <text x="44" y="51" text-anchor="middle" fill="#bf5e3c" font-weight="600" font-size="12">Timer</text>
+  <text x="44" y="65" text-anchor="middle" fill="#7c766c" font-size="11">fires</text>
+  <!-- lock -->
+  <rect x="96" y="33" width="88" height="44" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="140" y="53" text-anchor="middle" fill="#9d4a2d" font-weight="600" font-size="12">Global lock</text>
+  <text x="140" y="68" text-anchor="middle" fill="#7c766c" font-size="11">pg_try_advisory_lock(1)</text>
+  <!-- gc -->
+  <rect x="198" y="33" width="72" height="44" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="234" y="53" text-anchor="middle" fill="#201e18" font-weight="600" font-size="12">GC</text>
+  <text x="234" y="68" text-anchor="middle" fill="#7c766c" font-size="11">mark-sweep</text>
+  <!-- reap -->
+  <rect x="284" y="33" width="72" height="44" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="320" y="53" text-anchor="middle" fill="#201e18" font-weight="600" font-size="12">Reap</text>
+  <text x="320" y="68" text-anchor="middle" fill="#7c766c" font-size="11">stuck jobs</text>
+  <!-- scan -->
+  <rect x="370" y="33" width="80" height="44" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="410" y="53" text-anchor="middle" fill="#201e18" font-weight="600" font-size="12">Scan frags</text>
+  <text x="410" y="68" text-anchor="middle" fill="#7c766c" font-size="11">EnqueueDefrag</text>
+  <!-- drain -->
+  <rect x="464" y="33" width="80" height="44" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="504" y="53" text-anchor="middle" fill="#201e18" font-weight="600" font-size="12">Drain</text>
+  <text x="504" y="68" text-anchor="middle" fill="#7c766c" font-size="11">DrainJobs</text>
+  <!-- sleep -->
+  <rect x="558" y="33" width="72" height="44" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="594" y="53" text-anchor="middle" fill="#201e18" font-weight="600" font-size="12">Sleep</text>
+  <text x="594" y="68" text-anchor="middle" fill="#7c766c" font-size="11">ENGRAM_GC_INTERVAL</text>
+  <!-- arrows -->
+  <line x1="82" y1="55" x2="96" y2="55" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="184" y1="55" x2="198" y2="55" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="270" y1="55" x2="284" y2="55" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="356" y1="55" x2="370" y2="55" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="450" y1="55" x2="464" y2="55" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="544" y1="55" x2="558" y2="55" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- back arrow below -->
+  <path d="M630 77 Q630 98 44 98 Q44 77 44 77" fill="none" stroke="#e7c9ba" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr-muted)"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="arr-muted" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#e7c9ba"/>
+    </marker>
+  </defs>
+</svg>
+<p class="figcap">Full flow of one round (all steps run under the global lock)&nbsp;·&nbsp; <span class="fileref">cmd/maintenance/main.go:148–185</span></p>
+</div>
+
+<div class="callout invariant">
+  <span class="tag">Invariant</span>
+  The maintenance worker is completely decoupled from the foreground request path and never blocks an agent session.
+  All writes go through the same <code>CommitWithCAS</code> interface used by the foreground — the system has exactly one consistency control point.
+</div>
+
+<!-- ─────────────────────────────── §2 job lifecycle -->
+<h2 id="s2">2. A job's lifecycle (state machine)</h2>
+
+<p>
+<code>memory_jobs</code> is the Postgres job queue that drives the entire maintenance pipeline. Key columns:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Column</th><th>Type</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>id</code></td><td>bigserial PK</td><td>Globally unique job ID</td></tr>
+    <tr><td><code>agent_id</code></td><td>text</td><td>Owning agent</td></tr>
+    <tr><td><code>kind</code></td><td>text</td><td><code>reflect</code> / <code>reindex</code> / <code>defrag</code></td></tr>
+    <tr><td><code>from_sha</code></td><td>text nullable</td><td>HEAD commit SHA at enqueue time (for future diff-since use in reflect)</td></tr>
+    <tr><td><code>state</code></td><td>text</td><td><code>pending</code> / <code>running</code> / <code>failed</code></td></tr>
+    <tr><td><code>attempts</code></td><td>int default 0</td><td>Number of attempts so far; transitions to <code>failed</code> at <code>maxAttempts</code></td></tr>
+    <tr><td><code>claimed_at</code></td><td>timestamptz nullable</td><td>Timestamp of the most recent claim; used by the Reaper to detect stuck jobs</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Jobs are enqueued from two sources:</strong></p>
+<ul>
+  <li>
+    <strong>In-transaction enqueue (commit path)</strong>: <code>CommitRef</code> advances HEAD and inserts
+    <code>reflect</code>/<code>reindex</code> jobs inside the same Postgres transaction —
+    a job exists if and only if the commit succeeded (replaces the Kafka + outbox pattern).
+  </li>
+  <li>
+    <strong>Out-of-band enqueue (defrag scan)</strong>: <code>EnqueueJob</code> uses a partial-unique index
+    <code>(agent_id, kind) WHERE state='pending'</code> with <code>ON CONFLICT DO NOTHING</code>,
+    so there is at most one pending row per (agent, kind) pair.
+  </li>
+</ul>
+
+<!-- state machine SVG -->
+<div class="figure">
+<svg viewBox="0 0 560 220" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
+  <!-- pending -->
+  <rect x="30" y="80" width="110" height="44" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="2"/>
+  <text x="85" y="98" text-anchor="middle" fill="#9d4a2d" font-weight="700" font-size="13">pending</text>
+  <text x="85" y="114" text-anchor="middle" fill="#7c766c" font-size="11">waiting to be claimed</text>
+  <!-- running -->
+  <rect x="220" y="80" width="110" height="44" rx="10" fill="#f8efda" stroke="#a9741f" stroke-width="2"/>
+  <text x="275" y="98" text-anchor="middle" fill="#a9741f" font-weight="700" font-size="13">running</text>
+  <text x="275" y="114" text-anchor="middle" fill="#7c766c" font-size="11">claimed</text>
+  <!-- done -->
+  <rect x="410" y="30" width="110" height="44" rx="10" fill="#eef2e6" stroke="#5f7a4e" stroke-width="2"/>
+  <text x="465" y="48" text-anchor="middle" fill="#5f7a4e" font-weight="700" font-size="13">done</text>
+  <text x="465" y="64" text-anchor="middle" fill="#7c766c" font-size="11">CompleteJob deletes row</text>
+  <!-- failed -->
+  <rect x="410" y="130" width="110" height="44" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="2"/>
+  <text x="465" y="148" text-anchor="middle" fill="#7c766c" font-weight="700" font-size="13">failed</text>
+  <text x="465" y="164" text-anchor="middle" fill="#7c766c" font-size="11">retained for audit</text>
+  <!-- pending→running -->
+  <line x1="140" y1="102" x2="220" y2="102" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#a1)"/>
+  <text x="180" y="96" text-anchor="middle" fill="#bf5e3c" font-size="11">ClaimJob</text>
+  <text x="180" y="109" text-anchor="middle" fill="#7c766c" font-size="10">SKIP LOCKED</text>
+  <!-- running→done -->
+  <line x1="330" y1="88" x2="410" y2="60" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="375" y="68" text-anchor="middle" fill="#5f7a4e" font-size="11">CompleteJob</text>
+  <!-- running→pending (retry) -->
+  <path d="M275 80 Q275 15 85 15 Q85 80 85 80" fill="none" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#a3)"/>
+  <text x="180" y="11" text-anchor="middle" fill="#a9741f" font-size="11">RetryJob (attempts &lt; max)</text>
+  <!-- running→failed -->
+  <line x1="330" y1="116" x2="410" y2="148" stroke="#7c766c" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#a4)"/>
+  <text x="375" y="145" text-anchor="middle" fill="#7c766c" font-size="11">RetryJob (limit reached)</text>
+  <!-- reap→pending -->
+  <path d="M275 124 Q275 200 85 200 Q85 124 85 124" fill="none" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#a3)"/>
+  <text x="180" y="214" text-anchor="middle" fill="#a9741f" font-size="11">ReapStaleJobs (claimed_at timed out)</text>
+  <defs>
+    <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/></marker>
+    <marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#5f7a4e"/></marker>
+    <marker id="a3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#a9741f"/></marker>
+    <marker id="a4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#7c766c"/></marker>
+  </defs>
+</svg>
+<p class="figcap">memory_jobs state machine. done means the row is deleted immediately — no tombstone; failed rows are retained for inspection.</p>
+</div>
+
+<div class="callout win">
+  <span class="tag">Design highlight</span>
+  Completing a job (done) deletes the row outright — the queue only holds active work, so historical throughput has no effect on table size.
+  <code>failed</code> rows are kept for audit and are never picked up again by Drain or Reaper.
+</div>
+
+<!-- ─────────────────────────────── §3 SKIP LOCKED -->
+<h2 id="s3">3. Claiming jobs without races</h2>
+
+<p>
+<code>ClaimJob</code> (<code>refs/refs.go:122</code>) atomically "grabs" one pending row in a single transaction.
+The sequence is: SELECT + FOR UPDATE SKIP LOCKED to lock a row,
+immediately UPDATE it to <code>running</code> and record <code>claimed_at=now()</code>, then commit.
+</p>
+
+<pre><code>func (r *Refs) ClaimJob(ctx context.Context) (*DequeuedJob, error) {
+    tx, err := r.pool.Begin(ctx)
+    ...
+    err = tx.QueryRow(ctx,
+        `SELECT id, agent_id, kind, from_sha, attempts FROM memory_jobs
+         WHERE state='pending' FOR UPDATE SKIP LOCKED LIMIT 1`).
+        Scan(&j.ID, &j.AgentID, &j.Kind, &fromSHA, &j.Attempts)
+    ...
+    tx.Exec(ctx,
+        `UPDATE memory_jobs SET state='running', claimed_at=now() WHERE id=$1`, j.ID)
+    tx.Commit(ctx)
+    return &j, nil
+}</code></pre>
+<p class="fileref">internal/memstore/refs/refs.go:122–151</p>
+
+<p>A few key design points:</p>
+<ul>
+  <li>
+    <strong>SKIP LOCKED</strong>: skips rows already locked by another transaction, so multiple workers each grab a different job without waiting on each other.
+    There is currently only one worker, but the design scales horizontally with no code changes.
+  </li>
+  <li><strong>No ORDER BY</strong>: pending jobs are not ordered ("queue hygiene"), which prevents a class of failing jobs from permanently blocking fair processing of others.</li>
+  <li><strong>LIMIT 1</strong>: only one row per call, keeping progress granular and error boundaries tight.</li>
+  <li><strong>claimed_at=now()</strong>: records the claim timestamp so the Reaper can later determine whether a job has timed out.</li>
+</ul>
+
+<p>
+On success, <code>CompleteJob</code> simply DELETEs the row.
+On failure, <code>RetryJob</code> does <code>attempts++</code> and sets state to either <code>pending</code> or <code>failed</code> depending on whether <code>maxAttempts</code> has been reached,
+and clears <code>claimed_at</code>:
+</p>
+
+<pre><code>UPDATE memory_jobs
+SET attempts = attempts + 1,
+    state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END,
+    claimed_at = NULL
+WHERE id=$1</code></pre>
+<p class="fileref">internal/memstore/refs/refs.go:163–174</p>
+
+<!-- ─────────────────────────────── §4 Deps + DrainJobs -->
+<h2 id="s4">4. Dispatching by kind + busy-loop prevention</h2>
+
+<h3>Deps: the dependency container</h3>
+
+<p>
+<code>Deps</code> bundles the dependencies each job handler needs, keeping handlers decoupled from one another:
+</p>
+
+<pre><code>type Deps struct {
+    Store          memstore.MemStore
+    Completer      Completer       // for reflect
+    Emb            search.Embedder // for reindex
+    EmbCache       cache.Cache     // for reindex
+    DefragMaxBytes int             // for defrag
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:15–21</p>
+
+<h3>processJob: dispatch by kind, always resolve the job</h3>
+
+<pre><code>func processJob(ctx context.Context, r *refs.Refs, deps Deps,
+    job *refs.DequeuedJob, maxAttempts int) error {
+    switch job.Kind {
+    case "reflect":
+        ran, err := r.WithGlobalLock(ctx, agentKey(job.AgentID), func(ctx context.Context) error {
+            return Reflect(ctx, deps.Store, deps.Completer, job.AgentID, job.FromSHA)
+        })
+        if !ran || err != nil {
+            return r.RetryJob(ctx, job.ID, maxAttempts)
+        }
+        return r.CompleteJob(ctx, job.ID)
+    case "reindex":
+        if err := Reindex(ctx, deps.Store, deps.Emb, deps.EmbCache, job.AgentID); err != nil {
+            return r.RetryJob(ctx, job.ID, maxAttempts)
+        }
+        return r.CompleteJob(ctx, job.ID)
+    case "defrag":
+        ran, err := r.WithGlobalLock(ctx, agentKey(job.AgentID), func(ctx context.Context) error {
+            return Defrag(ctx, deps.Store, job.AgentID, deps.DefragMaxBytes)
+        })
+        if !ran || err != nil {
+            return r.RetryJob(ctx, job.ID, maxAttempts)
+        }
+        return r.CompleteJob(ctx, job.ID)
+    default:
+        return r.CompleteJob(ctx, job.ID) // unknown kind: discard rather than block the queue
+    }
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:34–61</p>
+
+<p>Three core rules apply to every branch:</p>
+<ol>
+  <li><strong>Always resolve the job</strong>: regardless of success or failure, processJob always calls either CompleteJob or RetryJob — a job row never stays permanently in <code>running</code>.</li>
+  <li><strong>Unknown kinds are completed immediately</strong>: unknown jobs are not retried, to prevent zombie jobs from clogging the queue.</li>
+  <li><strong>Failing to acquire the per-agent lock (ran=false) counts as failure</strong>: falls back to RetryJob and tries again next round.</li>
+</ol>
+
+<h3>DrainJobs: seen-set for busy-loop prevention</h3>
+
+<pre><code>func DrainJobs(ctx context.Context, r *refs.Refs, deps Deps, maxAttempts int) (int, error) {
+    seen := map[int64]struct{}{}
+    processed := 0
+    for {
+        job, err := r.ClaimJob(ctx)
+        ...
+        if job == nil { return processed, nil } // queue is empty
+        if _, dup := seen[job.ID]; dup {
+            // same job seen again within one round — it was requeued
+            // RetryJob once more (second attempts bump) then end this round
+            r.RetryJob(ctx, job.ID, maxAttempts)
+            return processed, nil
+        }
+        seen[job.ID] = struct{}{}
+        processJob(ctx, r, deps, job, maxAttempts)
+        processed++
+    }
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:68–91</p>
+
+<p>
+The <code>seen</code> set tracks the IDs of jobs already processed during this round.
+If a job is returned to <code>pending</code> by RetryJob and is then claimed again in the same round,
+DrainJobs immediately calls RetryJob a second time (bumping attempts again) and ends the round.
+This way a repeatedly failing job eventually reaches <code>failed</code> after enough rounds rather than spinning forever.
+</p>
+
+<div class="callout gotcha">
+  <span class="tag">Watch out</span>
+  The seen-set is only valid within a single DrainJobs call (one round); it is not persisted across rounds.
+  GC and Reap run before each drain, so stale running jobs are already recovered by the time drain starts — the seen set is always clean at round entry.
+</div>
+
+<!-- ─────────────────────────────── §5 per-agent lock + no self-trigger -->
+<h2 id="s5">5. Per-agent singleton lock + no self-triggering</h2>
+
+<h3>agentKey: FNV hash to advisory lock key</h3>
+
+<pre><code>func agentKey(agentID string) int64 {
+    h := fnv.New64a()
+    _, _ = h.Write([]byte(agentID))
+    return int64(h.Sum64())
+}</code></pre>
+<p class="fileref">internal/maintenance/drain.go:25–30</p>
+
+<p>
+Both reflect and defrag jobs run under <code>r.WithGlobalLock(ctx, agentKey(agentID), ...)</code>.
+This is the <strong>maintenance-side per-agent singleton lock</strong>, preventing concurrent maintenance writes to the same agent's memory.
+It uses a <em>different</em> advisory lock key from the foreground writer (foreground uses the global key=1; maintenance uses the agent-hash key) — the two are independent.
+</p>
+
+<p>
+Hash collisions only cause two agents to occasionally serialize, which does not affect correctness —
+real correctness is guaranteed by the CAS in CommitWithCAS; the advisory lock just reduces unnecessary CAS conflicts.
+</p>
+
+<h3>jobs=nil: breaking the self-trigger loop</h3>
+
+<p>When reflect and defrag write back, they pass <code>nil</code> as the jobs argument to <code>CommitWithCAS</code>:</p>
+
+<pre><code>// jobs=nil: reflection never enqueues a reflect job (no self-trigger loop).
+if _, err := store.CommitWithCAS(ctx, agentID, head, dir, nil); err != nil { ... }</code></pre>
+<p class="fileref">internal/maintenance/reflect.go:72 &nbsp;|&nbsp; internal/maintenance/defrag.go:159</p>
+
+<p>
+The foreground agent passes <code>[]refs.Job{{Kind:"reflect"},{Kind:"reindex"}}</code> on commit;
+maintenance passes <code>nil</code> — <strong>a maintenance commit never enqueues new maintenance jobs</strong>,
+structurally severing the "maintenance triggers maintenance" feedback loop rather than relying on runtime checks.
+</p>
+
+<div class="callout invariant">
+  <span class="tag">Invariant</span>
+  Maintenance commits use jobs=nil. Commits from reflect and defrag never enqueue any new jobs,
+  so the maintenance pipeline cannot grow into an infinite loop. This is a structural guarantee, not a flag or conditional check.
+</div>
+
+<h3>CAS conflict → ErrConflict → retry</h3>
+
+<p>
+If an agent advances HEAD while a maintenance write is in flight (concurrent foreground write), CommitWithCAS's CAS fails.
+reflect.go and defrag.go surface this as <code>ErrConflict</code>,
+and processJob calls RetryJob to return the job to <code>pending</code>.
+On the next drain Reflect re-resolves HEAD, sees the latest state, and re-consolidates — it never force-overwrites.
+</p>
+
+<!-- ─────────────────────────────── §6 Reflection -->
+<h2 id="s6">6. Reflection</h2>
+
+<h3>Completer: the minimal LLM interface</h3>
+
+<pre><code>type Completer interface {
+    Complete(ctx context.Context, system, user string) (string, error)
+}</code></pre>
+<p class="fileref">internal/maintenance/reflect.go:18–20</p>
+
+<p>
+Reflection needs only a single text completion, so it is abstracted behind the minimal <code>Completer</code> interface,
+decoupled from the agent package's full-featured <code>LLMProvider</code> (which includes the tool-calling protocol).
+<code>cmd/maintenance/main.go</code> supplies two implementations driven by <code>ENGRAM_PROVIDER</code>:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Implementation</th><th>Use case</th><th>Behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>providerCompleter</code></td>
+      <td>Production, <code>ENGRAM_PROVIDER=anthropic</code></td>
+      <td>Wraps <code>agent.LLMProvider.Generate</code> and extracts <code>resp.Text</code></td>
+    </tr>
+    <tr>
+      <td><code>fixedCompleter</code></td>
+      <td>Development / testing, default</td>
+      <td>Returns the constant string <code>"(fake reflection) consolidated\n"</code> with no API call</td>
+    </tr>
+  </tbody>
+</table>
+<p class="fileref">cmd/maintenance/main.go:28–49</p>
+
+<h3>Reflect execution steps</h3>
+
+<ol class="steps">
+  <li>
+    <span class="st">ResolveHead</span>
+    <span class="sd">Fetch the current HEAD (ignores fromSHA — always reads the latest state; fromSHA is preserved for a future diff-since optimization).</span>
+  </li>
+  <li>
+    <span class="st">Materialize</span>
+    <span class="sd">Materialize the HEAD tree into a temporary directory (<code>os.MkdirTemp</code>, defer RemoveAll).</span>
+  </li>
+  <li>
+    <span class="st">readSystemDir</span>
+    <span class="sd">Walk the <code>system/</code> subdirectory and concatenate all files into a single string with path headers.</span>
+  </li>
+  <li>
+    <span class="st">Skip if no residents</span>
+    <span class="sd"><code>if resident == "" { return nil }</code> — when system/ is empty, no commit is produced, avoiding pointless commit churn.</span>
+  </li>
+  <li>
+    <span class="st">Complete</span>
+    <span class="sd">Call the Completer with <code>reflectSystemPrompt</code> plus the resident content to obtain a consolidated summary.</span>
+  </li>
+  <li>
+    <span class="st">Write system/reflection.md</span>
+    <span class="sd">Write the LLM output into the materialized directory (MkdirAll ensures the path exists).</span>
+  </li>
+  <li>
+    <span class="st">CommitWithCAS(jobs=nil)</span>
+    <span class="sd">CAS commit; conflicts surface as ErrConflict and the caller calls RetryJob.</span>
+  </li>
+</ol>
+
+<h3>readSystemDir error propagation</h3>
+
+<pre><code>walkErr := filepath.WalkDir(systemDir, func(path string, d fs.DirEntry, err error) error {
+    if err != nil {
+        if errors.Is(err, fs.ErrNotExist) {
+            return fs.SkipAll // system/ directory not yet created — normal
+        }
+        return err // real IO error: propagate up
+    }
+    ...
+})
+if walkErr != nil { // SkipAll resolves to nil, so this is always a real error
+    return "", fmt.Errorf("maintenance: read system/: %w", walkErr)
+}</code></pre>
+<p class="fileref">internal/maintenance/reflect.go:86–107</p>
+
+<p>
+<code>fs.ErrNotExist</code> (system/ directory not yet created) is silently handled via <code>SkipAll</code> —
+readSystemDir returns <code>""</code> and the caller skips this consolidation pass.
+Other read errors (permission denied, IO faults) propagate up and ultimately trigger RetryJob.
+</p>
+
+<div class="callout win">
+  <span class="tag">Design highlight</span>
+  Reflect always works from the latest HEAD, ensuring the consolidated result is never based on a stale resident set.
+  The <code>fromSHA</code> field is already in place as a hook for a future diff-since-last-reflect optimization —
+  at that point only the delta would be sent to the LLM instead of a full re-read.
+</div>
+
+<!-- ─────────────────────────────── §7 Defrag -->
+<h2 id="s7">7. Splitting large files (Defrag)</h2>
+
+<h3>Splittability check</h3>
+
+<p>A file qualifies for splitting (<code>isSplittable</code>) when it satisfies all three conditions:</p>
+<ol>
+  <li>Has a <code>.md</code> extension;</li>
+  <li>Byte size exceeds <code>maxBytes</code> (default <code>ENGRAM_DEFRAG_MAX_BYTES=16384</code>);</li>
+  <li><code>splitTopLevel</code> produces at least 2 parts (i.e., at least 2 <code># </code> top-level headings).</li>
+</ol>
+
+<pre><code>func isSplittable(path string, content []byte, maxBytes int) bool {
+    return strings.HasSuffix(path, ".md") &&
+        len(content) > maxBytes &&
+        len(splitTopLevel(content)) >= 2
+}</code></pre>
+<p class="fileref">internal/maintenance/defrag.go:52–54</p>
+
+<h3>splitTopLevel: splitting on top-level headings</h3>
+
+<pre><code>func splitTopLevel(content []byte) [][]byte {
+    var parts [][]byte
+    var cur []byte
+    flush := func() {
+        if len(bytes.TrimSpace(cur)) > 0 { parts = append(parts, cur) }
+        cur = nil
+    }
+    for _, ln := range bytes.SplitAfter(content, []byte("\n")) {
+        if len(ln) == 0 { continue }
+        if isTopHeading(ln) { flush() }
+        cur = append(cur, ln...)
+    }
+    flush()
+    return parts
+}</code></pre>
+<p class="fileref">internal/maintenance/defrag.go:24–44</p>
+
+<p>
+Only lines starting with <code># </code> (a single <code>#</code> followed by a space) trigger a split; <code>##</code> and deeper headings are not split points.
+Any preamble before the first top-level heading becomes part 0 if it contains non-whitespace characters.
+</p>
+
+<h3>Why splitting does not recurse forever: structural convergence</h3>
+
+<p>
+Defrag convergence does <strong>not</strong> rely on "each part being smaller than maxBytes after splitting" — it relies on a structural constraint:
+</p>
+
+<blockquote>
+Each <code>base.NN.md</code> part produced by a split contains exactly one top-level heading (the <code># </code> line that triggered the split).
+Calling <code>splitTopLevel</code> on that part returns exactly 1 element, so <code>isSplittable</code> is false.
+The next scan sees it as non-splittable and does not enqueue it; the next Defrag run ignores it too.
+</blockquote>
+
+<p>
+Side effect: <strong>a single oversized section (larger than maxBytes but with only one top-level heading) is never split.</strong>
+This is intentional — slicing markdown at a byte boundary destroys semantic structure; splits should be driven by document structure, not byte counts.
+</p>
+
+<!-- convergence flow SVG -->
+<div class="figure">
+<svg viewBox="0 0 660 130" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="12.5">
+  <rect x="10" y="40" width="110" height="50" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="65" y="61" text-anchor="middle" fill="#9d4a2d" font-weight="600">EnqueueDefrag</text>
+  <text x="65" y="78" text-anchor="middle" fill="#7c766c">scan all agents</text>
+
+  <rect x="145" y="40" width="120" height="50" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="205" y="61" text-anchor="middle" fill="#201e18" font-weight="600">isSplittable?</text>
+  <text x="205" y="78" text-anchor="middle" fill="#7c766c">&#x2265; 2 top-level headings</text>
+
+  <rect x="290" y="40" width="110" height="50" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="345" y="61" text-anchor="middle" fill="#201e18" font-weight="600">enqueue defrag</text>
+  <text x="345" y="78" text-anchor="middle" fill="#7c766c">ON CONFLICT DO NOTHING</text>
+
+  <rect x="425" y="40" width="110" height="50" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="480" y="55" text-anchor="middle" fill="#201e18" font-weight="600">Defrag</text>
+  <text x="480" y="70" text-anchor="middle" fill="#7c766c">splitTopLevel</text>
+  <text x="480" y="84" text-anchor="middle" fill="#7c766c">write base.NN.md</text>
+
+  <rect x="555" y="40" width="95" height="50" rx="10" fill="#eef2e6" stroke="#5f7a4e" stroke-width="1.5"/>
+  <text x="602" y="61" text-anchor="middle" fill="#5f7a4e" font-weight="600">converged</text>
+  <text x="602" y="78" text-anchor="middle" fill="#7c766c">each part = 1 heading</text>
+
+  <line x1="120" y1="65" x2="145" y2="65" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ba)"/>
+  <line x1="265" y1="65" x2="290" y2="65" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ba)"/>
+  <text x="277" y="58" text-anchor="middle" fill="#5f7a4e" font-size="11">yes</text>
+  <line x1="400" y1="65" x2="425" y2="65" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ba)"/>
+  <line x1="535" y1="65" x2="555" y2="65" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#ba2)"/>
+
+  <!-- no branch -->
+  <path d="M205 90 Q205 115 65 115 Q65 90 65 90" fill="none" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ba3)"/>
+  <text x="135" y="128" text-anchor="middle" fill="#7c766c" font-size="11">no (single-section large file or already split) &#x2192; not enqueued, skipped next round</text>
+
+  <defs>
+    <marker id="ba" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/></marker>
+    <marker id="ba2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#5f7a4e"/></marker>
+    <marker id="ba3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#e9e3d6"/></marker>
+  </defs>
+</svg>
+<p class="figcap">Defrag convergence flow. Each part produced by a split contains exactly 1 top-level heading, so isSplittable returns false for it permanently.</p>
+</div>
+
+<div class="callout invariant">
+  <span class="tag">Invariant</span>
+  Convergence is structurally guaranteed: after each split, every part has exactly 1 top-level heading,
+  making isSplittable permanently false for it — regardless of file size (a single oversized section is left intact).
+</div>
+
+<h3>Naming scheme and the empty-targets optimization</h3>
+
+<p>
+The original file <code>notes.md</code> is deleted and each part is named <code>notes.01.md</code>, <code>notes.02.md</code>, and so on.
+If the traversal finds no splittable files (targets is empty), Defrag returns nil immediately with no commit produced.
+</p>
+
+<!-- ─────────────────────────────── §8 Reaper -->
+<h2 id="s8">8. Reaping stuck jobs</h2>
+
+<p>
+If a worker crashes while processing a job, that job's state is permanently stuck in <code>running</code> with <code>claimed_at</code> frozen.
+Each round's <code>ReapStaleJobs</code> moves it back to <code>pending</code>:
+</p>
+
+<pre><code>func (r *Refs) ReapStaleJobs(ctx context.Context, before time.Time, maxAttempts int) (int, error) {
+    tag, err := r.pool.Exec(ctx,
+        `UPDATE memory_jobs
+         SET attempts = attempts + 1,
+             state = CASE WHEN attempts + 1 >= $2 THEN 'failed' ELSE 'pending' END,
+             claimed_at = NULL
+         WHERE state='running' AND (claimed_at IS NULL OR claimed_at < $1)`,
+        before, maxAttempts)
+    ...
+    return int(tag.RowsAffected()), nil
+}</code></pre>
+<p class="fileref">internal/memstore/refs/refs.go:181–193</p>
+
+<p>
+<code>before = time.Now().Add(-reapAfter)</code>, where <code>reapAfter</code> defaults to 10 minutes (<code>ENGRAM_JOB_REAP_AFTER</code>).
+<code>claimed_at IS NULL</code> handles the edge case where a row is in running state but claimed_at was never written (defensive handling).
+</p>
+
+<p>
+<strong>Poison-job protection</strong>: every Reap also increments <code>attempts</code>.
+A job that crashes the worker every time will cycle through "crash → Reap → pending → crash → Reap…"
+and automatically transition to <code>failed</code> after maxAttempts iterations, never to be picked up by ClaimJob again.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Scenario</th><th>claimed_at state</th><th>Reap action</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Worker processing normally</td><td>within the reapAfter window</td><td>untouched</td></tr>
+    <tr><td>Worker crashed, job timed out</td><td>before the cutoff</td><td>attempts++ → pending or failed</td></tr>
+    <tr><td>claimed_at is NULL (anomaly)</td><td>NULL</td><td>attempts++ → pending or failed</td></tr>
+    <tr><td>Poison job, Nth reap</td><td>before the cutoff</td><td>attempts reaches limit → failed, loop terminates</td></tr>
+  </tbody>
+</table>
+
+<div class="callout gotcha">
+  <span class="tag">Watch out</span>
+  The Reaper is designed assuming a <strong>single worker</strong>: <code>reapAfter</code> must be significantly longer than the expected execution time of any individual job.
+  If multiple workers run concurrently in the future, reapAfter must be set more conservatively, or a heartbeat-renewal mechanism must be introduced,
+  to avoid misidentifying a healthy running job as stale.
+</div>
+
+<!-- ─────────────────────────────── §9 Round order and config -->
+<h2 id="s9">9. Round order and configuration</h2>
+
+<h3>Logical dependencies in execution order</h3>
+
+<p>
+The execution order within a single round has inherent logical dependencies and cannot be shuffled:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Step</th><th>Why it must be here</th><th>Failure policy</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>① GC</td>
+      <td>Runs before drain so this round cleans the most up-to-date reachability set; must never delete objects based on an incomplete reachable set.</td>
+      <td>Entire round returns error, logged, no crash</td>
+    </tr>
+    <tr>
+      <td>② ReapStaleJobs</td>
+      <td>Runs before drain so stale running jobs are back in pending and can be picked up in this round's drain.</td>
+      <td>Log only, round continues</td>
+    </tr>
+    <tr>
+      <td>③ EnqueueDefrag</td>
+      <td>Runs before drain so defrag jobs found in this scan are processed in this same round's drain (fastest response path).</td>
+      <td>Log only, round continues</td>
+    </tr>
+    <tr>
+      <td>④ DrainJobs</td>
+      <td>Runs last; completed GC and Reap are not rolled back by a drain failure.</td>
+      <td>Round returns error, logged</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="fileref">cmd/maintenance/main.go:148–185</p>
+
+<h3>Environment variable reference</h3>
+
+<table>
+  <thead>
+    <tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ENGRAM_DB</code></td><td><code>postgres://postgres:engram@localhost:5433/engram?sslmode=disable</code></td><td>Postgres DSN</td></tr>
+    <tr><td><code>ENGRAM_OBJ</code></td><td><code>./engram-objects</code></td><td>Object store root directory</td></tr>
+    <tr><td><code>ENGRAM_GC_INTERVAL</code></td><td><code>5m</code></td><td>Interval between rounds (time.ParseDuration)</td></tr>
+    <tr><td><code>ENGRAM_GC_GRACE</code></td><td><code>1h</code></td><td>GC grace period: minimum object age before an unreachable object may be swept (protects in-flight commits)</td></tr>
+    <tr><td><code>ENGRAM_JOB_MAX_ATTEMPTS</code></td><td><code>5</code></td><td>Maximum attempts per job; exceeding this transitions the job to failed</td></tr>
+    <tr><td><code>ENGRAM_JOB_REAP_AFTER</code></td><td><code>10m</code></td><td>A running job with no claimed_at update for this long is reaped</td></tr>
+    <tr><td><code>ENGRAM_DEFRAG_MAX_BYTES</code></td><td><code>16384</code></td><td>Byte threshold above which a single file triggers defrag</td></tr>
+    <tr><td><code>ENGRAM_PROVIDER</code></td><td><code>fake</code></td><td><code>fake</code> uses fixedCompleter; <code>anthropic</code> calls the real LLM</td></tr>
+    <tr><td><code>ANTHROPIC_API_KEY</code></td><td>—</td><td>Required when ENGRAM_PROVIDER=anthropic</td></tr>
+    <tr><td><code>ENGRAM_EMBEDDER</code></td><td><code>fake</code></td><td><code>fake</code> uses random vectors; <code>voyage</code> uses Voyage AI</td></tr>
+    <tr><td><code>VOYAGE_API_KEY</code></td><td>—</td><td>Required when ENGRAM_EMBEDDER=voyage</td></tr>
+    <tr><td><code>ENGRAM_EMB_OBJ</code></td><td><code>./engram-embeddings</code></td><td>Persistent embedding store root (must differ from ENGRAM_OBJ to prevent GC from sweeping embeddings)</td></tr>
+  </tbody>
+</table>
+
+<div class="callout gotcha">
+  <span class="tag">Watch out</span>
+  Setting <code>ENGRAM_EMB_OBJ</code> to the same path as <code>ENGRAM_OBJ</code> causes a Fatal on worker startup —
+  embedding objects are not part of any commit tree, so GC would classify them as unreachable and delete all of them. The two paths must be physically separate.
+  <p class="fileref" style="margin-top:8px">cmd/maintenance/main.go:133–135</p>
+</div>
+
+</main>
+<footer>Engram deep dives · hand-built SVG/HTML, readable offline · based on the main branch (L1–L5d)</footer>
+</body></html>

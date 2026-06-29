@@ -1,0 +1,574 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram · Build journey</title>
+<link rel="stylesheet" href="../style.css">
+</head><body>
+<nav class="topnav">
+  <span class="brand">Engram</span>
+  <a href="index.html">Index</a>
+  <a href="01-architecture-overview.html">Architecture</a>
+  <a href="02-request-path.html">Request Path</a>
+  <a href="03-storage-consistency.html">Storage</a>
+  <a href="04-search-index.html">Search</a>
+  <a href="05-maintenance-pipeline.html">Maintenance</a>
+  <a href="06-build-journey.html" class="active">Build Journey</a>
+  <a class="lang" href="../cn/06-build-journey.html">中文</a>
+</nav>
+<main>
+
+<h1>Build Journey</h1>
+<p class="lead">How Engram grew from a first scaffold commit to 10 packages, 32 source files, 29 test files, and 2 runnable binaries — and the engineering discipline that drove every layer.</p>
+<p class="meta">Based on main branch L1–L5d · 113 commits · 2026-06</p>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     § 1  Building layer by layer
+═══════════════════════════════════════════════════════════════ -->
+<h2><span class="n">1 ·</span> Building layer by layer</h2>
+
+<p>The architecture doc targeted M5 (scale) from day one, but the implementation didn't get there in a single push. Each layer had to land on main with a clean build and a fully green test suite before the next one could start. This isn't just "discipline for its own sake" — every merge is a genuinely shippable increment: no long-lived feature branches, no "we'll test it once everything's integrated" debt.</p>
+
+<h3>1.1 Milestones × layers</h3>
+
+<p>CLAUDE.md defines five milestones: M1 (walking skeleton) → M2 (read cache) → M3 (maintenance worker) → M4 (search) → M5 (scale). In practice the work broke down into 9 independently verifiable layers, plus one database test-isolation retrofit:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Layer</th>
+      <th>Milestone</th>
+      <th>Core deliverables</th>
+      <th>Spec</th>
+      <th>Plan</th>
+      <th>Merge</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>L1</strong></td>
+      <td>M1 walking skeleton</td>
+      <td>ObjStore · gitfs Storer · Postgres refs CAS · memory_jobs queue · MemStore</td>
+      <td><code>2026-06-09-engram-l1-foundation-design.md</code></td>
+      <td><code>2026-06-09-engram-l1-memstore-core.md</code></td>
+      <td><code>c70e6af</code></td>
+    </tr>
+    <tr>
+      <td><strong>L2</strong></td>
+      <td>M1 complete</td>
+      <td>Router · Session · recall/read/edit tool suite · FakeProvider · Anthropic provider · cmd/api</td>
+      <td><code>2026-06-10-engram-l2-agent-loop-design.md</code></td>
+      <td><code>2026-06-17-engram-l2-agent-loop.md</code></td>
+      <td><code>5d29295</code></td>
+    </tr>
+    <tr>
+      <td><strong>L3</strong></td>
+      <td>M2 read cache</td>
+      <td>per-pod LRU · TreeKeys · cache-backed assembleSystem · Router/cmd injection</td>
+      <td><code>2026-06-22-engram-l3-read-cache-design.md</code></td>
+      <td><code>2026-06-22-engram-l3-read-cache.md</code></td>
+      <td><code>2e3b568</code></td>
+    </tr>
+    <tr>
+      <td><strong>L4</strong></td>
+      <td>M4 search</td>
+      <td>Trigram line-level inverted index · SemanticIndex (Voyage) · HybridSearch RRF · content-addressed embedding cache</td>
+      <td><code>2026-06-22-engram-l4-hybrid-search-design.md</code></td>
+      <td><code>2026-06-22-engram-l4-hybrid-search.md</code></td>
+      <td><code>80ebec6</code></td>
+    </tr>
+    <tr>
+      <td><strong>L4b</strong></td>
+      <td>M4 complete</td>
+      <td>ObjCache persistent embeddings · Tiered cache · maintenance.Reindex · embedding cache separated from read cache</td>
+      <td><code>2026-06-24-engram-l4b-index-persistence-design.md</code></td>
+      <td><code>2026-06-24-engram-l4b-index-persistence.md</code></td>
+      <td><code>6a9a3de</code></td>
+    </tr>
+    <tr>
+      <td><strong>L5a</strong></td>
+      <td>M3 maintenance worker</td>
+      <td>ObjStore Stat/Delete · gitfs.ReachableObjects · AllHeads · WithGlobalLock mark-and-sweep GC · cmd/maintenance</td>
+      <td><code>2026-06-23-engram-l5a-maintenance-gc-design.md</code></td>
+      <td><code>2026-06-23-engram-l5a-maintenance-gc.md</code></td>
+      <td><code>56dc6cc</code></td>
+    </tr>
+    <tr>
+      <td><strong>L5b</strong></td>
+      <td>M3 complete</td>
+      <td>memory_jobs consumer (ClaimJob/CompleteJob/RetryJob) · Reflect LLM integration · DrainJobs · cmd wiring</td>
+      <td><code>2026-06-23-engram-l5b-reflection-jobqueue-design.md</code></td>
+      <td><code>2026-06-23-engram-l5b-reflection-jobqueue.md</code></td>
+      <td><code>49e0100</code></td>
+    </tr>
+    <tr>
+      <td><strong>L5c</strong></td>
+      <td>M3 complete</td>
+      <td>Deterministic defrag: split oversized .md by top-level headings · Deps refactor · EnqueueJob/AllAgentIDs · per-round scanning</td>
+      <td><code>2026-06-24-engram-l5c-defrag-design.md</code></td>
+      <td><code>2026-06-24-engram-l5c-defrag.md</code></td>
+      <td><code>5a49f50</code></td>
+    </tr>
+    <tr>
+      <td><strong>L5d</strong></td>
+      <td>M3 complete</td>
+      <td>claimed_at (migration 000002) · ReapStaleJobs · reap runs before drain each round · §14 open question closed</td>
+      <td><code>2026-06-25-engram-l5d-stale-job-reaper-design.md</code></td>
+      <td><code>2026-06-25-engram-l5d-stale-job-reaper.md</code></td>
+      <td><code>342b208</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>1.2 Layer dependency graph</h3>
+
+<div class="figure">
+<!-- SVG layer dependency graph: hand-drawn, readable offline -->
+<svg viewBox="0 0 660 380" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L8,3.5 L0,7 Z" fill="#bf5e3c"/>
+    </marker>
+    <style>
+      .box { rx:10; ry:10; fill:#faf8f3; stroke:#e9e3d6; stroke-width:1.5; }
+      .box.accent { fill:#f4e6dd; stroke:#e7c9ba; }
+      .lbl { font-weight:650; fill:#201e18; font-size:13; }
+      .sub { fill:#7c766c; font-size:11.5; }
+      .edge { stroke:#bf5e3c; stroke-width:1.5; fill:none; marker-end:url(#arr); }
+    </style>
+  </defs>
+
+  <!-- L1 -->
+  <rect class="box accent" x="260" y="16" width="140" height="50"/>
+  <text class="lbl" x="330" y="38" text-anchor="middle">L1</text>
+  <text class="sub" x="330" y="55" text-anchor="middle">MemStore core</text>
+
+  <!-- L2 -->
+  <rect class="box" x="260" y="110" width="140" height="50"/>
+  <text class="lbl" x="330" y="132" text-anchor="middle">L2</text>
+  <text class="sub" x="330" y="149" text-anchor="middle">Agent loop + Session</text>
+
+  <!-- L3 -->
+  <rect class="box" x="80" y="204" width="140" height="50"/>
+  <text class="lbl" x="150" y="226" text-anchor="middle">L3</text>
+  <text class="sub" x="150" y="243" text-anchor="middle">SHA read cache</text>
+
+  <!-- L4 -->
+  <rect class="box" x="260" y="204" width="140" height="50"/>
+  <text class="lbl" x="330" y="226" text-anchor="middle">L4</text>
+  <text class="sub" x="330" y="243" text-anchor="middle">Hybrid search</text>
+
+  <!-- L4b -->
+  <rect class="box" x="260" y="300" width="140" height="50"/>
+  <text class="lbl" x="330" y="322" text-anchor="middle">L4b</text>
+  <text class="sub" x="330" y="339" text-anchor="middle">Index persistence</text>
+
+  <!-- L5a -->
+  <rect class="box" x="440" y="110" width="140" height="50"/>
+  <text class="lbl" x="510" y="132" text-anchor="middle">L5a</text>
+  <text class="sub" x="510" y="149" text-anchor="middle">GC + maint. worker</text>
+
+  <!-- L5b -->
+  <rect class="box accent" x="440" y="204" width="140" height="50"/>
+  <text class="lbl" x="510" y="226" text-anchor="middle">L5b</text>
+  <text class="sub" x="510" y="243" text-anchor="middle">Reflection + job consumer</text>
+
+  <!-- L5c -->
+  <rect class="box" x="440" y="300" width="140" height="50"/>
+  <text class="lbl" x="510" y="322" text-anchor="middle">L5c</text>
+  <text class="sub" x="510" y="339" text-anchor="middle">Defrag</text>
+
+  <!-- L5d — right of L5c, same row via note below -->
+  <!-- For clarity, L5d is drawn to the right of L5c -->
+
+  <!-- Edges -->
+  <!-- L1 → L2 -->
+  <line class="edge" x1="330" y1="66" x2="330" y2="108"/>
+  <!-- L1 → L3 (diagonal) -->
+  <path class="edge" d="M275,66 Q200,90 150,202"/>
+  <!-- L1 → L5a (diagonal) -->
+  <path class="edge" d="M385,66 Q460,80 510,108"/>
+  <!-- L2 → L3 -->
+  <path class="edge" d="M275,145 Q200,175 150,202"/>
+  <!-- L2 → L4 -->
+  <line class="edge" x1="330" y1="160" x2="330" y2="202"/>
+  <!-- L2 → L5a -->
+  <path class="edge" d="M400,135 Q450,145 440,135"/>
+  <!-- L4 → L4b -->
+  <line class="edge" x1="330" y1="254" x2="330" y2="298"/>
+  <!-- L5a → L5b -->
+  <line class="edge" x1="510" y1="160" x2="510" y2="202"/>
+  <!-- L4b → L5b -->
+  <path class="edge" d="M400,325 Q430,325 440,255"/>
+  <!-- L5b → L5c -->
+  <line class="edge" x1="510" y1="254" x2="510" y2="298"/>
+
+  <!-- L5d: small continuation note -->
+  <rect class="box" x="530" y="355" width="90" height="22" rx="6" ry="6"/>
+  <text class="sub" x="575" y="370" text-anchor="middle">→ L5d (reaper)</text>
+  <line class="edge" x1="545" y1="350" x2="560" y2="355"/>
+</svg>
+<p class="figcap">Layer dependency graph. L3 and L4/L4b are two independent optimization tracks (read acceleration vs. search) that converge at L5b's DrainJobs: the Reindex job requires both the persistent embedding cache (L4b) and the job-consumer infrastructure (L5b). L5c → L5d is a linear wrap-up.</p>
+</div>
+
+<div class="callout invariant">
+  <div class="tag">Core meta-decision</div>
+  <p>After every layer merges to main, <code>go build ./...</code> and a full <code>go test ./...</code> (including DB-backed tests, requires <code>ENGRAM_TEST_DB</code>) must be completely green before the next layer begins. No long-lived feature branches. No "test it once it's all integrated."</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     § 2  The process every layer goes through
+═══════════════════════════════════════════════════════════════ -->
+<h2><span class="n">2 ·</span> The process every layer goes through</h2>
+
+<p>Every layer follows the same five phases, in order, without skipping or shuffling steps. This isn't ceremony — each phase produces a concrete artifact (a file, a test, a commit), and the artifact has to exist before the phase counts as done.</p>
+
+<ol class="steps">
+  <li>
+    <span class="st">Brainstorming</span>
+    <span class="sd">Clarify use-case boundaries, interface shapes, and how the new layer relates to existing packages. Artifact: a Spec document under <code>docs/superpowers/specs/</code>. Every section must include an SVG or Mermaid diagram — prose-plus-code-block alone is not acceptable. The spec must be "readable offline" without depending on any external rendering service.</span>
+  </li>
+  <li>
+    <span class="st">Writing a plan</span>
+    <span class="sd">Once the spec is confirmed, break the implementation into bite-sized TDD tasks and store them in <code>docs/superpowers/plans/</code>. Each task's acceptance criterion must be "running that task's tests in isolation passes green" — "we'll test it together with the next task" is not allowed. Target task granularity: 30–90 minutes.</span>
+  </li>
+  <li>
+    <span class="st">Subagent-driven execution</span>
+    <span class="sd">Each task is dispatched to a fresh subagent with no prior session context to bleed through. TDD order is strict: write the test first (watch it fail), then write the implementation, then watch the test go green. Each task maps to exactly one <code>feat/fix/refactor/test</code> commit. Independent tasks can be dispatched concurrently to separate subagents.</span>
+  </li>
+  <li>
+    <span class="st">Two-phase review (spec compliance + code quality)</span>
+    <span class="sd">Phase 1: compliance check against the spec — does the implementation cover every design point, and do the interfaces match the diagrams? Phase 2: code-quality check — error propagation with <code>%w</code>, interface size, test coverage, edge cases. In practice these are usually combined into a single final review that produces a batch of fix/refactor commits before the merge.</span>
+  </li>
+  <li>
+    <span class="st">Local merge + branch deletion</span>
+    <span class="sd"><code>git merge --no-ff</code> preserves the layered history (each layer boundary is visible on the mainline), then the feature branch is deleted — no dangling refs. GitHub PR merges are deliberately avoided to prevent auto-squash from erasing commit granularity.</span>
+  </li>
+</ol>
+
+<h3>2.1 Coding rules (five hard constraints)</h3>
+
+<p>These five rules are spelled out explicitly in CLAUDE.md and checked item-by-item during the review phase:</p>
+
+<table>
+  <thead>
+    <tr><th>Rule</th><th>What it requires</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Tests first</strong></td>
+      <td>Write the test for a new interface, watch it fail, then write the implementation</td>
+      <td>Writing tests first forces you to nail down the interface contract before you code; tests written after tend to cover only the paths that already work</td>
+    </tr>
+    <tr>
+      <td><strong><code>%w</code> error wrapping</strong></td>
+      <td>All <code>fmt.Errorf</code> calls must use <code>%w</code>, never <code>%s</code></td>
+      <td>Callers can use <code>errors.Is</code>/<code>errors.As</code> to match precisely; <code>%s</code> turns the error into a string and destroys reachability</td>
+    </tr>
+    <tr>
+      <td><strong><code>context.Context</code> as first argument</strong></td>
+      <td>Every I/O function takes <code>ctx context.Context</code> as its first parameter</td>
+      <td>Timeout cancellation must be able to propagate; functions without a context almost always require a breaking interface change when they're wired up later</td>
+    </tr>
+    <tr>
+      <td><strong>Small interfaces</strong></td>
+      <td>Package boundaries expose only the minimal interface; internal implementation details do not leak</td>
+      <td>Small interfaces are easy to mock, easy to test, and easy to swap out; large interfaces introduce tight coupling across packages</td>
+    </tr>
+    <tr>
+      <td><strong>Table-driven tests</strong></td>
+      <td>Multi-scenario coverage uses <code>[]struct{name, input, want}</code> — no copy-pasted test functions</td>
+      <td>Adding a new test case is one extra struct literal; you don't have to duplicate the entire test function body</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     § 3  Bugs the review chain actually caught
+═══════════════════════════════════════════════════════════════ -->
+<h2><span class="n">3 ·</span> Bugs the review chain actually caught</h2>
+
+<p>The table below lists real defects captured during review or testing, each traceable to a fix commit. Every one of them was found and fixed before the merge — not in production.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Symptom</th>
+      <th>Root cause</th>
+      <th>Fix</th>
+      <th>Commit</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Connection pool lock leak</strong></td>
+      <td><code>WithGlobalLock</code>'s <code>defer unlock</code> used the caller-supplied <code>ctx</code> — if that context was already cancelled, the unlock SQL couldn't execute, leaving the advisory lock held permanently; when the connection was returned to the pool it still carried the lock, and the next borrower inherited it</td>
+      <td>Changed unlock to use <code>context.Background()</code>, fully decoupled from the caller's context lifetime</td>
+      <td><code>6f8c410</code></td>
+    </tr>
+    <tr>
+      <td><strong>Reflection self-triggering loop</strong></td>
+      <td>After Reflect committed a new commit, that commit enqueued a new reflect job in the same transaction; the new job triggered Reflect again, infinitely</td>
+      <td>Reflect's commit call passes <code>jobs=nil</code> — maintenance commits must never produce new maintenance jobs</td>
+      <td><code>9db0762</code></td>
+    </tr>
+    <tr>
+      <td><strong>Reflection writing back empty/partial content</strong></td>
+      <td>When reading a resident file failed, Reflect silently swallowed the error and continued, committing empty content as "consolidated"; or if the resident file was already empty, it still made an LLM call and committed the empty result, corrupting memory</td>
+      <td>Read errors now return immediately (not skipped); if resident content is empty, return early without making an LLM call</td>
+      <td><code>d601f50</code></td>
+    </tr>
+    <tr>
+      <td><strong>System cache caching partial content</strong></td>
+      <td><code>buildSystemContent</code>'s original signature returned no error; if reading a <code>system/</code> file failed mid-way, the already-read portion was written into the LRU cache as "complete content"</td>
+      <td>Signature changed to <code>(string, error)</code>; the cache is only written when <code>error == nil</code></td>
+      <td><code>63ad4cd</code></td>
+    </tr>
+    <tr>
+      <td><strong>Two env vars selecting different embedding models</strong></td>
+      <td><code>cmd/api</code> used <code>ENGRAM_PROVIDER</code> to select the embedder; <code>cmd/maintenance</code> used <code>ENGRAM_EMBEDDER</code> — both processes shared one ObjCache embedding store but used different models, causing vector-dimension conflicts and wasted embeddings</td>
+      <td><code>cmd/maintenance</code> unified to use <code>ENGRAM_EMBEDDER</code>; convention: both ends must use the same model when sharing the <code>ENGRAM_EMB_OBJ</code> path</td>
+      <td><code>3a37820</code></td>
+    </tr>
+    <tr>
+      <td><strong>Wrong convergence rationale in defrag comment</strong></td>
+      <td>A code comment said defrag decided whether to split based on "file size" (size-based); the actual <code>isSplittable</code> checks for multiple top-level headings — size-based logic cannot guarantee convergence (a small file with multiple headings would trigger repeatedly)</td>
+      <td>Comment corrected to describe structural convergence; confirmed <code>isSplittable</code> only returns true when there are multiple top-level headings (after splitting, each file has one — no further trigger)</td>
+      <td><code>9d1688c</code></td>
+    </tr>
+    <tr>
+      <td><strong>GC mistakenly sweeping the embedding store</strong></td>
+      <td>The global mark-and-sweep GC walks the objstore; the embedding cache's ObjCache and the main objstore can be configured with different root paths, but the GC lacked root-path discrimination and could identify embedding objects as unreachable orphans and delete them</td>
+      <td>Added a distinct-root guard: shared storage paths are only allowed when <code>filepath.Clean(ENGRAM_EMB_OBJ) != filepath.Clean(ENGRAM_OBJ)</code>; <code>cmd/maintenance</code> uses <code>filepath.Clean</code> for the comparison</td>
+      <td><code>25286b8</code></td>
+    </tr>
+    <tr>
+      <td><strong>Concurrent commits silently overwriting each other</strong></td>
+      <td>Session's early CAS-failure path directly overwrote HEAD with the local view instead of returning <code>ErrConflict</code> — a concurrent writer's commit was silently discarded</td>
+      <td>CAS failure now explicitly returns <code>ErrConflict</code>; Session catches it and retries up to a bounded number of times before surfacing the error</td>
+      <td><code>1d58581</code></td>
+    </tr>
+    <tr>
+      <td><strong>Read tool off-by-one: 0-based vs 1-based line numbers</strong></td>
+      <td>The recall tool returns 1-based line numbers (consistent with git diff / grep), but the read tool used 0-based offsets internally — the model passed recall's line numbers directly to read, landing one line off</td>
+      <td>Read tool changed to 1-based, consistent with recall and the ToolDef docs; test cases updated accordingly (<code>start=5</code> rather than <code>start=4</code>)</td>
+      <td><code>90c8b1d</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout gotcha">
+  <div class="tag">Pattern</div>
+  <p>Of the 9 bugs above, 3 of them (the advisory lock leak, the ENGRAM_EMBEDDER divergence, and the GC deleting embeddings) are <strong>cross-boundary integration defects</strong> — unit tests cover the behavior of a single function and cannot see the contract between two independent processes or two independent storage paths. This is direct evidence for why the two-phase review (spec compliance + code quality) cannot be skipped.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     § 4  How tests stay out of each other's way
+═══════════════════════════════════════════════════════════════ -->
+<h2><span class="n">4 ·</span> How tests stay out of each other's way</h2>
+
+<p>Postgres-dependent tests run concurrently under <code>go test ./...</code>. In early versions this produced intermittent flakes. The root cause: multiple <code>_test.go</code> files shared the same <code>refs</code> table, so one test's DELETE or assertion would race with another test's writes.</p>
+
+<p>The fix uses two strategies, each targeting a different class of operation:</p>
+
+<h3>4.1 Ordinary CRUD tests: per-test agent ID + scoped DELETE</h3>
+
+<p>For ordinary refs / MemStore tests (commit <code>d3f4bba</code>, merge <code>86f71dd</code>):</p>
+<ul>
+  <li>Each test generates a unique agent ID (<code>t.Name()</code> hash + random suffix), so no two concurrent tests ever touch the same row.</li>
+  <li>Cleanup DELETEs only the rows the test itself inserted (<code>WHERE agent_id = $1</code>) — never a <code>TRUNCATE</code> of the whole table.</li>
+  <li>All global <code>TRUNCATE</code> calls removed: truncating globally under concurrent tests wipes out rows another test is actively using.</li>
+</ul>
+
+<h3>4.2 Global-scan operations: per-test schema isolation</h3>
+
+<p>For operations like <code>ClaimJob</code> and <code>DrainJobs</code> that <strong>scan globally without an agent_id filter</strong>, scoped DELETE isn't enough. The scan sees pending jobs inserted by other tests and breaks "exactly N jobs claimed" assertions. The fix is per-test schema isolation:</p>
+<ul>
+  <li>Each test runs <code>SET search_path TO test_&lt;unique_name&gt;</code> inside a transaction, so all DDL and DML execute in an isolated schema.</li>
+  <li>Global scans (<code>SELECT ... FOR UPDATE SKIP LOCKED</code>) can only see rows in the same schema — data from other tests is completely invisible.</li>
+  <li>After the test completes, DROP SCHEMA CASCADE cleans up with no residue.</li>
+</ul>
+
+<div class="figure">
+<svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
+  <defs>
+    <style>
+      .box2 { rx:10; ry:10; }
+      .tbl { fill:#f4e6dd; stroke:#e7c9ba; stroke-width:1.5; }
+      .sch { fill:#eef2e6; stroke:#c4d4b2; stroke-width:1.5; }
+      .sep { stroke:#e9e3d6; stroke-width:1; stroke-dasharray:4,3; }
+    </style>
+  </defs>
+
+  <!-- Shared table approach (left) -->
+  <text x="130" y="22" text-anchor="middle" font-weight="650" fill="#bf5e3c" font-size="13.5">Shared table (before)</text>
+  <rect class="box2 tbl" x="60" y="34" width="140" height="40"/>
+  <text x="130" y="51" text-anchor="middle" fill="#201e18" font-weight="650">refs table</text>
+  <text x="130" y="67" text-anchor="middle" fill="#7c766c" font-size="11.5">global scope</text>
+
+  <!-- Test A and B both writing to same table -->
+  <rect class="box2" x="30" y="106" width="80" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="70" y="127" text-anchor="middle" fill="#7c766c" font-size="12">Test A</text>
+  <rect class="box2" x="140" y="106" width="80" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="180" y="127" text-anchor="middle" fill="#7c766c" font-size="12">Test B</text>
+  <line x1="70" y1="106" x2="110" y2="74" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="3,2"/>
+  <line x1="180" y1="106" x2="150" y2="74" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="3,2"/>
+  <text x="130" y="168" text-anchor="middle" fill="#a9741f" font-size="12">contention → flakes</text>
+
+  <!-- Divider -->
+  <line x1="250" y1="20" x2="250" y2="185" class="sep"/>
+
+  <!-- Schema-isolated approach (right) -->
+  <text x="430" y="22" text-anchor="middle" font-weight="650" fill="#5f7a4e" font-size="13.5">Schema isolation (after)</text>
+
+  <rect class="box2 sch" x="280" y="34" width="130" height="50"/>
+  <text x="345" y="53" text-anchor="middle" fill="#3a5c2e" font-weight="650" font-size="12.5">schema: test_A</text>
+  <text x="345" y="70" text-anchor="middle" fill="#7c766c" font-size="11">isolated refs / jobs tables</text>
+
+  <rect class="box2 sch" x="430" y="34" width="130" height="50"/>
+  <text x="495" y="53" text-anchor="middle" fill="#3a5c2e" font-weight="650" font-size="12.5">schema: test_B</text>
+  <text x="495" y="70" text-anchor="middle" fill="#7c766c" font-size="11">isolated refs / jobs tables</text>
+
+  <rect class="box2" x="295" y="110" width="70" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="330" y="131" text-anchor="middle" fill="#7c766c" font-size="12">Test A</text>
+  <rect class="box2" x="445" y="110" width="70" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="480" y="131" text-anchor="middle" fill="#7c766c" font-size="12">Test B</text>
+
+  <line x1="330" y1="110" x2="335" y2="84" stroke="#5f7a4e" stroke-width="1.5"/>
+  <line x1="480" y1="110" x2="475" y2="84" stroke="#5f7a4e" stroke-width="1.5"/>
+  <text x="430" y="168" text-anchor="middle" fill="#5f7a4e" font-size="12">invisible to each other → zero flakes</text>
+</svg>
+<p class="figcap">Left: old approach — multiple tests write to the same table and global scans interfere with each other. Right: new approach — tests that perform global operations each get their own schema; scans only see that test's own data.</p>
+</div>
+
+<div class="callout win">
+  <div class="tag">Result</div>
+  <p>After the isolation retrofit, <code>ENGRAM_TEST_DB="..." go test -race ./...</code> runs zero flakes across multiple consecutive runs. 29 test files across 10 packages execute concurrently — no <code>-p 1</code> serialization needed.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     § 5  Hard constraints (guardrails)
+═══════════════════════════════════════════════════════════════ -->
+<h2><span class="n">5 ·</span> Hard constraints (guardrails)</h2>
+
+<p>CLAUDE.md lists four design constraints that must never be violated. Each has a clear engineering rationale — these are not matters of taste.</p>
+
+<table>
+  <thead>
+    <tr><th>Constraint</th><th>Engineering rationale</th><th>Cost of violation</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>No Temporal / Kafka</strong></td>
+      <td>Maintenance jobs are idempotent, short (second-scale), and re-dispatchable; Postgres transactional enqueue already eliminates the outbox dual-write problem; the reconcile loop is sufficient; River is a drop-in for M5</td>
+      <td>Temporal/Kafka require independent ops overhead and independent health monitoring; net benefit is negative at agent-memory scale</td>
+    </tr>
+    <tr>
+      <td><strong>Objects are immutable</strong></td>
+      <td>Content-addressing means a hash always maps to the same content — the L3 LRU cache never needs invalidation; GC works by reachability; append-only writes are crash-safe</td>
+      <td>Any mutation breaks cache correctness, introduces invalidation complexity, and makes mark-and-sweep GC impossible</td>
+    </tr>
+    <tr>
+      <td><strong>Concurrency control lives only at the ref CAS</strong></td>
+      <td>A single serialization point keeps reasoning simple; all writers compete on one atomic operation, losers retry, no two-phase commit, no distributed lock protocol</td>
+      <td>A second concurrency control point introduces distributed transactions; deadlock probability grows exponentially</td>
+    </tr>
+    <tr>
+      <td><strong>system/ stays small; cache/index/working tree are derived views</strong></td>
+      <td>system/ is loaded into the LLM context every turn — bytes directly consume tokens; derived views can be rebuilt at any time, so a pod crash loses nothing</td>
+      <td>system/ bloat causes token explosion every round; treating the cache as primary storage means data loss on pod restart</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     § 6  Scale and current state
+═══════════════════════════════════════════════════════════════ -->
+<h2><span class="n">6 ·</span> Scale and current state</h2>
+
+<h3>6.1 Measured statistics</h3>
+
+<div class="cardgrid">
+  <div class="card">
+    <div class="num">Go packages</div>
+    <h3>10</h3>
+    <p><code>cmd/api</code> · <code>cmd/maintenance</code> · <code>internal/memstore</code> · <code>internal/memstore/objstore</code> · <code>internal/memstore/refs</code> · <code>internal/memstore/gitfs</code> · <code>internal/cache</code> · <code>internal/search</code> · <code>internal/agent</code> · <code>internal/maintenance</code></p>
+  </div>
+  <div class="card">
+    <div class="num">Source files (non-test)</div>
+    <h3>32</h3>
+    <p><code>find internal cmd -name '*.go' ! -name '*_test.go'</code><br/>Largest packages: <code>internal/search</code> (7 files), <code>internal/maintenance</code> (6 files)</p>
+  </div>
+  <div class="card">
+    <div class="num">Test files</div>
+    <h3>29</h3>
+    <p><code>find . -name '*_test.go'</code>; includes Postgres-backed integration tests, requires <code>ENGRAM_TEST_DB</code></p>
+  </div>
+  <div class="card">
+    <div class="num">DB migrations</div>
+    <h3>4 files</h3>
+    <p><code>000001_init</code> (refs + memory_jobs) · <code>000002_claimed_at</code> (L5d reaper)<br/>up + down for each</p>
+  </div>
+  <div class="card">
+    <div class="num">Layer merge commits</div>
+    <h3>10</h3>
+    <p>L1 · L2 · L3 · L4 · L4b · L5a · L5b · L5c · L5d + DB isolation, all <code>--no-ff</code></p>
+  </div>
+  <div class="card">
+    <div class="num">Total commits</div>
+    <h3>113</h3>
+    <p>Includes merge commits, feat/fix/refactor/test/docs — full history from scaffold to L5d</p>
+  </div>
+  <div class="card">
+    <div class="num">Runnable binaries</div>
+    <h3>2</h3>
+    <p><code>cmd/api</code> — request-path dev harness<br/><code>cmd/maintenance</code> — async maintenance worker</p>
+  </div>
+  <div class="card">
+    <div class="num">Spec + Plan docs</div>
+    <h3>9 + 9 = 18</h3>
+    <p>One spec and one plan per layer, in <code>docs/superpowers/specs/</code> and <code>docs/superpowers/plans/</code></p>
+  </div>
+</div>
+
+<h3>6.2 Milestone completion status</h3>
+
+<table>
+  <thead>
+    <tr><th>Milestone</th><th>Contents</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>M1 walking skeleton</td><td>MemStore + Agent loop + CAS commit</td><td><span class="pill ok">Done</span> L1 + L2</td></tr>
+    <tr><td>M2 read cache</td><td>SHA-keyed per-pod LRU</td><td><span class="pill ok">Done</span> L3</td></tr>
+    <tr><td>M3 maintenance worker</td><td>GC + reflection + defrag + stale reaper + reindex job</td><td><span class="pill ok">Done</span> L4b + L5a–L5d</td></tr>
+    <tr><td>M4 search</td><td>Trigram + semantic + RRF + persistent embedding cache</td><td><span class="pill ok">Done</span> L4 + L4b</td></tr>
+    <tr><td>M5 scale</td><td>River drop-in; warm per-agent sidecar; cross-tenant dedup</td><td><span class="pill run">Planned</span> River listed in A/B candidates; remainder awaits load-driven validation</td></tr>
+  </tbody>
+</table>
+
+<h3>6.3 The one intentionally deferred feature</h3>
+
+<p>The embedding store's <strong>eviction</strong> logic was intentionally deferred — not a technical gap, but a priority call:</p>
+<ul>
+  <li>Embeddings are a content-addressed derived view and can be fully rebuilt from HEAD via <code>maintenance.Reindex</code>.</li>
+  <li>At agent-memory scale, each agent's embedding store is small (Markdown text, a bounded number of embeddings).</li>
+  <li>Implementing LRU eviction would add complexity to ObjCache (access-time tracking, eviction policy design) that isn't worth investing in before there's a concrete need.</li>
+</ul>
+
+<div class="callout invariant">
+  <div class="tag">§14 open-question tracking</div>
+  <p>Of the 5 open questions listed in <code>architecture.md §14</code>, the <strong>stale-running job reaper</strong> was fully resolved in L5d (commit <code>950afe2</code>, documentation closed at <code>aa6a1a5</code>). The remaining 4 — index eventual-consistency window, cross-tenant dedup vs. isolation, reflection trigger policy, warm sidecar threshold — remain open, waiting for scale-driven requirements.</p>
+</div>
+
+<h3>6.4 §15 research A/B candidates</h3>
+
+<p>Deep research cross-validation in 2026 confirmed most of the design decisions. Two real optimization goals have already been implemented in the build, aligned with the research recommendations:</p>
+<ul>
+  <li><strong>Hybrid recall (§15.2)</strong>: L4 already implements trigram + semantic RRF fusion.</li>
+  <li><strong>Queue hygiene (§15.3)</strong>: L5b's SKIP LOCKED + no ORDER BY, plus L5d's stale reaper, correspond to the "operational leverage" recommendations; River is kept as an M5 drop-in.</li>
+</ul>
+<p>Storage layer alternatives (§15.4 Prolly Trees / lakeFS SSTable) and structured memory (§15.5 Zep/Graphiti) are preserved as A/B candidates; current scale does not require them.</p>
+
+</main>
+<footer>Engram deep dives · hand-built SVG/HTML, readable offline · based on the main branch (L1–L5d)</footer>
+</body></html>
