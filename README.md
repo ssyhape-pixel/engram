@@ -139,3 +139,9 @@ The designed roadmap (L1 → L5d) is complete and merged; the full suite passes
 (serialized) with the race detector clean on the concurrent packages. The one
 deliberately deferred piece is embedding-store eviction — embeddings are derived,
 rebuildable, and small, so there is no pressure yet.
+
+## License
+
+Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md): you may
+read it, learn from it, and use it for **non-commercial** purposes. **Commercial use is
+reserved** — reach out if you'd like a commercial license.
