@@ -1,5 +1,7 @@
 # Engram
 
+**English** · [简体中文](README.zh-CN.md)
+
 **A cloud-side, multi-tenant memory system for AI agents.**
 
 Engram gives every agent a versioned "notebook" it can read, search, and durably
