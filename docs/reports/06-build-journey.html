@@ -1,54 +1,51 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
+<!DOCTYPE html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Engram · 构建历程</title>
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
-</head>
-<body>
+</head><body>
 <nav class="topnav">
   <span class="brand">Engram</span>
-  <a href="index.html">总览索引</a>
-  <a href="01-architecture-overview.html">① 架构总览</a>
-  <a href="02-request-path.html">② 请求路径</a>
-  <a href="03-storage-consistency.html">③ 存储与一致性</a>
-  <a href="04-search-index.html">④ 搜索与索引</a>
-  <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>
-  <a href="06-build-journey.html" class="active">⑥ 构建历程</a>
+  <a href="index.html">索引</a>
+  <a href="01-architecture-overview.html">架构总览</a>
+  <a href="02-request-path.html">请求路径</a>
+  <a href="03-storage-consistency.html">存储与一致性</a>
+  <a href="04-search-index.html">搜索与索引</a>
+  <a href="05-maintenance-pipeline.html">维护管线</a>
+  <a href="06-build-journey.html" class="active">构建历程</a>
 </nav>
 <main>
 
-<h1>⑥ 构建历程与工程方法</h1>
-<p class="lead">Engram 如何从一行 scaffold 提交成长为一个包含 10 个 Go 包、32 个源文件、29 个测试文件、2 个可运行二进制的生产级系统——以及背后那套严格的 spec→plan→subagent→review 工程规程。</p>
-<p class="meta">基于 main 分支 L1–L5d · 2026-06</p>
+<h1>构建历程</h1>
+<p class="lead">Engram 从第一行 scaffold 提交走到如今 10 个包、32 个源文件、29 个测试文件、2 个可运行二进制的过程——以及那套驱动每一层的工程规程。</p>
+<p class="meta">基于 main 分支 L1–L5d · 113 次提交 · 2026-06</p>
 
 <!-- ═══════════════════════════════════════════════════════════════
-     § 1  路线图 M1–M5 与分层落地
+     § 1  一层层盖起来
 ═══════════════════════════════════════════════════════════════ -->
-<h2>1 · 路线图 M1–M5 与分层落地</h2>
+<h2><span class="n">1 ·</span> 一层层盖起来</h2>
 
-<p>CLAUDE.md 定义了 M1–M5 五个里程碑，目标从"走路骷架"到"规模化"。关键元决策是：<strong>架构瞄准 M5、但分层实现——每一层独立可验证（独立测试可跑绿，不依赖后层）</strong>。这让每次 merge 都是一个真实的、可发布的增量，而不是在大型分支里积累半成品。</p>
+<p>架构文档从第一天就瞄准 M5（规模化），但实现不是一次推进的。每一层进 main 后，构建和全量测试必须全绿，下一层才能开工。这样做的好处不只是"纪律感"——每次 merge 都是一个真实可发布的增量，没有大功能分支，没有"等整合完再测"的债。</p>
 
-<h3>1.1 里程碑与层级对应</h3>
+<h3>1.1 里程碑 × 分层对应</h3>
+
+<p>CLAUDE.md 定义五个里程碑：M1（走路骷架）→ M2（读缓存）→ M3（维护 worker）→ M4（搜索）→ M5（规模化）。实际落地分成 9 个可独立验证的层，加一次数据库测试隔离改造：</p>
 
 <table>
   <thead>
     <tr>
       <th>层</th>
       <th>里程碑</th>
-      <th>核心交付物</th>
-      <th>Spec 文件</th>
-      <th>Plan 文件</th>
-      <th>Merge commit</th>
+      <th>核心交付</th>
+      <th>Spec</th>
+      <th>Plan</th>
+      <th>Merge</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td><strong>L1</strong></td>
       <td>M1 走路骷架</td>
-      <td>ObjStore · gitfs Storer · Postgres refs CAS + job 队列 · MemStore</td>
+      <td>ObjStore · gitfs Storer · Postgres refs CAS · memory_jobs 队列 · MemStore</td>
       <td><code>2026-06-09-engram-l1-foundation-design.md</code></td>
       <td><code>2026-06-09-engram-l1-memstore-core.md</code></td>
       <td><code>c70e6af</code></td>
@@ -56,7 +53,7 @@
     <tr>
       <td><strong>L2</strong></td>
       <td>M1 完成</td>
-      <td>Router · Session · 工具集 (recall/read/edit) · FakeProvider · Anthropic provider · cmd/api</td>
+      <td>Router · Session · recall/read/edit 工具集 · FakeProvider · Anthropic provider · cmd/api</td>
       <td><code>2026-06-10-engram-l2-agent-loop-design.md</code></td>
       <td><code>2026-06-17-engram-l2-agent-loop.md</code></td>
       <td><code>5d29295</code></td>
@@ -72,7 +69,7 @@
     <tr>
       <td><strong>L4</strong></td>
       <td>M4 搜索</td>
-      <td>Trigram 行级倒排 · SemanticIndex (Voyage) · HybridSearch RRF 融合 · content-addressed embedding cache</td>
+      <td>Trigram 行级倒排 · SemanticIndex（Voyage） · HybridSearch RRF · content-addressed embedding cache</td>
       <td><code>2026-06-22-engram-l4-hybrid-search-design.md</code></td>
       <td><code>2026-06-22-engram-l4-hybrid-search.md</code></td>
       <td><code>80ebec6</code></td>
@@ -80,7 +77,7 @@
     <tr>
       <td><strong>L4b</strong></td>
       <td>M4 完成</td>
-      <td>ObjCache 持久化 embedding · Tiered cache · maintenance.Reindex · embedding cache 从 read cache 分离</td>
+      <td>ObjCache 持久 embedding · Tiered cache · maintenance.Reindex · embedding cache 与读 cache 分离</td>
       <td><code>2026-06-24-engram-l4b-index-persistence-design.md</code></td>
       <td><code>2026-06-24-engram-l4b-index-persistence.md</code></td>
       <td><code>6a9a3de</code></td>
@@ -96,7 +93,7 @@
     <tr>
       <td><strong>L5b</strong></td>
       <td>M3 完成</td>
-      <td>memory_jobs consumer (ClaimJob/CompleteJob/RetryJob) · Reflect LLM 整合 · DrainJobs · cmd 联通</td>
+      <td>memory_jobs consumer（ClaimJob/CompleteJob/RetryJob） · Reflect LLM 整合 · DrainJobs · cmd 联通</td>
       <td><code>2026-06-23-engram-l5b-reflection-jobqueue-design.md</code></td>
       <td><code>2026-06-23-engram-l5b-reflection-jobqueue.md</code></td>
       <td><code>49e0100</code></td>
@@ -112,7 +109,7 @@
     <tr>
       <td><strong>L5d</strong></td>
       <td>M3 完成</td>
-      <td>claimed_at (migration 000002) · ReapStaleJobs · 每轮 reap 先于 drain · §14 open question 关闭</td>
+      <td>claimed_at（migration 000002） · ReapStaleJobs · 每轮 reap 先于 drain · §14 open question 关闭</td>
       <td><code>2026-06-25-engram-l5d-stale-job-reaper-design.md</code></td>
       <td><code>2026-06-25-engram-l5d-stale-job-reaper.md</code></td>
       <td><code>342b208</code></td>
@@ -120,148 +117,238 @@
   </tbody>
 </table>
 
-<div class="callout invariant">
-  <div class="tag">核心元决策</div>
-  <p>每一层合并进 main 后，<code>go build ./...</code> 和全量 <code>go test ./...</code>（含数据库测试，需 <code>ENGRAM_TEST_DB</code>）必须全绿。下一层才能开始。没有"大功能分支"，没有"等整合完再测"。</p>
-</div>
-
 <h3>1.2 层依赖图</h3>
 
-<pre class="mermaid">
-graph TD
-    L1["L1<br/>MemStore core"]
-    L2["L2<br/>Agent loop + Session"]
-    L3["L3<br/>SHA read cache"]
-    L4["L4<br/>Hybrid search"]
-    L4b["L4b<br/>Index persistence"]
-    L5a["L5a<br/>GC + maintenance worker"]
-    L5b["L5b<br/>Reflection + job consumer"]
-    L5c["L5c<br/>Deterministic defrag"]
-    L5d["L5d<br/>Stale job reaper"]
+<div class="figure">
+<!-- SVG 分层依赖图：手工绘制，离线可读 -->
+<svg viewBox="0 0 660 380" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L8,3.5 L0,7 Z" fill="#bf5e3c"/>
+    </marker>
+    <style>
+      .box { rx:10; ry:10; fill:#faf8f3; stroke:#e9e3d6; stroke-width:1.5; }
+      .box.accent { fill:#f4e6dd; stroke:#e7c9ba; }
+      .lbl { font-weight:650; fill:#201e18; font-size:13; }
+      .sub { fill:#7c766c; font-size:11.5; }
+      .edge { stroke:#bf5e3c; stroke-width:1.5; fill:none; marker-end:url(#arr); }
+    </style>
+  </defs>
 
-    L1 --> L2
-    L1 --> L3
-    L2 --> L3
-    L2 --> L4
-    L4 --> L4b
-    L1 --> L5a
-    L5a --> L5b
-    L4b --> L5b
-    L5b --> L5c
-    L5c --> L5d
-</pre>
+  <!-- L1 -->
+  <rect class="box accent" x="260" y="16" width="140" height="50"/>
+  <text class="lbl" x="330" y="38" text-anchor="middle">L1</text>
+  <text class="sub" x="330" y="55" text-anchor="middle">MemStore core</text>
 
-<p>L3 和 L4/L4b 是并行发展的两条优化路线（读加速 vs 搜索），最终在 L5b 通过 DrainJobs 汇聚：Reindex 任务同时需要持久 embedding cache（L4b）和 job 消费者基础设施（L5b）。</p>
+  <!-- L2 -->
+  <rect class="box" x="260" y="110" width="140" height="50"/>
+  <text class="lbl" x="330" y="132" text-anchor="middle">L2</text>
+  <text class="sub" x="330" y="149" text-anchor="middle">Agent loop + Session</text>
+
+  <!-- L3 -->
+  <rect class="box" x="80" y="204" width="140" height="50"/>
+  <text class="lbl" x="150" y="226" text-anchor="middle">L3</text>
+  <text class="sub" x="150" y="243" text-anchor="middle">SHA read cache</text>
+
+  <!-- L4 -->
+  <rect class="box" x="260" y="204" width="140" height="50"/>
+  <text class="lbl" x="330" y="226" text-anchor="middle">L4</text>
+  <text class="sub" x="330" y="243" text-anchor="middle">Hybrid search</text>
+
+  <!-- L4b -->
+  <rect class="box" x="260" y="300" width="140" height="50"/>
+  <text class="lbl" x="330" y="322" text-anchor="middle">L4b</text>
+  <text class="sub" x="330" y="339" text-anchor="middle">Index persistence</text>
+
+  <!-- L5a -->
+  <rect class="box" x="440" y="110" width="140" height="50"/>
+  <text class="lbl" x="510" y="132" text-anchor="middle">L5a</text>
+  <text class="sub" x="510" y="149" text-anchor="middle">GC + maint. worker</text>
+
+  <!-- L5b -->
+  <rect class="box accent" x="440" y="204" width="140" height="50"/>
+  <text class="lbl" x="510" y="226" text-anchor="middle">L5b</text>
+  <text class="sub" x="510" y="243" text-anchor="middle">Reflection + job consumer</text>
+
+  <!-- L5c -->
+  <rect class="box" x="440" y="300" width="140" height="50"/>
+  <text class="lbl" x="510" y="322" text-anchor="middle">L5c</text>
+  <text class="sub" x="510" y="339" text-anchor="middle">Defrag</text>
+
+  <!-- L5d — right of L5c, same row via note below -->
+  <!-- For clarity, L5d is drawn to the right of L5c -->
+
+  <!-- Edges -->
+  <!-- L1 → L2 -->
+  <line class="edge" x1="330" y1="66" x2="330" y2="108"/>
+  <!-- L1 → L3 (diagonal) -->
+  <path class="edge" d="M275,66 Q200,90 150,202"/>
+  <!-- L1 → L5a (diagonal) -->
+  <path class="edge" d="M385,66 Q460,80 510,108"/>
+  <!-- L2 → L3 -->
+  <path class="edge" d="M275,145 Q200,175 150,202"/>
+  <!-- L2 → L4 -->
+  <line class="edge" x1="330" y1="160" x2="330" y2="202"/>
+  <!-- L2 → L5a -->
+  <path class="edge" d="M400,135 Q450,145 440,135"/>
+  <!-- L4 → L4b -->
+  <line class="edge" x1="330" y1="254" x2="330" y2="298"/>
+  <!-- L5a → L5b -->
+  <line class="edge" x1="510" y1="160" x2="510" y2="202"/>
+  <!-- L4b → L5b -->
+  <path class="edge" d="M400,325 Q430,325 440,255"/>
+  <!-- L5b → L5c -->
+  <line class="edge" x1="510" y1="254" x2="510" y2="298"/>
+
+  <!-- L5d: small continuation note -->
+  <rect class="box" x="530" y="355" width="90" height="22" rx="6" ry="6"/>
+  <text class="sub" x="575" y="370" text-anchor="middle">→ L5d (reaper)</text>
+  <line class="edge" x1="545" y1="350" x2="560" y2="355"/>
+</svg>
+<p class="figcap">层依赖图。L3 和 L4/L4b 是两条独立优化路线（读加速 vs 搜索），在 L5b 的 DrainJobs 汇合：Reindex 任务同时需要持久 embedding cache（L4b）和 job 消费者基础设施（L5b）。L5c → L5d 是线性收尾。</p>
+</div>
+
+<div class="callout invariant">
+  <div class="tag">核心元决策</div>
+  <p>每一层 merge 进 main 后，<code>go build ./...</code> 和全量 <code>go test ./...</code>（含数据库测试，需 <code>ENGRAM_TEST_DB</code>）必须全绿。下一层才能开始。没有"大功能分支"，没有"等整合完再测"。</p>
+</div>
 
 <!-- ═══════════════════════════════════════════════════════════════
-     § 2  工程规程：The Loop
+     § 2  每层都走的规程
 ═══════════════════════════════════════════════════════════════ -->
-<h2>2 · 工程规程（The Loop）</h2>
+<h2><span class="n">2 ·</span> 每层都走的规程</h2>
 
-<p>每一层的开发都严格遵循同一个五阶段循环，没有例外。</p>
+<p>每一层都经历相同的五个阶段。顺序从不跳过，阶段之间不随意切换。这不是仪式感——每个阶段有具体的产物（文件、测试、提交），产物存在才算完成。</p>
 
-<h3>2.1 五阶段循环</h3>
-
-<pre class="mermaid">
-flowchart LR
-    A["brainstorming<br/>意图 + 边界探索"]
-    B["writing-plans<br/>TDD 任务列表<br/>bite-sized 每任务单独可绿"]
-    C["subagent execution<br/>每任务新鲜子 agent<br/>test-red 到 test-green"]
-    D["spec-review + code-review<br/>合规审查 + 质量审查<br/>opus final pass"]
-    E["merge --no-ff<br/>删分支"]
-
-    A --> B --> C --> D --> E
-    E -->|"下一层"| A
-</pre>
-
-<p>各阶段要点：</p>
-
-<ul>
-  <li><strong>brainstorming（意图探索）</strong>：不急着写代码——先探清用例边界、接口形状、与已有包的关系。产物是一份 spec（<code>docs/superpowers/specs/</code>），每个 spec 章节必须含 Mermaid 架构图或时序图，不允许只有文字 + 代码片段。</li>
-  <li><strong>writing-plans（实现计划）</strong>：spec 确认后，把实现拆成一个个 bite-sized TDD 任务（<code>docs/superpowers/plans/</code>）。每个任务的验收条件是"这个任务单独跑测试可以绿"——不允许"等后面任务一起测"。</li>
-  <li><strong>subagent-driven execution（子 agent 执行）</strong>：每个任务派发给一个新鲜 subagent，没有前置会话上下文的干扰。TDD 顺序严格：先写测试（看着它失败），再写实现，再看测试变绿。每个任务对应独立的 <code>feat/fix/refactor/test</code> commit。</li>
-  <li><strong>两阶段审查</strong>：第一阶段 spec 合规审查（实现是否覆盖了 spec 的所有设计点），第二阶段代码质量审查（错误传播、%w 包装、接口大小、测试覆盖度）。通常合并为一次 opus 整体实现审查，产出一批 fix/refactor commit 然后才 merge。</li>
-  <li><strong>本地 <code>--no-ff</code> merge + 删分支</strong>：不用 GitHub PR 合并——本地执行，保留合并提交（主线可见分层历史），然后删除功能分支，不留悬空引用。</li>
-</ul>
-
-<h3>2.2 编码规范（TDD 五戒）</h3>
-
-<ol>
-  <li><strong>test first, watch it fail</strong> — 任何新接口都先写测试，先跑失败，再写实现。</li>
-  <li><strong><code>%w</code> 包装错误</strong> — 所有 <code>fmt.Errorf</code> 必须用 <code>%w</code>，上层可用 <code>errors.Is</code> / <code>errors.As</code> 精确匹配。</li>
-  <li><strong>context.Context 第一参数</strong> — 所有 I/O 函数第一参数为 <code>ctx context.Context</code>，无例外。</li>
-  <li><strong>小接口</strong> — 包边界只暴露最小接口；内部实现不泄漏到接口。</li>
-  <li><strong>表驱动测试</strong> — 多场景覆盖必须用 table-driven tests（<code>[]struct{name, input, want}</code>），不用大量重复函数。</li>
+<ol class="steps">
+  <li>
+    <span class="st">构思（brainstorming）</span>
+    <span class="sd">探清用例边界、接口形状、与已有包的关系。产物：<code>docs/superpowers/specs/</code> 下的 Spec 文档，每个章节都必须有 SVG 或 Mermaid 图——不允许只有文字加代码块。Spec 必须"离线可读"，不依赖任何外部渲染服务。</span>
+  </li>
+  <li>
+    <span class="st">写计划（writing-plans）</span>
+    <span class="sd">Spec 确认后，把实现拆成一个个 bite-sized TDD 任务，存入 <code>docs/superpowers/plans/</code>。每个任务的验收条件必须是"单独运行该任务的测试可以绿"——不允许"等后面任务一起测"。任务粒度以 30–90 分钟为目标。</span>
+  </li>
+  <li>
+    <span class="st">子 agent 执行（subagent-driven execution）</span>
+    <span class="sd">每个任务派发给一个新鲜 subagent，没有前置会话上下文的干扰。TDD 顺序严格：先写测试（看它失败），再写实现，再看测试变绿。每个任务对应一次独立的 <code>feat/fix/refactor/test</code> 提交。多个独立任务可以并发派发给不同 subagent。</span>
+  </li>
+  <li>
+    <span class="st">双重审查（spec-review + code-review）</span>
+    <span class="sd">第一阶段：对照 Spec 做合规检查（实现是否覆盖了所有设计点，接口是否与图表一致）。第二阶段：代码质量检查（错误传播 <code>%w</code>、接口大小、测试覆盖、边界条件）。通常合并为一次最终审查，产出一批 fix/refactor 提交，之后才 merge。</span>
+  </li>
+  <li>
+    <span class="st">本地 merge + 删分支</span>
+    <span class="sd"><code>git merge --no-ff</code> 保留分层历史（主线可见每层边界），然后删除功能分支，不留悬空引用。不用 GitHub PR 合并，避免自动 squash 抹去提交粒度。</span>
+  </li>
 </ol>
 
-<!-- ═══════════════════════════════════════════════════════════════
-     § 3  审查链抓到的真实 bug
-═══════════════════════════════════════════════════════════════ -->
-<h2>3 · 审查链抓到的真实 bug</h2>
+<h3>2.1 编码规范（五条死规矩）</h3>
 
-<p>以下是审查或测试阶段捕获的具有代表性的缺陷，均有对应 fix commit 可溯源。</p>
+<p>这五条规矩在 CLAUDE.md 中明确写出，在审查阶段会逐条核对：</p>
+
+<table>
+  <thead>
+    <tr><th>规矩</th><th>具体要求</th><th>为什么</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>测试先行</strong></td>
+      <td>新接口必须先写测试并看到失败，再写实现</td>
+      <td>测试先行逼迫你在写实现前想清楚接口契约，事后补测试往往只测已经工作的路径</td>
+    </tr>
+    <tr>
+      <td><strong><code>%w</code> 包装错误</strong></td>
+      <td>所有 <code>fmt.Errorf</code> 必须用 <code>%w</code>，不用 <code>%s</code></td>
+      <td>上层可以用 <code>errors.Is</code>/<code>errors.As</code> 精确匹配；<code>%s</code> 把错误变字符串，可达性丢失</td>
+    </tr>
+    <tr>
+      <td><strong><code>context.Context</code> 第一参数</strong></td>
+      <td>所有 I/O 函数第一参数为 <code>ctx context.Context</code></td>
+      <td>超时取消必须能传播；无 ctx 的函数在未来集成时几乎必然要破坏接口</td>
+    </tr>
+    <tr>
+      <td><strong>小接口</strong></td>
+      <td>包边界只暴露最小接口，内部实现不泄漏</td>
+      <td>小接口好 mock、好测试、好替换；接口太大在包间引入强耦合</td>
+    </tr>
+    <tr>
+      <td><strong>表驱动测试</strong></td>
+      <td>多场景覆盖用 <code>[]struct{name, input, want}</code>，不重复写函数</td>
+      <td>新增测试用例只加一行结构体，不用复制整个测试函数体</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     § 3  审查链真正抓到的坑
+═══════════════════════════════════════════════════════════════ -->
+<h2><span class="n">3 ·</span> 审查链真正抓到的坑</h2>
+
+<p>下表是审查或测试阶段捕获的真实缺陷，均有对应 fix commit 可溯源。每个都在真正 merge 之前被发现和修复——不是在生产里。</p>
 
 <table>
   <thead>
     <tr>
-      <th>缺陷描述</th>
-      <th>问题根因</th>
-      <th>修复方式</th>
+      <th>现象</th>
+      <th>根因</th>
+      <th>修法</th>
       <th>Commit</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td><strong>Advisory lock pooled-conn 泄漏</strong></td>
-      <td><code>WithGlobalLock</code> 的 defer unlock 使用了 request <code>ctx</code>——若 ctx 已被取消，unlock SQL 无法执行，锁永久持有，连接归还连接池后仍锁住</td>
-      <td>unlock 改用 <code>context.Background()</code>，与 caller ctx 生命周期解耦</td>
+      <td><strong>进程池连接锁泄漏</strong></td>
+      <td><code>WithGlobalLock</code> 的 <code>defer unlock</code> 用了 caller 传入的 <code>ctx</code>——若 ctx 已被取消，unlock SQL 无法执行，advisory lock 永久持有；连接归还连接池后仍带锁，下一个借用者继承了锁</td>
+      <td>unlock 改用 <code>context.Background()</code>，与 caller ctx 生命周期完全解耦</td>
       <td><code>6f8c410</code></td>
     </tr>
     <tr>
-      <td><strong>Reflection 自触发循环</strong></td>
-      <td>Reflect 完成后提交新 commit，提交时同事务入队新 reflect job，触发无限循环</td>
-      <td>Reflect 的 commit 调用必须传 <code>jobs=nil</code>，维护任务提交不产生新维护任务</td>
-      <td><code>f9db0762</code> (feat: Reflect)</td>
+      <td><strong>反思自我触发死循环</strong></td>
+      <td>Reflect 完成后提交新 commit；提交在同一事务入队新 reflect job；新 job 又触发 Reflect，无限循环</td>
+      <td>Reflect 的 commit 调用传 <code>jobs=nil</code>——维护任务提交必须不产生新维护任务</td>
+      <td><code>9db0762</code></td>
     </tr>
     <tr>
-      <td><strong>Reflect 提交空内容 / 传播读错误</strong></td>
-      <td>读 resident 文件失败时 Reflect 静默忽略错误继续执行，提交空内容造成记忆损坏；或将空 resident 提交为"整合后"内容</td>
+      <td><strong>反思把空/残缺内容写回</strong></td>
+      <td>读 resident 文件失败时 Reflect 静默忽略错误继续执行，把空内容提交为"整合后"内容；或 resident 本来就空，照样发起 LLM 调用然后提交空结果，损坏记忆</td>
       <td>读错误立即返回（不跳过）；resident 为空时直接 return，不发起 LLM 调用</td>
       <td><code>d601f50</code></td>
     </tr>
     <tr>
-      <td><strong>buildSystemContent 缓存部分内容</strong></td>
-      <td><code>buildSystemContent</code> 原始实现不返回 error；读取 system/ 文件时若中途失败，已读部分被缓存为"完整内容"</td>
-      <td>函数签名改为返回 <code>(string, error)</code>；缓存写入仅在无错误时进行</td>
+      <td><strong>系统缓存缓存了残缺内容</strong></td>
+      <td><code>buildSystemContent</code> 原始签名不返回 error；读 system/ 文件中途失败时，已读部分被写入 LRU 缓存，成为"完整内容"</td>
+      <td>函数签名改为 <code>(string, error)</code>；只在 error == nil 时写缓存</td>
       <td><code>63ad4cd</code></td>
     </tr>
     <tr>
-      <td><strong>ENGRAM_PROVIDER vs ENGRAM_EMBEDDER 模型发散</strong></td>
-      <td><code>cmd/api</code> 用 <code>ENGRAM_PROVIDER</code> 选 embedder，<code>cmd/maintenance</code> 用 <code>ENGRAM_EMBEDDER</code>——两个进程共享同一 ObjCache embedding store，但用了不同模型，产生向量维度冲突</td>
-      <td><code>cmd/maintenance</code> 统一改用 <code>ENGRAM_EMBEDDER</code>；两个二进制约定共享 <code>ENGRAM_EMB_OBJ</code> 路径时必须用同一模型</td>
+      <td><strong>两个环境变量选了不同向量模型</strong></td>
+      <td><code>cmd/api</code> 用 <code>ENGRAM_PROVIDER</code> 选 embedder，<code>cmd/maintenance</code> 用 <code>ENGRAM_EMBEDDER</code>——两个进程共享同一个 ObjCache embedding store，但用了不同模型，向量维度冲突，embedding 白存</td>
+      <td><code>cmd/maintenance</code> 统一改用 <code>ENGRAM_EMBEDDER</code>；约定共享 <code>ENGRAM_EMB_OBJ</code> 路径时两端必须用同一模型</td>
       <td><code>3a37820</code></td>
     </tr>
     <tr>
-      <td><strong>Defrag 收敛性注释错误</strong></td>
-      <td>代码注释说 defrag 按"文件大小"判断是否可拆分（size-based），实际是按"结构"（是否有多个顶级标题）——大小判断无法保证收敛，小文件多标题仍会反复触发</td>
-      <td>注释改为正确的 structural 收敛性描述；<code>isSplittable</code> 确认只在有多个顶级 heading 时返回 true（拆后每文件只有一个，不再触发）</td>
+      <td><strong>拆分收敛理由写错</strong></td>
+      <td>代码注释说 defrag 按"文件大小"判断是否可拆（size-based）；实际 <code>isSplittable</code> 是按"是否有多个顶级标题"——大小判断无法保证收敛（小文件多标题仍会反复触发）</td>
+      <td>注释改为正确的 structural 收敛性描述；确认 <code>isSplittable</code> 只在有多个顶级 heading 时返回 true（拆后每文件一个，不再触发）</td>
       <td><code>9d1688c</code></td>
     </tr>
     <tr>
-      <td><strong>GC 扫描误删 embedding store</strong></td>
-      <td>全局 mark-sweep GC 遍历对象存储时，embedding cache 的 ObjCache 与主 objstore 用了不同根路径，但 GC 缺少根路径区分，可能将 embedding 对象识别为不可达孤儿并删除</td>
-      <td>GC 流程增加 distinct-root guard：<code>filepath.Clean(ENGRAM_EMB_OBJ)</code> vs <code>filepath.Clean(ENGRAM_OBJ)</code> 不同时才允许共用存储路径；<code>harden(cmd/maintenance)</code> 用 <code>filepath.Clean</code> 比较</td>
+      <td><strong>GC 误扫向量库</strong></td>
+      <td>全局标记-清除 GC 遍历 objstore 时，embedding cache 的 ObjCache 与主 objstore 可能配置了不同根路径，但 GC 缺少根路径区分，会把 embedding 对象识别为不可达孤儿并删除</td>
+      <td>增加 distinct-root guard：只有 <code>filepath.Clean(ENGRAM_EMB_OBJ) != filepath.Clean(ENGRAM_OBJ)</code> 时才允许共用存储路径；<code>cmd/maintenance</code> 用 <code>filepath.Clean</code> 比较</td>
       <td><code>25286b8</code></td>
     </tr>
     <tr>
-      <td><strong>CAS conflict 被静默覆盖</strong></td>
-      <td>Session 早期实现在 CAS 失败时直接用本地视图覆盖 HEAD，不返回 <code>ErrConflict</code>——并发写者的提交会被无声丢弃</td>
-      <td>CAS 失败显式返回 <code>ErrConflict</code>；Session 捕获后重试（有上限），超出重试次数才报错</td>
+      <td><strong>提交撞车被静默覆盖</strong></td>
+      <td>Session 早期实现 CAS 失败时直接用本地视图覆盖 HEAD，不返回 <code>ErrConflict</code>——并发写者的提交被无声丢弃</td>
+      <td>CAS 失败显式返回 <code>ErrConflict</code>；Session 捕获后有上限次数重试，超出才报错</td>
       <td><code>1d58581</code></td>
     </tr>
     <tr>
-      <td><strong>read 工具 0-based vs 1-based 不一致</strong></td>
-      <td>recall 工具返回的行号是 1-based（与 git diff / grep 一致），但 read 工具内部使用 0-based 偏移——模型传入 recall 的行号直接传给 read 时差一行</td>
+      <td><strong>读工具行号 0-based vs 1-based</strong></td>
+      <td>recall 工具返回 1-based 行号（与 git diff / grep 一致），但 read 工具内部用 0-based 偏移——模型把 recall 的行号直接传给 read，差一行</td>
       <td>read 工具改为 1-based，与 recall、ToolDef 文档统一；测试用例同步修正（<code>start=5</code> 而非 <code>start=4</code>）</td>
       <td><code>90c8b1d</code></td>
     </tr>
@@ -270,33 +357,88 @@ flowchart LR
 
 <div class="callout gotcha">
   <div class="tag">规律</div>
-  <p>上表中有 3 个 bug（advisory lock 泄漏、ENGRAM_EMBEDDER 发散、GC 误删 embedding）是<strong>跨边界集成缺陷</strong>——单元测试无法发现，只有代码审查 + 集成测试才能抓到。这是两阶段审查规程存在的核心理由。</p>
+  <p>上面 9 个 bug 中，有 3 个（advisory lock 泄漏、ENGRAM_EMBEDDER 发散、GC 误删 embedding）是<strong>跨边界集成缺陷</strong>——单元测试覆盖的是单个函数的行为，无法感知两个独立进程或两个独立存储路径之间的约定。这是为什么两阶段审查（spec 合规 + 代码质量）不可省略的直接证据。</p>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════
-     § 4  测试隔离的故事
+     § 4  测试怎么互不打架
 ═══════════════════════════════════════════════════════════════ -->
-<h2>4 · 测试隔离的故事</h2>
+<h2><span class="n">4 ·</span> 测试怎么互不打架</h2>
 
 <p>Postgres 依赖测试在 <code>go test ./...</code> 并发执行时，早期版本存在间歇性 flake。根因是多个 <code>_test.go</code> 共享同一张 <code>refs</code> 表，某个测试的 DELETE 或断言会与其他测试的写入产生竞争。</p>
 
-<h3>4.1 方案 A：per-test 唯一 agent id + scoped DELETE</h3>
+<p>修复分两种策略，分别针对两类不同的操作：</p>
 
-<p>对于普通的 refs / MemStore 测试，修复方案（commit <code>d3f4bba</code>，merge <code>86f71dd</code>）是：</p>
+<h3>4.1 普通 CRUD 测试：per-test agent id + scoped DELETE</h3>
+
+<p>对于普通的 refs / MemStore 测试（commit <code>d3f4bba</code>，merge <code>86f71dd</code>）：</p>
 <ul>
-  <li>每个测试生成唯一 agent id（如 <code>t.Name()</code> 哈希 + 随机后缀），杜绝两个并发测试操作同一行。</li>
-  <li>测试结束后只 DELETE 自己插入的行（<code>WHERE agent_id = $1</code>），而不是 <code>TRUNCATE</code> 整张表。</li>
+  <li>每个测试生成唯一 agent id（<code>t.Name()</code> 哈希 + 随机后缀），杜绝两个并发测试操作同一行。</li>
+  <li>清理只 DELETE 自己插入的行（<code>WHERE agent_id = $1</code>），而不是 <code>TRUNCATE</code> 整张表。</li>
   <li>移除所有全局 <code>TRUNCATE</code>：全局清空在并发测试下会把其他测试正在使用的数据一并删除。</li>
 </ul>
 
-<h3>4.2 方案 B：全局队列操作的 per-test schema 隔离</h3>
+<h3>4.2 全局扫描类操作：per-test schema 隔离</h3>
 
-<p>对于 <code>ClaimJob</code>、<code>DrainJobs</code> 这类<strong>不带 agent_id 过滤的全局扫描</strong>，仅靠 scoped DELETE 不够——扫描会看到其他测试插入的 pending jobs，破坏"claimed exactly N jobs"的断言。修复方案是 per-test <strong>pgx search_path schema 隔离</strong>：</p>
+<p>对于 <code>ClaimJob</code>、<code>DrainJobs</code> 这类<strong>不带 agent_id 过滤的全局扫描</strong>，仅靠 scoped DELETE 不够。扫描会看到其他测试插入的 pending jobs，破坏"exactly N jobs claimed"的断言。修复方案是 per-test schema 隔离：</p>
 <ul>
   <li>每个测试在事务内执行 <code>SET search_path TO test_&lt;unique_name&gt;</code>，所有 DDL 和 DML 都在独立 schema 下运行。</li>
   <li>全局扫描（<code>SELECT ... FOR UPDATE SKIP LOCKED</code>）只能看到同 schema 内的行——不同测试的数据完全不可见。</li>
   <li>测试完成后 DROP SCHEMA CASCADE 清理，无残留。</li>
 </ul>
+
+<div class="figure">
+<svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
+  <defs>
+    <style>
+      .box2 { rx:10; ry:10; }
+      .tbl { fill:#f4e6dd; stroke:#e7c9ba; stroke-width:1.5; }
+      .sch { fill:#eef2e6; stroke:#c4d4b2; stroke-width:1.5; }
+      .sep { stroke:#e9e3d6; stroke-width:1; stroke-dasharray:4,3; }
+    </style>
+  </defs>
+
+  <!-- Shared table approach (left) -->
+  <text x="130" y="22" text-anchor="middle" font-weight="650" fill="#bf5e3c" font-size="13.5">共享表（旧）</text>
+  <rect class="box2 tbl" x="60" y="34" width="140" height="40"/>
+  <text x="130" y="51" text-anchor="middle" fill="#201e18" font-weight="650">refs table</text>
+  <text x="130" y="67" text-anchor="middle" fill="#7c766c" font-size="11.5">global scope</text>
+
+  <!-- Test A and B both writing to same table -->
+  <rect class="box2" x="30" y="106" width="80" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="70" y="127" text-anchor="middle" fill="#7c766c" font-size="12">Test A</text>
+  <rect class="box2" x="140" y="106" width="80" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="180" y="127" text-anchor="middle" fill="#7c766c" font-size="12">Test B</text>
+  <line x1="70" y1="106" x2="110" y2="74" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="3,2"/>
+  <line x1="180" y1="106" x2="150" y2="74" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="3,2"/>
+  <text x="130" y="168" text-anchor="middle" fill="#a9741f" font-size="12">竞争 → flake</text>
+
+  <!-- Divider -->
+  <line x1="250" y1="20" x2="250" y2="185" class="sep"/>
+
+  <!-- Schema-isolated approach (right) -->
+  <text x="430" y="22" text-anchor="middle" font-weight="650" fill="#5f7a4e" font-size="13.5">Schema 隔离（新）</text>
+
+  <rect class="box2 sch" x="280" y="34" width="130" height="50"/>
+  <text x="345" y="53" text-anchor="middle" fill="#3a5c2e" font-weight="650" font-size="12.5">schema: test_A</text>
+  <text x="345" y="70" text-anchor="middle" fill="#7c766c" font-size="11">独立 refs / jobs 表</text>
+
+  <rect class="box2 sch" x="430" y="34" width="130" height="50"/>
+  <text x="495" y="53" text-anchor="middle" fill="#3a5c2e" font-weight="650" font-size="12.5">schema: test_B</text>
+  <text x="495" y="70" text-anchor="middle" fill="#7c766c" font-size="11">独立 refs / jobs 表</text>
+
+  <rect class="box2" x="295" y="110" width="70" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="330" y="131" text-anchor="middle" fill="#7c766c" font-size="12">Test A</text>
+  <rect class="box2" x="445" y="110" width="70" height="32" fill="#fff" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="480" y="131" text-anchor="middle" fill="#7c766c" font-size="12">Test B</text>
+
+  <line x1="330" y1="110" x2="335" y2="84" stroke="#5f7a4e" stroke-width="1.5"/>
+  <line x1="480" y1="110" x2="475" y2="84" stroke="#5f7a4e" stroke-width="1.5"/>
+  <text x="430" y="168" text-anchor="middle" fill="#5f7a4e" font-size="12">互不可见 → 零 flake</text>
+</svg>
+<p class="figcap">左：旧方案，多个测试写同一张表，全局扫描互相干扰。右：新方案，全局操作测试用独立 schema，扫描只看到本测试的数据。</p>
+</div>
 
 <div class="callout win">
   <div class="tag">成果</div>
@@ -304,57 +446,57 @@ flowchart LR
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════
-     § 4b  守则 (Guardrails)
+     § 5  几条铁律（守则）
 ═══════════════════════════════════════════════════════════════ -->
-<h2>4b · 守则（Guardrails）</h2>
+<h2><span class="n">5 ·</span> 几条铁律（守则）</h2>
 
-<p>CLAUDE.md 列出了四条不得违反的设计约束，每条都有工程理由。</p>
+<p>CLAUDE.md 列出了四条不得违反的设计约束，每条背后都有明确的工程推导，不是品味问题。</p>
 
 <table>
   <thead>
-    <tr><th>守则</th><th>工程理由</th><th>如果违反会怎样</th></tr>
+    <tr><th>守则</th><th>工程理由</th><th>违反的代价</th></tr>
   </thead>
   <tbody>
     <tr>
-      <td><strong>不加 Temporal / Kafka</strong></td>
-      <td>维护任务幂等、短小（秒级）、可重派；Postgres 同事务入队已消除 outbox 双写问题；reconcile loop 足够；River 是现成 drop-in（M5 计划）</td>
-      <td>引入 Temporal/Kafka 需独立运维，比 Postgres 更重，在 Agent 记忆规模下净收益为负</td>
+      <td><strong>不上 Temporal / Kafka</strong></td>
+      <td>维护任务幂等、短小（秒级）、可重派；Postgres 同事务入队已消除 outbox 双写；reconcile loop 已够用；River 是 M5 级的 drop-in</td>
+      <td>引入 Temporal/Kafka 需独立运维、独立健康监控，在 Agent 记忆规模下净收益为负</td>
     </tr>
     <tr>
-      <td><strong>不可变对象</strong></td>
-      <td>内容寻址 = 哈希 → 内容的映射永远不变 = 缓存永不失效（L3 LRU 无需 invalidation）；GC 靠可达性判断；append-only 写入崩溃安全</td>
+      <td><strong>对象不可变</strong></td>
+      <td>内容寻址 = 哈希永远映射同一内容 = 缓存永不失效（L3 LRU 无需 invalidation）；GC 靠可达性判断；append-only 写入崩溃安全</td>
       <td>任何 mutation 破坏缓存正确性，引入 invalidation 复杂度，GC 无法做简单标记-清除</td>
     </tr>
     <tr>
       <td><strong>并发控制只有 ref CAS 一个点</strong></td>
       <td>单一序列化点使推理简单；所有写者在同一个原子操作竞争，输者重试，无两阶段提交、无分布式锁协议</td>
-      <td>第二个并发控制点引入分布式事务，概率指数级增长的"两者都持有、等对方"死锁</td>
+      <td>第二个并发控制点引入分布式事务，死锁概率指数级增长</td>
     </tr>
     <tr>
-      <td><strong>system/ 保持精小；缓存/索引/工作树是派生视图</strong></td>
-      <td>system/ 每轮推理必须塞进 LLM 上下文，字节直接消耗 token；派生视图可随时重建，Pod 崩溃不丢数据，真相只在 objstore + Postgres</td>
-      <td>system/ 膨胀导致每轮 token 爆炸；把缓存当主存会在 Pod 重启时丢数据</td>
+      <td><strong>system/ 精小；缓存/索引/工作树是派生视图</strong></td>
+      <td>system/ 每轮推理必须塞进 LLM 上下文，字节直接消耗 token；派生视图可随时重建，Pod 崩溃不丢数据</td>
+      <td>system/ 膨胀导致每轮 token 爆炸；把缓存当主存在 Pod 重启时丢数据</td>
     </tr>
   </tbody>
 </table>
 
 <!-- ═══════════════════════════════════════════════════════════════
-     § 5  规模与状态
+     § 6  规模与现状
 ═══════════════════════════════════════════════════════════════ -->
-<h2>5 · 规模与当前状态</h2>
+<h2><span class="n">6 ·</span> 规模与现状</h2>
 
-<h3>5.1 代码规模统计</h3>
+<h3>6.1 实测统计</h3>
 
 <div class="cardgrid">
   <div class="card">
-    <div class="num">Go packages</div>
+    <div class="num">Go 包</div>
     <h3>10</h3>
-    <p>含 <code>cmd/api</code>、<code>cmd/maintenance</code>、<code>internal/memstore</code>、<code>internal/memstore/objstore</code>、<code>internal/memstore/refs</code>、<code>internal/memstore/gitfs</code>、<code>internal/cache</code>、<code>internal/search</code>、<code>internal/agent</code>、<code>internal/maintenance</code></p>
+    <p><code>cmd/api</code> · <code>cmd/maintenance</code> · <code>internal/memstore</code> · <code>internal/memstore/objstore</code> · <code>internal/memstore/refs</code> · <code>internal/memstore/gitfs</code> · <code>internal/cache</code> · <code>internal/search</code> · <code>internal/agent</code> · <code>internal/maintenance</code></p>
   </div>
   <div class="card">
     <div class="num">源文件（非测试）</div>
     <h3>32</h3>
-    <p><code>find internal cmd -name '*.go' ! -name '*_test.go'</code></p>
+    <p><code>find internal cmd -name '*.go' ! -name '*_test.go'</code><br/>最大包：<code>internal/search</code>（7 文件）、<code>internal/maintenance</code>（6 文件）</p>
   </div>
   <div class="card">
     <div class="num">测试文件</div>
@@ -363,55 +505,69 @@ flowchart LR
   </div>
   <div class="card">
     <div class="num">DB migrations</div>
-    <h3>2 版本 / 4 文件</h3>
-    <p><code>000001_init</code>（refs + memory_jobs）· <code>000002_claimed_at</code>（L5d reaper）<br/>up + down 各一份，共 4 文件</p>
+    <h3>4 文件</h3>
+    <p><code>000001_init</code>（refs + memory_jobs）· <code>000002_claimed_at</code>（L5d reaper）<br/>up + down 各一份</p>
   </div>
   <div class="card">
     <div class="num">分层 merge 提交</div>
-    <h3>10</h3>
-    <p>L1 · L2 · L3 · L4 · L4b · L5a · L5b · L5c · L5d + DB 测试隔离，均 <code>--no-ff</code></p>
+    <h3>10 次</h3>
+    <p>L1 · L2 · L3 · L4 · L4b · L5a · L5b · L5c · L5d + DB 隔离，均 <code>--no-ff</code></p>
+  </div>
+  <div class="card">
+    <div class="num">总提交数</div>
+    <h3>113</h3>
+    <p>含 merge 提交、feat/fix/refactor/test/docs，从 scaffold 到 L5d 全过程</p>
   </div>
   <div class="card">
     <div class="num">可运行二进制</div>
     <h3>2</h3>
-    <p><code>cmd/api</code>（请求路径 dev harness）<br/><code>cmd/maintenance</code>（异步维护 worker）</p>
+    <p><code>cmd/api</code> — 请求路径 dev harness<br/><code>cmd/maintenance</code> — 异步维护 worker</p>
+  </div>
+  <div class="card">
+    <div class="num">Spec + Plan 文档</div>
+    <h3>9 + 9 = 18</h3>
+    <p>每层一份 spec、一份 plan，存于 <code>docs/superpowers/specs/</code> 和 <code>docs/superpowers/plans/</code></p>
   </div>
 </div>
 
-<h3>5.2 里程碑完成状态</h3>
+<h3>6.2 里程碑完成状态</h3>
 
 <table>
   <thead>
     <tr><th>里程碑</th><th>内容</th><th>状态</th></tr>
   </thead>
   <tbody>
-    <tr><td>M1 走路骷架</td><td>MemStore + Agent loop + CAS commit</td><td>✓ 完成（L1+L2）</td></tr>
-    <tr><td>M2 读缓存</td><td>SHA-keyed per-pod LRU</td><td>✓ 完成（L3）</td></tr>
-    <tr><td>M3 维护 worker</td><td>GC + reflection + defrag + stale reaper + reindex job</td><td>✓ 完成（L4b+L5a–L5d）</td></tr>
-    <tr><td>M4 搜索</td><td>Trigram + semantic + RRF + 持久 embedding cache</td><td>✓ 完成（L4+L4b）</td></tr>
-    <tr><td>M5 规模化</td><td>River drop-in；warm per-agent sidecar；跨 tenant dedup</td><td>⟳ 计划中（River 已列入 A/B；其余待负载验证）</td></tr>
+    <tr><td>M1 走路骷架</td><td>MemStore + Agent loop + CAS commit</td><td><span class="pill ok">完成</span> L1 + L2</td></tr>
+    <tr><td>M2 读缓存</td><td>SHA-keyed per-pod LRU</td><td><span class="pill ok">完成</span> L3</td></tr>
+    <tr><td>M3 维护 worker</td><td>GC + reflection + defrag + stale reaper + reindex job</td><td><span class="pill ok">完成</span> L4b + L5a–L5d</td></tr>
+    <tr><td>M4 搜索</td><td>Trigram + semantic + RRF + 持久 embedding cache</td><td><span class="pill ok">完成</span> L4 + L4b</td></tr>
+    <tr><td>M5 规模化</td><td>River drop-in；warm per-agent sidecar；跨租户 dedup</td><td><span class="pill run">计划中</span> River 已列入 A/B；其余待负载验证</td></tr>
   </tbody>
 </table>
 
-<h3>5.3 唯一延期的功能项</h3>
+<h3>6.3 唯一有意推迟的功能</h3>
 
-<p>Embedding store 的<strong>驱逐（eviction）</strong>逻辑被有意推迟——不是技术问题，而是优先级决策：embedding 是内容寻址的派生视图，可从 HEAD 全量重建（maintenance.Reindex），且在 Agent 记忆规模下体积很小。实现 LRU 驱逐会增加实现复杂度，在需求出现前不值得。</p>
+<p>Embedding store 的<strong>驱逐（eviction）</strong>逻辑被有意推迟，不是技术问题，而是优先级决策：</p>
+<ul>
+  <li>Embedding 是内容寻址的派生视图，可从 HEAD 全量重建（<code>maintenance.Reindex</code>）。</li>
+  <li>在 Agent 记忆规模下，每个 agent 的 embedding store 体积很小（Markdown 文本，embedding 数量有限）。</li>
+  <li>实现 LRU 驱逐会增加 ObjCache 的复杂度（需要跟踪访问时间、设计驱逐策略），在需求出现前不值得投入。</li>
+</ul>
 
 <div class="callout invariant">
-  <div class="tag">§14 开放问题追踪结果</div>
-  <p><code>architecture.md §14</code> 列出的 5 个开放问题中，<strong>stale-running job reaper</strong> 已在 L5d 完整解决（commit <code>950afe2</code>，doc 关闭 <code>aa6a1a5</code>）。其余 4 个（index 最终一致性窗口、跨租户去重 vs 隔离、reflection 触发策略、warm sidecar 阈值）保持开放，等规模化需求驱动。</p>
+  <div class="tag">§14 开放问题追踪</div>
+  <p><code>architecture.md §14</code> 列出的 5 个开放问题中，<strong>stale-running job reaper</strong> 已在 L5d 完整解决（commit <code>950afe2</code>，文档关闭 <code>aa6a1a5</code>）。其余 4 个——index 最终一致性窗口、跨租户去重 vs 隔离、reflection 触发策略、warm sidecar 阈值——保持开放，等规模化需求驱动。</p>
 </div>
 
-<h3>5.4 §15 研究 A/B 候选项</h3>
+<h3>6.4 §15 研究 A/B 候选项</h3>
 
-<p>2026 年深度研究交叉验证了大部分设计决策（validated 3-0）。两个真实优化目标已在构建中实现：</p>
+<p>2026 年深度研究交叉验证了大部分设计决策。两个真实优化目标已在构建中实现，与研究推荐方向一致：</p>
 <ul>
-  <li><strong>混合召回（§15.2）</strong>：L4 已实现 trigram + semantic RRF fusion，与研究推荐方向一致。</li>
+  <li><strong>混合召回（§15.2）</strong>：L4 已实现 trigram + semantic RRF fusion。</li>
   <li><strong>队列卫生（§15.3）</strong>：L5b 的 SKIP LOCKED + 无 ORDER BY + L5d 的 stale reaper 对应"操作杠杆"建议；River 保留为 M5 drop-in。</li>
 </ul>
 <p>存储底层（§15.4 Prolly Trees / lakeFS SSTable）和结构化记忆（§15.5 Zep/Graphiti）作为 A/B 候选项保留，当前规模不需要。</p>
 
 </main>
-<footer>Engram 深入解析报告 · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
-</body>
-</html>
+<footer>Engram 深入解析 · 手工 SVG/HTML 图表，离线可读 · 基于 main 分支 L1–L5d</footer>
+</body></html>

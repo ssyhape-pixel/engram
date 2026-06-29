@@ -3,125 +3,166 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Engram · 深入解析报告</title>
+<title>Engram · 深入解析</title>
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
 </head>
 <body>
 <nav class="topnav">
   <span class="brand">Engram</span>
-  <a href="index.html" class="active">总览索引</a>
-  <a href="01-architecture-overview.html">① 架构总览</a>
-  <a href="02-request-path.html">② 请求路径</a>
-  <a href="03-storage-consistency.html">③ 存储与一致性</a>
-  <a href="04-search-index.html">④ 搜索与索引</a>
-  <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>
-  <a href="06-build-journey.html">⑥ 构建历程</a>
+  <a href="index.html" class="active">索引</a>
+  <a href="01-architecture-overview.html">架构总览</a>
+  <a href="02-request-path.html">请求路径</a>
+  <a href="03-storage-consistency.html">存储与一致性</a>
+  <a href="04-search-index.html">搜索与索引</a>
+  <a href="05-maintenance-pipeline.html">维护管线</a>
+  <a href="06-build-journey.html">构建历程</a>
 </nav>
 <main>
-  <h1>Engram 深入解析报告</h1>
-  <p class="lead">一座云端多租户 agent 记忆系统的完整剖析 —— 从内容寻址对象到后台维护管线。</p>
-  <p class="meta">基于 <code>main</code> 分支 · L1–L5d 全部实现并合并 · 生成于 2026-06</p>
+  <h1>Engram 深入解析</h1>
+  <p class="lead">一座给 AI agent 用的"云端记忆系统"是怎么从零长出来的——从一块块不可变的存储,到在后台默默整理记忆的工人。</p>
+  <p class="meta">基于 <code>main</code> 分支 · 九层全部实现并合并 · 六份报告 + 本索引</p>
 
-  <p>Engram 把一套 git 风格的「记忆文件系统」搬到服务端：<strong>内容寻址的不可变对象</strong> + <strong>Postgres 上对 <code>agent_id→HEAD</code> 的 CAS</strong> + <strong>无状态计算</strong>。每个 agent 拥有一个版本化的记忆仓库，由无状态 worker 服务；agent 能读取常驻记忆、按需召回长尾、跨会话持久地编辑记忆。设计刻意轻量——不上 Temporal、不上 Kafka——一切并发与一致性都汇聚到那一个 ref CAS 上。</p>
+  <p>想象每个 AI agent 都有一本只属于它的笔记本。它能随时翻看常驻的几页要点,需要时再去翻长尾的细节,还能把新学到的东西<strong>持久地写回去</strong>,下次开机依然记得。Engram 就是在服务端给成千上万个 agent 提供这种笔记本的系统。</p>
 
-  <blockquote>核心一句话：<strong>记忆是主动式（agentic）的，不是 RAG。</strong>推理前只装载常驻 <code>system/</code> + 一份廉价的树索引（文件名 + 描述）；长尾由模型在循环中通过 recall/read 工具自行拉取。</blockquote>
+  <p>它的做法刻意简单:<strong>写进去的每一块内容都不可更改</strong>(要改就写一块新的),而"这本笔记现在翻到第几页"这唯一会变的指针,放在一个数据库里、用一把"改之前先确认没人动过"的小锁守着。其余一切——缓存、搜索索引、工作副本——都是<strong>可以随时丢掉重算</strong>的派生物。整套系统因此能保持无状态、可水平扩展,却又强一致。</p>
+
+  <blockquote>一句话抓住灵魂:<strong>记忆是"主动去取"的,不是"一股脑塞给模型"的。</strong>开口推理前只装载常驻要点和一份薄薄的目录;真正的细节,由模型在思考过程中自己决定要不要去翻。</blockquote>
+
+  <figure class="figure">
+    <svg viewBox="0 0 680 452" font-family="ui-sans-serif, -apple-system, system-ui, sans-serif" aria-label="Engram 系统全景">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#bf5e3c"/>
+        </marker>
+        <marker id="ahg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#b6ada0"/>
+        </marker>
+      </defs>
+
+      <!-- Zone 1: request path -->
+      <text x="28" y="34" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">① 请求路径</text>
+      <rect x="20" y="42" width="404" height="92" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <rect x="34" y="66" width="78" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="73" y="93" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">客户端</text>
+      <rect x="150" y="66" width="124" height="44" rx="10" fill="#f4e6dd" stroke="#e7c9ba"/>
+      <text x="212" y="86" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">Router · Session</text>
+      <text x="212" y="101" text-anchor="middle" font-size="10.5" fill="#7c766c">单写者 · 跑 agent 循环</text>
+      <rect x="332" y="66" width="78" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="371" y="93" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">LLM</text>
+      <line x1="112" y1="88" x2="148" y2="88" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#ah)"/>
+      <line x1="274" y1="88" x2="330" y2="88" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#ah)"/>
+
+      <!-- Zone 2: read accelerators -->
+      <text x="448" y="34" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">② 读加速器</text>
+      <rect x="440" y="42" width="220" height="92" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <rect x="454" y="66" width="92" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="500" y="86" text-anchor="middle" font-size="12.5" font-weight="600" fill="#201e18">读缓存</text>
+      <text x="500" y="101" text-anchor="middle" font-size="10.5" fill="#7c766c">按内容指纹</text>
+      <rect x="554" y="66" width="92" height="44" rx="10" fill="#ffffff" stroke="#ddd5c5"/>
+      <text x="600" y="86" text-anchor="middle" font-size="12.5" font-weight="600" fill="#201e18">搜索</text>
+      <text x="600" y="101" text-anchor="middle" font-size="10.5" fill="#7c766c">本地索引</text>
+      <line x1="424" y1="100" x2="438" y2="100" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+
+      <!-- Zone 3: canonical store -->
+      <text x="28" y="178" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">③ 权威存储</text>
+      <rect x="20" y="186" width="640" height="86" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <rect x="38" y="210" width="290" height="48" rx="10" fill="#f4e6dd" stroke="#e7c9ba"/>
+      <text x="183" y="231" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">对象存储</text>
+      <text x="183" y="247" text-anchor="middle" font-size="10.5" fill="#7c766c">内容寻址 · 不可变 · 可去重/可 GC</text>
+      <rect x="352" y="210" width="290" height="48" rx="10" fill="#f4e6dd" stroke="#e7c9ba"/>
+      <text x="497" y="231" text-anchor="middle" font-size="13" font-weight="600" fill="#201e18">Postgres</text>
+      <text x="497" y="247" text-anchor="middle" font-size="10.5" fill="#7c766c">唯一可变指针 HEAD（CAS）+ 任务队列</text>
+
+      <!-- Zone 4: maintenance -->
+      <text x="28" y="316" font-size="12.5" font-weight="700" fill="#9d4a2d" letter-spacing=".04em">④ 维护 worker · 每轮</text>
+      <rect x="20" y="324" width="640" height="104" rx="14" fill="#fcfbf7" stroke="#e9e3d6"/>
+      <g font-size="12.5" font-weight="600" fill="#201e18">
+        <rect x="40" y="360" width="120" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="100" y="385" text-anchor="middle">GC 回收</text>
+        <rect x="192" y="360" width="120" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="252" y="385" text-anchor="middle">回收卡死任务</text>
+        <rect x="344" y="360" width="120" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="404" y="385" text-anchor="middle">扫描碎片</text>
+        <rect x="496" y="360" width="144" height="40" rx="10" fill="#ffffff" stroke="#ddd5c5"/><text x="568" y="385" text-anchor="middle">消化任务队列</text>
+      </g>
+      <line x1="160" y1="380" x2="190" y2="380" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+      <line x1="312" y1="380" x2="342" y2="380" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+      <line x1="464" y1="380" x2="494" y2="380" stroke="#b6ada0" stroke-width="1.4" marker-end="url(#ahg)"/>
+
+      <!-- cross-zone flows -->
+      <line x1="200" y1="134" x2="200" y2="208" stroke="#bf5e3c" stroke-width="1.7" marker-end="url(#ah)"/>
+      <text x="208" y="174" font-size="11" fill="#9d4a2d">先写对象，再 CAS 改 HEAD（同一事务）</text>
+      <line x1="540" y1="272" x2="540" y2="322" stroke="#bf5e3c" stroke-width="1.7" marker-end="url(#ah)"/>
+      <text x="548" y="300" font-size="11" fill="#9d4a2d">提交成功才入队任务</text>
+      <path d="M 360 358 C 320 320, 300 300, 240 262" fill="none" stroke="#b6ada0" stroke-width="1.5" marker-end="url(#ahg)"/>
+      <text x="250" y="318" font-size="11" fill="#7c766c">整理结果写回（仍是新对象 + CAS）</text>
+    </svg>
+    <figcaption>四个区各司其职:请求路径在前台跑 agent;权威存储是唯一的事实来源;读加速器和维护 worker 都只是它的派生与照料,可随时重建。</figcaption>
+  </figure>
 
   <h2>六份报告</h2>
   <div class="cardgrid">
     <div class="card">
-      <div class="num">报告 ①</div>
+      <div class="num">报告一</div>
       <h3><a href="01-architecture-overview.html">架构总览</a></h3>
-      <p>四个区、三条核心不变量、端到端数据流、关键设计决策、L1–L5d 分层地图。先读这份建立全局观。</p>
+      <p>四个区、三条贯穿全局的规矩、一次请求到一次提交的完整链路、为什么不上那些重型中间件。先读这份建立全局观。</p>
     </div>
     <div class="card">
-      <div class="num">报告 ②</div>
+      <div class="num">报告二</div>
       <h3><a href="02-request-path.html">请求路径</a></h3>
-      <p>Router 单写者锁、Session 多轮生命周期、上下文装配、recall/read/edit 工具、LLMProvider 抽象、提交与 CAS 冲突处理。</p>
+      <p>一个 agent 同时只有一个写者:进程内的小锁、跨机器的兜底、模型怎么"自己去翻"记忆、提交撞车了怎么办。</p>
     </div>
     <div class="card">
-      <div class="num">报告 ③</div>
+      <div class="num">报告三</div>
       <h3><a href="03-storage-consistency.html">存储与一致性</a></h3>
-      <p>系统的心脏：内容寻址对象模型、go-git Storer over ObjStore、ref CAS 单序列化点、「提交即一个 Postgres 事务」、GC 可达性 mark-sweep + 龄期宽限。</p>
+      <p>系统的心脏:为什么每块内容都按指纹存、唯一会变的指针怎么守、"提交就是一次数据库事务"、垃圾怎么安全回收。</p>
     </div>
     <div class="card">
-      <div class="num">报告 ④</div>
+      <div class="num">报告四</div>
       <h3><a href="04-search-index.html">搜索与索引</a></h3>
-      <p>Hybrid 检索（trigram + Voyage 语义 + RRF）、变体 A 本地索引、L3 SHA 读缓存、embedding 持久化（ObjCache/Tiered）、增量 reindex、与 GC 的隔离。</p>
+      <p>怎么把"关键词"和"语义"两种找法揉到一起、昂贵的向量怎么算一次存下来反复用、后台怎么悄悄把它们备齐。</p>
     </div>
     <div class="card">
-      <div class="num">报告 ⑤</div>
+      <div class="num">报告五</div>
       <h3><a href="05-maintenance-pipeline.html">维护管线</a></h3>
-      <p>memory_jobs 状态机、SKIP LOCKED 消费、Deps 派发、reflection、defrag（收敛）、reaper（claimed_at）、GC，以及每轮的全局锁循环。</p>
+      <p>后台那个工人每一轮都做什么:抢任务不打架、反思整理、拆大文件、回收卡死的活,以及它们如何复用同一套机制。</p>
     </div>
     <div class="card">
-      <div class="num">报告 ⑥</div>
+      <div class="num">报告六</div>
       <h3><a href="06-build-journey.html">构建历程</a></h3>
-      <p>M1–M5 路线图与分层落地、brainstorm→spec→plan→subagent→双阶段审查→合并的工程规程、审查链抓到的真实 bug、测试隔离的故事、规模与状态。</p>
+      <p>它是怎么一层层盖起来的:每层都走"构思→设计→计划→实现→双重审查→合并",以及审查链路真正抓出来的那些坑。</p>
     </div>
   </div>
 
-  <h2>系统全景</h2>
-  <pre class="mermaid">
-flowchart TB
-  Client["客户端"]
-  subgraph Z1["① 请求路径"]
-    Router["Session Router<br/>单写者 per agent"]
-    Worker["Agent Worker<br/>无状态"]
-    LLM["LLM Provider"]
-  end
-  subgraph Z2["② 读加速器"]
-    Cache["SHA 读缓存"]
-    Search["搜索 本地索引"]
-  end
-  subgraph Z3["③ 权威存储"]
-    Obj["对象存储<br/>内容寻址不可变"]
-    PG["Postgres<br/>refs CAS 加 job 队列"]
-  end
-  subgraph Z4["④ 维护"]
-    Maint["Go worker 每轮<br/>GC 到 reap 到 defrag 到 drain"]
-  end
-  Client --> Router --> Worker --> LLM
-  Worker --> Cache
-  Worker --> Search
-  Worker -->|"先写对象 再 ref CAS 同一事务"| Obj
-  Worker --> PG
-  PG -->|"同事务入队 job"| Maint
-  Maint --> Obj
-  Maint --> PG
-  </pre>
-
-  <h2>分层地图</h2>
+  <h2>九层地图</h2>
   <table>
-    <thead><tr><th>层</th><th>交付</th><th>核心保证</th><th>深读</th></tr></thead>
+    <thead><tr><th>层</th><th>加了什么</th><th>带来的保证</th><th>深读</th></tr></thead>
     <tbody>
-      <tr><td><strong>L1</strong></td><td>MemStore 核心（对象 + refs + CAS）</td><td>内容寻址不可变对象 + 单点 ref CAS + 先对象后 ref</td><td>报告 ③</td></tr>
-      <tr><td><strong>L2</strong></td><td>Agent Loop + Session</td><td>单写者 per agent + provider 无关 + agentic recall</td><td>报告 ②</td></tr>
-      <tr><td><strong>L3</strong></td><td>SHA 读缓存</td><td>内容寻址、永不失效（失效退化为 LRU 淘汰）</td><td>报告 ④</td></tr>
-      <tr><td><strong>L4</strong></td><td>Hybrid 搜索</td><td>trigram + Voyage 语义 + RRF 融合 + 降级</td><td>报告 ④</td></tr>
-      <tr><td><strong>L4b</strong></td><td>embedding 索引持久化 + 增量 reindex</td><td>持久内容寻址 embedding 库 + 与 GC 隔离</td><td>报告 ④</td></tr>
-      <tr><td><strong>L5a</strong></td><td>维护 GC</td><td>全局可达性 mark-sweep + 龄期宽限</td><td>报告 ③ / ⑤</td></tr>
-      <tr><td><strong>L5b</strong></td><td>memory_jobs 消费 + Reflection</td><td>SKIP LOCKED + per-agent 单例锁 + 防自触发 + 冲突退让</td><td>报告 ⑤</td></tr>
-      <tr><td><strong>L5c</strong></td><td>确定性 defrag</td><td>按顶层标题拆大文件 + 结构性收敛保证</td><td>报告 ⑤</td></tr>
-      <tr><td><strong>L5d</strong></td><td>stale-running reaper</td><td>claimed_at + 每轮回收崩溃搁浅的 job</td><td>报告 ⑤</td></tr>
+      <tr><td><strong>L1</strong></td><td>存储内核:按指纹存对象 + 数据库守唯一指针</td><td>内容不可变 + 唯一一处做并发裁决</td><td>报告三</td></tr>
+      <tr><td><strong>L2</strong></td><td>Agent 循环 + 多轮会话</td><td>一个 agent 同时一个写者 + 模型自取记忆</td><td>报告二</td></tr>
+      <tr><td><strong>L3</strong></td><td>按指纹的读缓存</td><td>命中即等于重算,永不会读到旧值</td><td>报告四</td></tr>
+      <tr><td><strong>L4</strong></td><td>关键词 + 语义混合搜索</td><td>两种找法融合,缺一种也能降级工作</td><td>报告四</td></tr>
+      <tr><td><strong>L4b</strong></td><td>向量持久化 + 增量补算</td><td>昂贵的向量只算一次、跨会话共享</td><td>报告四</td></tr>
+      <tr><td><strong>L5a</strong></td><td>后台垃圾回收</td><td>只删"没人引用且足够旧"的对象</td><td>报告三 / 五</td></tr>
+      <tr><td><strong>L5b</strong></td><td>任务队列消费 + 反思</td><td>多 worker 抢活不重不漏 + 不自我触发死循环</td><td>报告五</td></tr>
+      <tr><td><strong>L5c</strong></td><td>确定性拆分大文件</td><td>按标题拆,且保证不会越拆越多</td><td>报告五</td></tr>
+      <tr><td><strong>L5d</strong></td><td>回收卡死的任务</td><td>worker 崩在半路的活会被捞回来重做</td><td>报告五</td></tr>
     </tbody>
   </table>
 
-  <h2>阅读建议</h2>
+  <h2>怎么读</h2>
   <ul>
-    <li><strong>第一次了解全貌</strong>：① 架构总览 → ⑥ 构建历程，半小时建立全局观与工程方法认知。</li>
-    <li><strong>要改/接请求路径</strong>：② 请求路径（再按需翻 ③ 的 CAS 机制、④ 的缓存）。</li>
-    <li><strong>关心一致性/存储/GC</strong>：③ 存储与一致性是系统的心脏，最值得逐行读。</li>
-    <li><strong>做检索/embedding</strong>：④ 搜索与索引。</li>
-    <li><strong>做后台/运维</strong>：⑤ 维护管线（job 队列、reflection、defrag、reaper、每轮循环）。</li>
+    <li><strong>第一次看,想要全局观</strong> → 报告一(架构总览)加报告六(构建历程),半小时建立框架。</li>
+    <li><strong>要接前台、改请求处理</strong> → 报告二(请求路径),按需回看报告三的提交机制。</li>
+    <li><strong>关心一致性、存储、回收</strong> → 报告三是心脏,最值得逐段读。</li>
+    <li><strong>做检索、向量相关</strong> → 报告四。</li>
+    <li><strong>做后台、运维</strong> → 报告五(队列、反思、拆分、回收、每轮循环)。</li>
   </ul>
 
   <div class="callout win">
-    <div class="tag">状态</div>
-    M1–M5 路线图全部完成：10 个包、2 个可执行进程（<code>cmd/api</code> + <code>cmd/maintenance</code>）、9 个分层 merge。全套 <code>go test ./... -p 1</code> 序列化全绿、新包 <code>-race</code> 干净。唯一显式延后：embedding 库淘汰（派生、可重算、体量小，当前无压力）。
+    <div class="tag">现状</div>
+    <p>规划中的整条路线已全部走完:10 个代码模块、2 个可运行进程(一个跑前台、一个跑后台),九次分层合并。全套测试串行跑全绿、关键模块并发检测干净。唯一刻意推后的是"向量库的淘汰"——因为向量是派生的、能随时重算、体量又小,目前没有压力。</p>
   </div>
 </main>
-<footer>Engram 深入解析报告 · 共 6 份 + 本索引 · 共享 style.css + Mermaid CDN · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
+<footer>
+  Engram 深入解析 · 共六份报告 + 本索引 · 纯手工 SVG / HTML 图表,不依赖任何外部脚本,离线可读 · 基于 main 分支(L1–L5d)
+</footer>
 </body>
 </html>

@@ -1,266 +1,335 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!DOCTYPE html><html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Engram · 架构总览</title>
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
-</head>
-<body>
+</head><body>
 <nav class="topnav">
   <span class="brand">Engram</span>
-  <a href="index.html">总览索引</a>
-  <a href="01-architecture-overview.html" class="active">① 架构总览</a>
-  <a href="02-request-path.html">② 请求路径</a>
-  <a href="03-storage-consistency.html">③ 存储与一致性</a>
-  <a href="04-search-index.html">④ 搜索与索引</a>
-  <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>
-  <a href="06-build-journey.html">⑥ 构建历程</a>
+  <a href="index.html">索引</a>
+  <a href="01-architecture-overview.html" class="active">架构总览</a>
+  <a href="02-request-path.html">请求路径</a>
+  <a href="03-storage-consistency.html">存储与一致性</a>
+  <a href="04-search-index.html">搜索与索引</a>
+  <a href="05-maintenance-pipeline.html">维护管线</a>
+  <a href="06-build-journey.html">构建历程</a>
 </nav>
 <main>
 
-<p class="meta">docs/architecture.md · CLAUDE.md · main 分支 · L1–L5d 全部合并</p>
-<h1>① 架构总览</h1>
-<p class="lead">Engram 是一个云端、多租户 Agent 记忆系统——用 Git 对象模型管理 Markdown 记忆，用 Postgres CAS 保证一致性，用无状态工作节点提供可伸缩性。</p>
+<p class="meta">基于 main 分支 · L1–L5d 全部合并 · 源文件: docs/architecture.md · CLAUDE.md</p>
+<h1>架构总览</h1>
+<p class="lead">Engram 是给 agent 用的"云端笔记本"——用 git 对象模型存记忆，用 Postgres 的一把小锁保证一致性，用无状态工作节点做到横向扩展。这一页是全局地图；子系统细节见 <a href="02-request-path.html">请求路径</a>、<a href="03-storage-consistency.html">存储与一致性</a>、<a href="04-search-index.html">搜索与索引</a>、<a href="05-maintenance-pipeline.html">维护管线</a>。</p>
 
-<!-- ─────────────────────────────────────────────────────── -->
+<!-- ──────────────────────────────────────────────────── §1 -->
 <h2>1. 我们在建什么</h2>
 
-<p>Engram 将 MemFS（一个 Git 支撑的本地记忆文件系统，源自 Letta 范式）搬到了服务器端，使得<strong>多个 Agent 各自拥有一个版本化的记忆仓库</strong>，由无状态工作节点按需服务。Agent 可以读取常驻记忆（<code>system/</code>）、在推理过程中按需召回长尾内容、并跨会话持久化编辑。</p>
+<p>大模型每次对话都从空白开始——它不知道上次你说了什么，不记得上次它写了什么。Engram 要解决的就是这件事：给 agent 一个可以跨会话读写、版本化、多租户隔离的记忆仓库，部署在云端，由无状态工作节点按需服务。</p>
 
-<p>整体设计刻意保持轻量：<strong>无状态计算 + 内容寻址对象存储 + 单个 Postgres 作为协调枢纽</strong>，故意不引入 Temporal 或 Kafka（原因见§5）。</p>
+<p>出发点是 MemFS（Letta 项目里的 git 支撑本地记忆文件系统），但把它从"单机本地"搬到了"多租户云端"。每个 agent 各自拥有一个 git 仓库——文件就是 Markdown 记忆片段，历史就是 git commit，内容寻址就是 git 对象的哈希。云端的挑战是：多个 agent 并发写、pod 随时崩溃、worker 无状态、不能有单点瓶颈。</p>
 
 <div class="callout win">
-  <span class="tag">核心理念</span>
-  <p><strong>记忆是主动式（agentic）的，而非 RAG 式的。</strong>推理前只加载常驻的 <code>system/</code> 目录 + 轻量树索引（文件名 + description 字段）。长尾内容由模型在循环中途通过 recall / read 工具按需拉取，<em>不会</em>在推理前做自动 top-k 倾倒。这一原则显著降低了每轮 Token 消耗，同时保留了完整的记忆可达性。</p>
+  <span class="tag">核心理念 — 记忆是主动去取，不是塞给模型</span>
+  <p>每轮推理前，只把 <code>system/</code>（常驻要点）和轻量树索引（文件名 + description 字段）加载进上下文。长尾内容——那些不常用但存在的记忆——由模型在推理循环中途通过 <code>recall</code> / <code>read</code> 工具<strong>按需拉取</strong>。不做自动 top-k 倾倒，不事先把"可能有用"的内容全部塞进 prompt。这一原则显著压低每轮 Token 消耗，同时保留了完整的记忆可达性。</p>
 </div>
 
-<!-- ─────────────────────────────────────────────────────── -->
-<h2>2. 四个区（Four Zones）</h2>
+<p>整体设计刻意保持轻量：<strong>无状态计算 + 内容寻址对象存储 + 单个 Postgres 作为协调枢纽</strong>，不引入 Temporal 或 Kafka（原因见§5）。最简基础设施：一个对象存储桶 + Postgres + 无本地持久化的 pod。</p>
 
-<p>架构在逻辑上分为四个区（<code>docs/architecture.md §3</code>）。读路径自上而下流经加速器层；写路径（commit）直达规范存储层；维护工作完全异步，不在关键路径上。</p>
+<!-- ──────────────────────────────────────────────────── §2 -->
+<h2>2. 四个区</h2>
 
-<pre class="mermaid">
-flowchart TD
-  subgraph Z1["① 请求路径 (request path)"]
-    SR["Session Router<br/>按 agent_id 序列化写"]
-    AW["Agent Worker<br/>无状态 Pod，运行 Agent 循环"]
-    LLM["LLM Provider<br/>纯推理"]
-    SR --> AW --> LLM
-  end
+<p>架构在逻辑上分为四个区（<code>architecture.md §3</code>）。读路径从上往下流经加速层；写路径（commit）直达规范存储；维护完全异步，不在关键路径上。</p>
 
-  subgraph Z2["② 读加速层 (read accelerators)"]
-    MC["Memory Cache<br/>以 commit SHA 为键"]
-    SS["Search Service<br/>本地 trigram 索引"]
-  end
+<!-- 手工 SVG 四区图 -->
+<div class="figure">
+<svg viewBox="0 0 680 420" xmlns="http://www.w3.org/2000/svg"
+     font-family="ui-sans-serif,-apple-system,sans-serif" font-size="13">
 
-  subgraph Z3["③ 规范存储层 (canonical store)"]
-    OS["Object Storage<br/>内容寻址对象，S3 / 本地"]
-    PG["Postgres<br/>agent_id→HEAD CAS + 任务队列"]
-  end
+  <!-- Zone colours (faint fills) -->
+  <!-- Z1 request path -->
+  <rect x="20" y="14" width="640" height="96" rx="12"
+        fill="#fdf3ee" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="36" y="34" font-size="11" font-weight="700" fill="#bf5e3c" letter-spacing=".07em">① 请求路径</text>
 
-  subgraph Z4["④ 维护层 (maintenance)"]
-    MW["Go 维护 Worker<br/>GC · 反射 · Defrag · 重建索引 · Reaper"]
-  end
+  <!-- Z2 read accelerators -->
+  <rect x="20" y="126" width="300" height="84" rx="12"
+        fill="#f5f9f0" stroke="#c9d9be" stroke-width="1.2"/>
+  <text x="36" y="146" font-size="11" font-weight="700" fill="#5f7a4e" letter-spacing=".07em">② 读加速层</text>
 
-  AW -- "读 system/ + 树索引" --> MC
-  AW -- "recall 工具" --> SS
-  MC -- "未命中 → 读对象" --> OS
-  SS -- "Variant B 仅: Range GET" --> OS
-  AW -- "commit: 先写对象,再 CAS+入队" --> OS
-  AW -- "commit: 单 Postgres tx" --> PG
-  MW -- "轮询 / 出队" --> PG
-  MW -- "GC 标记清除" --> OS
-</pre>
+  <!-- Z3 canonical store -->
+  <rect x="20" y="228" width="640" height="84" rx="12"
+        fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.2"/>
+  <text x="36" y="248" font-size="11" font-weight="700" fill="#46413a" letter-spacing=".07em">③ 规范存储层（权威）</text>
+
+  <!-- Z4 maintenance -->
+  <rect x="20" y="330" width="640" height="72" rx="12"
+        fill="#fffbf5" stroke="#e9e3d6" stroke-width="1.2"/>
+  <text x="36" y="350" font-size="11" font-weight="700" fill="#a9741f" letter-spacing=".07em">④ 维护层</text>
+
+  <!-- ── Z1 nodes ── -->
+  <!-- Session Router -->
+  <rect x="52" y="46" width="140" height="50" rx="9"
+        fill="#fff" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="122" y="68" text-anchor="middle" font-weight="650" fill="#201e18">Session Router</text>
+  <text x="122" y="84" text-anchor="middle" font-size="11.5" fill="#7c766c">按 agent_id 序列化写</text>
+
+  <!-- arrow -->
+  <line x1="192" y1="71" x2="220" y2="71" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- Agent Worker -->
+  <rect x="220" y="46" width="140" height="50" rx="9"
+        fill="#fdf3ee" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="290" y="68" text-anchor="middle" font-weight="650" fill="#201e18">Agent Worker</text>
+  <text x="290" y="84" text-anchor="middle" font-size="11.5" fill="#7c766c">无状态 Pod · 运行循环</text>
+
+  <!-- arrow -->
+  <line x1="360" y1="71" x2="388" y2="71" stroke="#bf5e3c" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- LLM -->
+  <rect x="388" y="46" width="140" height="50" rx="9"
+        fill="#fff" stroke="#e7c9ba" stroke-width="1.2"/>
+  <text x="458" y="68" text-anchor="middle" font-weight="650" fill="#201e18">LLM Provider</text>
+  <text x="458" y="84" text-anchor="middle" font-size="11.5" fill="#7c766c">纯推理 · 无状态</text>
+
+  <!-- ── Z2 nodes ── -->
+  <!-- Memory Cache -->
+  <rect x="40" y="154" width="122" height="44" rx="9"
+        fill="#fff" stroke="#c9d9be" stroke-width="1.2"/>
+  <text x="101" y="174" text-anchor="middle" font-weight="650" fill="#201e18">Memory Cache</text>
+  <text x="101" y="190" text-anchor="middle" font-size="11" fill="#7c766c">以 commit SHA 为键</text>
+
+  <!-- Search Service -->
+  <rect x="178" y="154" width="122" height="44" rx="9"
+        fill="#fff" stroke="#c9d9be" stroke-width="1.2"/>
+  <text x="239" y="174" text-anchor="middle" font-weight="650" fill="#201e18">Search Service</text>
+  <text x="239" y="190" text-anchor="middle" font-size="11" fill="#7c766c">本地 trigram + 嵌入</text>
+
+  <!-- ── Z3 nodes ── -->
+  <!-- Object Storage -->
+  <rect x="52" y="254" width="152" height="44" rx="9"
+        fill="#fff" stroke="#ddd5c5" stroke-width="1.2"/>
+  <text x="128" y="274" text-anchor="middle" font-weight="650" fill="#201e18">Object Storage</text>
+  <text x="128" y="290" text-anchor="middle" font-size="11" fill="#7c766c">内容寻址对象 · S3/本地</text>
+
+  <!-- Postgres -->
+  <rect x="226" y="254" width="152" height="44" rx="9"
+        fill="#fff" stroke="#ddd5c5" stroke-width="1.2"/>
+  <text x="302" y="274" text-anchor="middle" font-weight="650" fill="#201e18">Postgres</text>
+  <text x="302" y="290" text-anchor="middle" font-size="11" fill="#7c766c">HEAD CAS · 任务队列</text>
+
+  <!-- ── Z4 node ── -->
+  <rect x="52" y="354" width="260" height="36" rx="9"
+        fill="#fff" stroke="#e9e3d6" stroke-width="1.2"/>
+  <text x="182" y="373" text-anchor="middle" font-weight="650" fill="#201e18">Go 维护 Worker — GC · Reflection · Defrag · Reaper</text>
+
+  <!-- ── Flow arrows ── -->
+  <!-- Worker → Cache (读 system/ + 树索引) -->
+  <line x1="290" y1="96" x2="112" y2="154" stroke="#5f7a4e" stroke-width="1.4"
+        stroke-dasharray="5,3" marker-end="url(#arrsage)"/>
+  <text x="172" y="134" font-size="10.5" fill="#5f7a4e">读 system/ + 树索引</text>
+
+  <!-- Worker → Search (recall) -->
+  <line x1="310" y1="96" x2="248" y2="154" stroke="#5f7a4e" stroke-width="1.4"
+        stroke-dasharray="5,3" marker-end="url(#arrsage)"/>
+  <text x="316" y="130" font-size="10.5" fill="#5f7a4e">recall 工具</text>
+
+  <!-- Cache → ObjStore (cache miss) -->
+  <line x1="101" y1="198" x2="110" y2="254" stroke="#7c766c" stroke-width="1.2"
+        stroke-dasharray="4,3" marker-end="url(#arrmuted)"/>
+  <text x="54" y="230" font-size="10" fill="#7c766c">miss→拉取</text>
+
+  <!-- Worker → ObjStore (commit: write objects first) -->
+  <line x1="270" y1="96" x2="150" y2="254" stroke="#bf5e3c" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+  <text x="170" y="190" font-size="10.5" fill="#bf5e3c">先写对象</text>
+
+  <!-- Worker → Postgres (commit: CAS + enqueue) -->
+  <line x1="310" y1="96" x2="290" y2="254" stroke="#bf5e3c" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+  <text x="315" y="180" font-size="10.5" fill="#bf5e3c">再 CAS+入队</text>
+  <text x="315" y="193" font-size="10" fill="#bf5e3c">(单 Postgres tx)</text>
+
+  <!-- Maintenance ↔ Postgres -->
+  <line x1="182" y1="354" x2="290" y2="298" stroke="#a9741f" stroke-width="1.3"
+        stroke-dasharray="5,3" marker-end="url(#arramber)"/>
+  <text x="248" y="330" font-size="10" fill="#a9741f">轮询/出队</text>
+
+  <!-- Maintenance → ObjStore (GC) -->
+  <line x1="130" y1="354" x2="128" y2="298" stroke="#a9741f" stroke-width="1.3"
+        stroke-dasharray="5,3" marker-end="url(#arramber)"/>
+  <text x="56" y="332" font-size="10" fill="#a9741f">GC 清扫</text>
+
+  <!-- arrowhead markers -->
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="arrsage" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#5f7a4e"/>
+    </marker>
+    <marker id="arrmuted" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#7c766c"/>
+    </marker>
+    <marker id="arramber" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#a9741f"/>
+    </marker>
+  </defs>
+</svg>
+<p class="figcap">四区拓扑图。红色实线 = 写路径（先对象后 CAS）；绿色虚线 = 读路径（优先走缓存/索引）；橙色虚线 = 异步维护。</p>
+</div>
 
 <div class="cardgrid">
   <div class="card">
     <div class="num">① 请求路径</div>
     <h3>Session Router → Agent Worker → LLM</h3>
-    <p>Router 按 <code>agent_id</code> 串行化写操作（粘性路由或逐 Agent 锁）。Worker 是无状态 Pod：挂载工作树、组装上下文、运行工具、提交。LLM 纯推理，无状态。</p>
-    <p>更多细节见 <a href="02-request-path.html">② 请求路径</a>。</p>
+    <p>Router 按 <code>agent_id</code> 串行化写操作（粘性路由或逐 Agent 锁）。Worker 是无状态 Pod：挂载工作树、组装上下文、运行工具循环、提交。LLM 纯推理，无状态。</p>
+    <p>→ <a href="02-request-path.html">请求路径</a> 深入解析。</p>
   </div>
   <div class="card">
     <div class="num">② 读加速层</div>
-    <h3>SHA 缓存 + Trigram 搜索</h3>
-    <p>Memory Cache 以 commit SHA（准确说是 <code>system/</code> 子树哈希）为键，无需失效机制。Search Service 本地持有完整文件内容（Variant A），查询时零对象存储访问。</p>
-    <p>更多细节见 <a href="04-search-index.html">④ 搜索与索引</a>。</p>
+    <h3>SHA 缓存 + 混合搜索</h3>
+    <p>Memory Cache 以 <code>system/</code> 子树哈希为键，无需失效（同一 SHA 永远映射同一内容）。Search Service 本地持有完整文件内容（Variant A），查询时零对象存储访问。</p>
+    <p>→ <a href="04-search-index.html">搜索与索引</a> 深入解析。</p>
   </div>
   <div class="card">
     <div class="num">③ 规范存储层</div>
     <h3>Object Storage + Postgres</h3>
-    <p>对象存储保存内容寻址的不可变对象（<code>objects/&lt;hash&gt;</code>）。Postgres 是唯一的强一致性协调点：持有 <code>agent_id→HEAD</code> CAS ref 和 <code>memory_jobs</code> 任务队列。</p>
-    <p>更多细节见 <a href="03-storage-consistency.html">③ 存储与一致性</a>。</p>
+    <p>对象存储保存内容寻址的不可变对象（<code>objects/&lt;hash&gt;</code>）。Postgres 是系统唯一的强一致性协调点：持有 <code>agent_id→HEAD</code> CAS ref 和 <code>memory_jobs</code> 任务队列。</p>
+    <p>→ <a href="03-storage-consistency.html">存储与一致性</a> 深入解析。</p>
   </div>
   <div class="card">
     <div class="num">④ 维护层</div>
     <h3>单个 Go 维护 Worker</h3>
-    <p>独立进程，周期性运行：GC（标记清除不可达对象）、Reflection（历史整合）、Defrag（拆分过大文件）、Reindex（增量触发）、Reaper（回收停滞任务）。</p>
-    <p>更多细节见 <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>。</p>
+    <p>独立进程，周期性运行：GC（标记清除不可达对象）、Reflection（历史整合）、Defrag（拆分过大文件）、Reindex（增量更新索引）、Reaper（回收停滞任务）。完全异步，不阻塞前台。</p>
+    <p>→ <a href="05-maintenance-pipeline.html">维护管线</a> 深入解析。</p>
   </div>
 </div>
 
-<!-- ─────────────────────────────────────────────────────── -->
-<h2>3. 三条核心不变量</h2>
+<!-- ──────────────────────────────────────────────────── §3 -->
+<h2>3. 三条贯穿全局的规矩</h2>
 
-<p>以下三条不变量是整个架构的脊梁（<code>docs/architecture.md §2</code>，<code>CLAUDE.md 核心不变量</code>）。每一条都派生出下游的多项设计决策。</p>
+<p>下面三条不变量是整个架构的脊梁（<code>architecture.md §2</code>，<code>CLAUDE.md 核心不变量</code>）。它们彼此派生：第一条让缓存和 GC 成为可能，第二条让全系统有唯一的裁决点，第三条让你可以随时丢掉、重建一切派生物。</p>
 
 <div class="callout invariant">
-  <span class="tag">不变量 1 — 对象不可变（Objects are immutable）</span>
-  <p>文件内容、树对象、提交对象全部以其自身哈希作为内容寻址键（SHA）。<strong>永远不要修改对象，只追加新对象。</strong>修改记忆 = 产生新的对象 + 一次新的提交。</p>
-  <p><strong>为什么这能派生出其他机制：</strong></p>
+  <span class="tag">不变量 ① — 每块内容不可变，按指纹存</span>
+  <p>文件内容、树对象、提交对象——全部以<strong>自身内容的哈希（SHA）</strong>作为键，存在对象存储里。<strong>永远不修改对象，只追加新对象。</strong>修改记忆 = 产生新的对象 + 一次新的提交。</p>
+  <p>这条规矩派生出三件事：</p>
   <ul>
-    <li><strong>按 SHA 缓存</strong>：<code>sha → materialized content</code> 是不可变映射，缓存永远不需要失效——"失效"退化为 LRU 淘汰以节省空间（§4.4）。</li>
-    <li><strong>跨版本去重</strong>：同一内容写入多次只存储一份对象，对象存储天然去重。</li>
-    <li><strong>标记清除 GC</strong>：哈希永远不会指向两份不同的内容，因此可以安全地从 HEAD 可达集之外标记"垃圾"，定期清除。</li>
+    <li><strong>缓存永远不用失效。</strong><code>sha → materialized content</code> 是不变映射，LRU 淘汰是为了省空间，不是为了保鲜。新内容 = 新 SHA = 新键 = 缓存未命中 = 重新填充，这是"天然失效"。</li>
+    <li><strong>跨版本去重。</strong>同一段内容写入两次只存一份对象，对象存储层天然去重。</li>
+    <li><strong>标记清除 GC 是安全的。</strong>同一个哈希不可能指向两段不同内容，因此"从 HEAD 可达集以外的对象"就是垃圾，定期清除，不会误删任何活跃对象。</li>
   </ul>
 </div>
 
 <div class="callout invariant">
-  <span class="tag">不变量 2 — Ref 可变且强一致（Refs mutable and strongly consistent）</span>
-  <p>系统中唯一可变的指针是 <code>agent_id → HEAD</code>，存储在 Postgres 中。<strong>所有并发控制、顺序保证、一致性都漏斗式地集中到这一个 CAS 操作上。</strong></p>
-  <p>CAS 的 SQL 原语（<code>docs/architecture.md §9</code>）：</p>
-<pre><code>UPDATE agent_refs SET head=$new, updated_at=now()
+  <span class="tag">不变量 ② — 唯一会变的是 HEAD 指针，用一把"改前先确认"的小锁守</span>
+  <p>系统里<strong>唯一可变的指针</strong>是 <code>agent_id → HEAD</code>，存在 Postgres 的 <code>agent_refs</code> 表。<strong>所有并发控制、顺序保证、一致性全都漏斗式地集中到这一个 CAS 操作上——这是全系统唯一的裁决点。</strong></p>
+  <p>SQL 原语（<code>architecture.md §9</code>）：</p>
+  <pre><code>UPDATE agent_refs SET head=$new, updated_at=now()
 WHERE agent_id=$id AND head=$expected_parent;</code></pre>
-  <p>行数为 0 → HEAD 已经移动 → 调用方 reconcile（rebase/重试）。这一单点序列化取代了任何外部锁服务。对象存储不需要条件写，因为它只存不可变对象。</p>
-  <p><strong>这与 lakeFS 的设计完全对应</strong>（§15.1 验证 3-0）：lakeFS 将已提交的元数据存储在对象存储中，但用 KV 存储中的 <code>SetIf()</code> CAS 保护分支指针，原因正是对象存储不具备条件写原语。</p>
+  <p>返回 0 行 → HEAD 已经移动 → 调用方 reconcile 并重试。这一单点序列化取代了任何外部锁服务。对象存储不需要条件写，因为它只存不可变对象。</p>
+  <p>这与 lakeFS 的设计完全对应（<code>architecture.md §15.1</code>，验证 3-0）：lakeFS 用对象存储保存已提交元数据，用 KV 存储的 <code>SetIf()</code> CAS 保护分支指针，原因正是对象存储没有条件写原语。</p>
 </div>
 
 <div class="callout invariant">
-  <span class="tag">不变量 3 — 其他一切都可重建（Everything else is rebuildable）</span>
-  <p>缓存、trigram 索引、工作树副本都是从对象 + ref 推导的视图，因此是无状态的、可丢弃的。</p>
+  <span class="tag">不变量 ③ — 其余都是可丢弃、可重算的派生物</span>
+  <p>缓存、trigram 索引、嵌入向量索引、工作树副本——都是从对象 + ref 推导的视图，因此是无状态的、可丢弃的。</p>
   <ul>
-    <li><strong>缓存</strong>：Pod 崩溃 → 重启后从对象存储重新填充，不丢任何数据。</li>
-    <li><strong>搜索索引</strong>：最终一致，刚写入的记忆可能几秒内不可搜——可接受，因为当前轮次的内容已在上下文中。</li>
-    <li><strong>工作树</strong>：临时目录，挂载到 worker scratch / tmpfs，可按 SHA 重新 materialize。</li>
+    <li><strong>缓存：</strong>Pod 崩溃 → 重启后从对象存储重新填充，零数据丢失。</li>
+    <li><strong>搜索索引：</strong>最终一致，刚写入的记忆可能数秒内不可搜——可接受，因为当前轮次的内容已在上下文中。</li>
+    <li><strong>工作树：</strong>临时目录，挂载在 worker scratch / tmpfs，可按 SHA 随时重新 materialize。</li>
   </ul>
 </div>
 
 <div class="callout gotcha">
-  <span class="tag">常见误区</span>
-  <p>不要将缓存、索引或工作树副本视为可信来源（source of truth）。它们是推导产物，是可丢弃的。对象 + ref 才是权威数据，这一点在 <code>CLAUDE.md 禁止事项</code> 中明确列出。</p>
+  <span class="tag">常见陷阱</span>
+  <p>不要把缓存、索引或工作树视为可信来源。它们是推导产物，是可丢弃的。对象 + ref 才是权威数据（<code>CLAUDE.md 禁止事项</code>）。一旦把派生物当成 source of truth，你就会开始担心"缓存和存储不一致怎么办"——而正确答案是：派生物不一致时，丢掉重建就好。</p>
 </div>
 
-<!-- ─────────────────────────────────────────────────────── -->
-<h2>4. 数据流</h2>
+<!-- ──────────────────────────────────────────────────── §4 -->
+<h2>4. 一次请求到一次提交</h2>
 
-<p>以下序列图展示了从推理前组装、Agent 循环中途工具调用，到提交并触发维护的完整数据流（<code>docs/architecture.md §8</code>）。</p>
+<p>从用户消息进来，到 agent 编辑记忆、提交、触发后台维护——完整生命周期走查（<code>architecture.md §8</code>）。</p>
 
-<pre class="mermaid">
-sequenceDiagram
-  participant Router as Session Router
-  participant Worker as Agent Worker
-  participant Cache as Memory Cache
-  participant ObjStore as Object Storage
-  participant PG as Postgres
-  participant LLM as LLM Provider
-  participant Maint as 维护 Worker
+<ol class="steps">
+  <li>
+    <span class="st">装载常驻要点 + 目录</span>
+    <span class="sd">Router 按 agent_id 序列化，将请求交给 Worker。Worker 从 Postgres 读当前 HEAD，向 Memory Cache 查 <code>Get(agentID, systemTreeSHA)</code>。命中 → 直接返回已物化的 <code>system/</code> 内容 + 树索引（文件名、description）；未命中 → 从对象存储拉取对象、填充缓存。上下文组装：常驻要点 + 树索引 + 用户消息，发给 LLM。</span>
+  </li>
+  <li>
+    <span class="st">Agent 循环 — 模型自己决定去取什么</span>
+    <span class="sd">LLM 收到上下文后进入工具调用循环。它可以调用 <code>recall(query)</code>（向 Search Service 发 trigram+向量混合查询，返回匹配的行号范围，不是整个文件）、<code>read(path)</code>（从工作树或对象存储读一个文件）、<code>edit(path, content)</code>（在工作树上写入修改）。这一切都发生在推理过程中，模型自主决定拉取哪些记忆——不是预先顶满上下文。</span>
+  </li>
+  <li>
+    <span class="st">提交 — 先写对象，再改 HEAD，同一事务入队任务</span>
+    <span class="sd">Worker 调用 <code>CommitWithCAS</code>：①把工作树里所有新内容写成内容寻址对象，幂等 PUT 到对象存储（这步可以崩溃，只留垃圾对象，GC 会清）；②在<strong>单个 Postgres 事务</strong>里执行 CAS <code>HEAD: parent → new</code> + <code>INSERT memory_jobs</code>。原子性保证：任务入队 当且仅当 提交已提交。CAS 失败（HEAD 已移动）→ 返回 <code>ErrCASConflict</code> → 调用方 reconcile 并重试。</span>
+  </li>
+  <li>
+    <span class="st">后台慢慢消化 — 异步维护，不阻塞前台</span>
+    <span class="sd">维护 Worker 用 <code>FOR UPDATE SKIP LOCKED</code> 出队 <code>memory_jobs</code>，在独立 git worktree 里运行 Reflection（历史整合）、Defrag（拆分过大文件）、GC（标记清除不可达对象）、Reindex（增量更新搜索索引）。全程不干扰前台 Worker 正在读取的 SHA 快照。任务超时被 Reaper 回收，毒任务（反复崩溃 worker 的任务）在 <code>maxAttempts</code> 次后进入 <code>failed</code> 状态（L5d）。</span>
+  </li>
+</ol>
 
-  Note over Router,Worker: 推理前组装 (pre-inference assemble)
-  Router->>Worker: 按 agent_id 序列化，分配请求
-  Worker->>PG: ResolveHead — 读取当前 HEAD
-  Worker->>Cache: Get(agentID, sha) — 读 system/ + 树索引
-  Cache-->>Worker: 命中 → 直接返回
-  Cache->>ObjStore: 未命中 → 拉取对象
-  ObjStore-->>Cache: 填充缓存
-  Cache-->>Worker: 返回 Resident(system/ content, tree index)
-  Worker->>LLM: 发送上下文(system/ + 树索引 + 用户消息)
+<h3>写顺序的崩溃安全保证</h3>
 
-  Note over Worker,LLM: Agent 循环 (mid-loop tools)
-  LLM-->>Worker: 调用 recall 工具
-  Worker->>Cache: Search.Recall(agentID, query)
-  Cache-->>Worker: 返回匹配行范围
-  LLM-->>Worker: 调用 read/edit 工具
-  Worker->>ObjStore: 按需拉取或写入工作树文件
+<p><code>architecture.md §6.2</code> 明确要求：<strong>先写对象到对象存储（幂等），再在 Postgres 中执行 CAS。</strong>在 CAS 之前崩溃，只留下不可达的垃圾对象，GC 会在宽限窗口后清理它们；不会产生指向不完整提交的悬空 ref。反过来如果先 CAS 再写对象，崩溃会留下一个 HEAD 指向尚不存在的对象——这是严重的一致性缺陷。</p>
 
-  Note over Worker,PG: 提交 (commit)
-  Worker->>ObjStore: 写新内容寻址对象 (幂等 PUT，先写)
-  Worker->>PG: 单事务: CAS HEAD + INSERT memory_jobs
-  PG-->>Worker: 成功 (新 HEAD) 或 ErrCASConflict → 重试
+<!-- ──────────────────────────────────────────────────── §5 -->
+<h2>5. 几个关键取舍</h2>
 
-  Note over Maint,PG: 异步维护 (async maintenance)
-  Maint->>PG: 出队 memory_jobs (FOR UPDATE SKIP LOCKED)
-  Maint->>ObjStore: GC 标记清除不可达对象
-  Maint->>Cache: Reindex(agentID, from, to) — 增量更新索引
-  Maint->>PG: 更新 maintenance_cursor / 任务状态
-</pre>
+<h3>单写者 vs 乐观多写者</h3>
+<div class="cmp">
+  <div class="col good">
+    <h4>选择：每个 agent 单写者，Router 串行化</h4>
+    <p>Router 通过粘性路由或逐 Agent 锁，保证同一时刻只有一个 Worker 对某个 agent 执行写操作。简单、正确，且 agent 的记忆访问模式本就是顺序的（一问一答）。</p>
+  </div>
+  <div class="col bad">
+    <h4>放弃：乐观多写者 + 自动 merge</h4>
+    <p>对结构化数据（JSON、代码）三路 merge 可行；对 Markdown prose 不可行——任何自动 merge 都有损，可能把两段不相关的记忆拼错位置，或静默地覆盖内容。</p>
+  </div>
+</div>
 
-<h3>写顺序的关键：先对象，再 Ref</h3>
+<h3>提交即一次数据库事务，替代重型消息中间件</h3>
+<div class="cmp">
+  <div class="col good">
+    <h4>选择：单个 Postgres 事务 — CAS + 入队任务</h4>
+    <p>CAS 和 <code>INSERT memory_jobs</code> 在同一事务里提交，原子性保证"任务入队 iff 提交已提交"。没有孤儿任务，没有提交/发送竞争（commit/emit race）。</p>
+  </div>
+  <div class="col bad">
+    <h4>放弃：Kafka outbox / 双写</h4>
+    <p>先写数据库再写 Kafka：如果 Kafka 写失败，任务丢失；如果先写 Kafka，DB 写失败，任务已入队但提交没发生——两种顺序都有不一致窗口。需要复杂的 outbox 表来弥补。</p>
+  </div>
+</div>
 
-<p>如 <code>docs/architecture.md §6.2</code> 所述：<strong>先将新对象写入对象存储（幂等），再在 Postgres 中执行 CAS。</strong>在 CAS 之前崩溃只留下不可达的垃圾对象（GC 会回收），不会产生指向不完整提交的悬空 ref。这是核心的崩溃安全保证。</p>
+<h3>搜索本地化：查询不碰对象存储</h3>
+<div class="cmp">
+  <div class="col good">
+    <h4>选择：Variant A — 索引本地存储文件全文内容</h4>
+    <p>查询时零对象存储访问，延迟低、无依赖。记忆文件是小型 Markdown，内容冗余可忽略。L4 已在此基础上叠加嵌入向量，实现 trigram 词法 + 语义混合召回。</p>
+  </div>
+  <div class="col bad">
+    <h4>Variant B — 索引只存偏移量 + Range GET</h4>
+    <p>查询时需对对象存储发起 Range GET，增加跨可用区网络往返，且在高并发下可能打穿对象存储限速配额。当记忆文件很大时才值得考虑，当前用例不适用。</p>
+  </div>
+</div>
 
-<!-- ─────────────────────────────────────────────────────── -->
-<h2>5. 关键设计决策</h2>
-
-<table>
-  <thead>
-    <tr>
-      <th>决策</th>
-      <th>选择</th>
-      <th>放弃的备选方案</th>
-      <th>原因摘要</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><strong>写并发</strong></td>
-      <td>每个 agent 单写者 (Single-writer)，Router 串行化</td>
-      <td>乐观多写者 + 自动 merge</td>
-      <td>Markdown prose 的自动 merge 有损。串行化简单、正确，且内存访问模式本就顺序化（§4.1）。</td>
-    </tr>
-    <tr>
-      <td><strong>提交原子性</strong></td>
-      <td>单个 Postgres 事务：CAS + 入队任务</td>
-      <td>Kafka outbox / 双写</td>
-      <td>原子性消除了"提交成功但任务未入队"的不一致。"任务入队 iff 提交已提交"（§8.2，§15.1 验证 3-0）。</td>
-    </tr>
-    <tr>
-      <td><strong>写顺序</strong></td>
-      <td>先写对象存储，再做 Ref CAS</td>
-      <td>先 CAS 再写对象</td>
-      <td>崩溃安全：CAS 之前崩溃只留垃圾对象（GC 回收），不留悬空 ref（§6.2）。</td>
-    </tr>
-    <tr>
-      <td><strong>搜索变体</strong></td>
-      <td>Variant A：索引存储文件内容</td>
-      <td>Variant B：索引存偏移量 + Range GET</td>
-      <td>查询时零对象存储访问；记忆是小型文本，内容冗余可忽略（§4.5）。L4 已实现混合 trigram + 嵌入向量。</td>
-    </tr>
-    <tr>
-      <td><strong>任务队列</strong></td>
-      <td>Postgres <code>memory_jobs</code> + reconcile loop</td>
-      <td>Temporal / Kafka / River（计划 M5）</td>
-      <td>维护任务幂等、可从状态重推导、运行时间短——不需要耐久的中途 resume（§12）。SKIP LOCKED 使用得当可规避性能陷阱（§15.3）。</td>
-    </tr>
-    <tr>
-      <td><strong>工作树</strong></td>
-      <td>go-git + 自定义 Storer（不调用 git 二进制）</td>
-      <td>shell out 到 <code>git</code></td>
-      <td>服务中调用子进程不可靠，go-git 可在测试中替换为内存 Storer（<code>CLAUDE.md 技术栈</code>）。</td>
-    </tr>
-  </tbody>
-</table>
-
-<h3>为什么不用 Temporal 和 Kafka（§12）</h3>
+<h3>为什么不用 Temporal 和 Kafka（<code>architecture.md §12</code>）</h3>
 
 <div class="callout gotcha">
-  <span class="tag">Guardrail</span>
-  <p><strong>不要添加 Temporal 或 Kafka。</strong> Temporal 解决的是"长时运行、崩溃可恢复、多步骤工作流"的问题；我们的维护任务幂等、可从状态重推导、运行时间短，接受"从头重试"就不需要耐久的中途 resume。Kafka 解决的是"解耦写路径、扇出到多个消费者"的问题；我们只有一个消费者（维护 worker），Postgres 同一事务入队提供了解耦且无双写不一致。仅当任务变得真正长时复杂（→ Temporal）或消费者增多需要重放（→ Kafka）时再重新评估。</p>
+  <span class="tag">Guardrail — 禁止引入 Temporal 或 Kafka</span>
+  <p><strong>Temporal</strong> 解决的是"长时运行、崩溃可恢复、多步骤工作流"的问题。我们的维护任务幂等、可从状态重推导、秒级完成，接受"从头重试"就不需要耐久的中途 resume——Temporal 的成本完全是浪费。<br><br>
+  <strong>Kafka</strong> 解决的是"解耦写路径、扇出到多个消费者"的问题。我们只有一个消费者（维护 Worker），Postgres 同一事务入队提供了解耦且没有双写不一致。<br><br>
+  仅当任务变得真正长时复杂（→ 才需要 Temporal）或消费者增多需要重放（→ 才需要 Kafka）时再重新评估。M5 计划升级到 River（同 Postgres，更丰富的重试语义），但不需要跨越到 Kafka。</p>
 </div>
 
-<!-- ─────────────────────────────────────────────────────── -->
-<h2>6. 分层地图（L1–L5d）</h2>
+<!-- ──────────────────────────────────────────────────── §6 -->
+<h2>6. 九层地图（L1–L5d）</h2>
 
-<p>项目按层（Layer）顺序构建，每层在前一层基础上叠加一组保证。截至 main 分支，L1–L5d 全部合并完成（<code>CLAUDE.md Build/test/run 状态</code>）。各层深度报告见其他报告页。</p>
+<p>项目按层（Layer）顺序构建，每层在前一层基础上叠加一组保证。截至 main 分支，L1–L5d 全部合并完成（<code>CLAUDE.md Build/test/run 状态</code>）。</p>
 
 <table>
   <thead>
     <tr>
       <th>层</th>
-      <th>里程碑对应</th>
-      <th>新增内容</th>
+      <th>加了什么</th>
       <th>核心保证</th>
       <th>深度报告</th>
     </tr>
@@ -268,76 +337,67 @@ sequenceDiagram
   <tbody>
     <tr>
       <td><strong>L1</strong></td>
-      <td>M1 Walking Skeleton</td>
       <td>MemStore 核心：本地 FS 对象后端 + Postgres refs + CAS；<code>CommitWithCAS</code>；单写者路由</td>
-      <td>Agent 可读/编辑/提交记忆，历史版本化、可 diff</td>
-      <td><a href="03-storage-consistency.html">③ 存储与一致性</a></td>
+      <td>agent 可读/编辑/提交记忆，历史版本化、可 diff</td>
+      <td><a href="03-storage-consistency.html">存储与一致性</a></td>
     </tr>
     <tr>
       <td><strong>L2</strong></td>
-      <td>M1（完善）</td>
       <td>Agent 循环 + Session；工具集（recall / read / edit）；上下文组装；LLM fake/anthropic 后端</td>
       <td>完整的推理-编辑-提交循环端到端可运行</td>
-      <td><a href="02-request-path.html">② 请求路径</a></td>
+      <td><a href="02-request-path.html">请求路径</a></td>
     </tr>
     <tr>
       <td><strong>L3</strong></td>
-      <td>M2 Read Cache</td>
-      <td>SHA 键控 LRU 读缓存；<code>assembleSystem</code> 缓存支持；Router/cmd 注入共享缓存</td>
-      <td><code>system/</code> 内容跨轮次命中缓存，不重复读对象存储；缓存永远不失效</td>
-      <td><a href="02-request-path.html">② 请求路径</a></td>
+      <td>SHA 键控 LRU 读缓存；<code>assembleSystem</code> 缓存支持；Router/cmd 注入共享缓存实例</td>
+      <td><code>system/</code> 内容跨轮次命中缓存，不重复读对象存储；缓存永远不需要失效</td>
+      <td><a href="02-request-path.html">请求路径</a></td>
     </tr>
     <tr>
       <td><strong>L4</strong></td>
-      <td>M4 Search</td>
       <td>混合搜索（trigram 词法 + 嵌入向量语义）；Recall 工具返回行范围；Search Variant A（本地内容）</td>
-      <td>查询时零对象存储访问；混合信号优于纯词法（§15.2）</td>
-      <td><a href="04-search-index.html">④ 搜索与索引</a></td>
+      <td>查询时零对象存储访问；混合信号优于纯词法（§15.2 验证 3-0）</td>
+      <td><a href="04-search-index.html">搜索与索引</a></td>
     </tr>
     <tr>
       <td><strong>L4b</strong></td>
-      <td>M4（完善）</td>
       <td>嵌入向量索引持久化（独立于 GC 的 embedding store）；增量 reindex（git diff 驱动）</td>
       <td>嵌入向量在 worker 重启后幸存；reindex 只处理变更差量</td>
-      <td><a href="04-search-index.html">④ 搜索与索引</a></td>
+      <td><a href="04-search-index.html">搜索与索引</a></td>
     </tr>
     <tr>
       <td><strong>L5a</strong></td>
-      <td>M3 Maintenance</td>
-      <td>GC Worker：标记清除不可达对象；grace 窗口防误删新对象</td>
+      <td>GC Worker：标记清除不可达对象；grace 窗口防误删新写入对象</td>
       <td>垃圾对象（CAS 前崩溃残留）被定期清除；对象存储不无限增长</td>
-      <td><a href="05-maintenance-pipeline.html">⑤ 维护管线</a></td>
+      <td><a href="05-maintenance-pipeline.html">维护管线</a></td>
     </tr>
     <tr>
       <td><strong>L5b</strong></td>
-      <td>M3（完善）</td>
       <td><code>memory_jobs</code> 消费者；Reflection（历史整合）；reconcile loop + 轮询 Postgres</td>
       <td>每轮维护：GC → 出队 memory_jobs（reflection + reindex）；任务按 agent 去重</td>
-      <td><a href="05-maintenance-pipeline.html">⑤ 维护管线</a></td>
+      <td><a href="05-maintenance-pipeline.html">维护管线</a></td>
     </tr>
     <tr>
       <td><strong>L5c</strong></td>
-      <td>M3（完善）</td>
       <td>确定性 Defrag：按顶级标题拆分过大 Markdown 文件（<code>ENGRAM_DEFRAG_MAX_BYTES</code>）</td>
-      <td>收敛性：反复运行产生相同结果；<code>system/</code> 不无限膨胀</td>
-      <td><a href="05-maintenance-pipeline.html">⑤ 维护管线</a></td>
+      <td>收敛性：反复运行产生相同结果；<code>system/</code> 文件不无限膨胀</td>
+      <td><a href="05-maintenance-pipeline.html">维护管线</a></td>
     </tr>
     <tr>
       <td><strong>L5d</strong></td>
-      <td>M3（完善）</td>
-      <td>停滞任务 Reaper：<code>claimed_at</code> 迁移；<code>ReapStaleJobs</code> 将超时 <code>running</code> 任务回收为 <code>pending</code>；毒任务防护（<code>maxAttempts</code>）</td>
+      <td>停滞任务 Reaper：<code>claimed_at</code> 字段迁移；<code>ReapStaleJobs</code> 将超时 <code>running</code> 任务回收为 <code>pending</code>；毒任务防护（<code>maxAttempts</code>）</td>
       <td>Worker 崩溃不会永久阻塞任务；超过重试上限的毒任务进入 <code>failed</code> 状态（§14 已解决）</td>
-      <td><a href="05-maintenance-pipeline.html">⑤ 维护管线</a></td>
+      <td><a href="05-maintenance-pipeline.html">维护管线</a></td>
     </tr>
   </tbody>
 </table>
 
 <div class="callout win">
   <span class="tag">里程碑完成度</span>
-  <p>设计路线图 M1–M5 的所有功能均已实现并合并至 main 分支（L1–L5d）。唯一推迟的功能是 embedding store 的淘汰策略（speculative：嵌入向量是推导产物，可重建，且体量小）。下一步方向：M5 River 队列升级（更丰富的重试语义）以及温热 sidecar（提升 grep 精度）。</p>
+  <p>设计路线图 M1–M4 的所有功能均已实现并合并至 main 分支（L1–L5d）。下一步方向：M5 River 队列升级（更丰富的重试语义）以及温热 per-agent sidecar（提升 grep 精度，当 grep 延迟或精度成为瓶颈时考虑）。</p>
 </div>
 
-<!-- ─────────────────────────────────────────────────────── -->
+<!-- ──────────────────────────────────────────────────── §7 -->
 <h2>7. 技术栈</h2>
 
 <div class="cardgrid">
@@ -346,51 +406,50 @@ sequenceDiagram
     <h3>Go</h3>
     <ul>
       <li>所有 I/O 函数第一参数为 <code>context.Context</code></li>
-      <li>错误用 <code>%w</code> 包装（可追溯链）</li>
-      <li>无全局可变状态</li>
-      <li>包边界用小接口隔离</li>
-      <li>测试用表驱动（table-driven tests）</li>
+      <li>错误用 <code>%w</code> 包装，调用链完整可追溯</li>
+      <li>无全局可变状态；包边界用小接口隔离</li>
+      <li>测试用表驱动（table-driven），Postgres 依赖测试在 <code>ENGRAM_TEST_DB</code> 未设置时自动 <code>t.Skip</code></li>
     </ul>
   </div>
   <div class="card">
     <div class="num">数据库</div>
     <h3>Postgres + pgx</h3>
     <ul>
-      <li>refs CAS（<code>agent_refs</code>）</li>
-      <li>任务队列（<code>memory_jobs</code>，SKIP LOCKED）</li>
-      <li>维护游标（<code>maintenance_cursor</code>）</li>
-      <li>迁移：<code>golang-migrate</code>，扩展-收缩，从不破坏性单步</li>
+      <li><code>agent_refs</code>：refs CAS，唯一强一致性协调点</li>
+      <li><code>memory_jobs</code>：任务队列，<code>FOR UPDATE SKIP LOCKED</code> 出队，按 agent+kind 去重</li>
+      <li><code>maintenance_cursor</code>：reconcile loop 游标</li>
+      <li>迁移：<code>golang-migrate</code>，扩展-收缩策略，单步从不破坏性</li>
     </ul>
   </div>
   <div class="card">
     <div class="num">对象存储</div>
     <h3>S3 / 本地 FS</h3>
     <ul>
-      <li>始终隐藏在 <code>ObjStore</code> 接口后方</li>
-      <li>生产用 S3/OSS；开发/测试用本地 FS 后端</li>
+      <li>始终隐藏在 <code>ObjStore</code> 接口后方；上层代码无感知替换</li>
+      <li>生产用 S3/OSS；开发/测试用本地 FS 后端（<code>ENGRAM_OBJ</code>）</li>
       <li>要求桶具备读后写强一致性（S3 自 2020 年起满足）</li>
-      <li>嵌入向量 store 独立于 git 对象 store（GC 不扫描前者）</li>
+      <li>Embedding store 独立于 git 对象 store，GC 不扫描前者</li>
     </ul>
   </div>
   <div class="card">
     <div class="num">Git 层</div>
     <h3>go-git + 自定义 Storer</h3>
     <ul>
-      <li>go-git 的 <code>Storer</code> 接口由 <code>ObjStore</code> 支撑</li>
-      <li>服务内部<strong>不调用</strong> <code>git</code> 二进制</li>
-      <li>工作树 materialize 用 <code>osfs</code>；测试可换 <code>memfs</code></li>
-      <li>未来无本地磁盘路径：全内存 billy <code>Filesystem</code>（§10.1 提及，尚未实现）</li>
+      <li>go-git 的 <code>Storer</code> 接口由 <code>ObjStore</code> 实现支撑</li>
+      <li>服务内部<strong>不调用</strong> <code>git</code> 二进制——shell out 在服务中不可靠且难以测试</li>
+      <li>工作树 materialize 用 <code>osfs</code>；测试可换 <code>memfs</code>，无需磁盘</li>
+      <li>未来路径：全内存 billy <code>Filesystem</code>，让 worker 无本地磁盘依赖（§10.1，尚未实现）</li>
     </ul>
   </div>
 </div>
 
-<h3>核心接口速览（<code>docs/architecture.md §11</code>）</h3>
+<h3>核心接口速览（<code>architecture.md §11</code>）</h3>
 
 <pre><code>type MemStore interface {
-    // ResolveHead 读取 agent 当前 HEAD（廉价 ref 读）
+    // ResolveHead 读取 agent 当前 HEAD（廉价 ref 读，不触碰对象存储）
     ResolveHead(ctx context.Context, agentID string) (CommitHash, error)
 
-    // Materialize 将 at 处的树检出到 dir（工作副本）
+    // Materialize 将 at 处的树检出到 dir（可丢弃的工作副本）
     Materialize(ctx context.Context, agentID string, at CommitHash, dir string) error
 
     // CommitWithCAS 写对象，构建提交，在同一 DB tx 中原子推进 HEAD 并入队任务
@@ -415,11 +474,11 @@ type Search interface {
   maintenance/    # 后台 Go Worker（reconcile loop）
 internal/
   memstore/       # MemStore 权威存储（ObjStore + refs + gitfs）
-    objstore/     # 内容寻址对象后端（S3 | 本地）
+    objstore/     # 内容寻址对象后端（S3 | 本地 FS）
     refs/         # Postgres refs + CAS + 任务队列
     gitfs/        # go-git Storer over objstore；materialize 工作树
   cache/          # SHA 键控记忆缓存（system/ + 树索引）
-  search/         # trigram 索引：构建 + 查询 + 嵌入向量
+  search/         # trigram 索引 + 嵌入向量：构建 + 查询
   agent/          # agent 循环：组装上下文、工具（recall/read/edit）、提交
   maintenance/    # reflection / defrag / gc / reaper 任务实现
 docs/
@@ -427,54 +486,6 @@ docs/
   architecture.html
   reports/        # 本系列深入解析报告（01–06）</code></pre>
 
-<!-- ─────────────────────────────────────────────────────── -->
-<h2>8. 2026 最佳实践交叉验证摘要（§15）</h2>
-
-<p>一次深度、多源、对抗性验证的最佳实践审查（<code>docs/architecture.md §15</code>）对上述设计进行了交叉检验。结论摘要如下：</p>
-
-<table>
-  <thead>
-    <tr>
-      <th>决策</th>
-      <th>验证结果</th>
-      <th>来源</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>不可变对象 + Postgres ref CAS</td>
-      <td class="pill" style="color:#1f9d57;background:#f0fdf4">验证 3-0</td>
-      <td>与 lakeFS 设计完全对应（§15.1）</td>
-    </tr>
-    <tr>
-      <td>同一事务 CAS + 入队（无 Kafka/outbox）</td>
-      <td class="pill" style="color:#1f9d57;background:#f0fdf4">验证 3-0</td>
-      <td>防止孤立任务和提交/发送竞争（§15.1）</td>
-    </tr>
-    <tr>
-      <td>纯词法 trigram 搜索（Variant A）</td>
-      <td class="pill" style="color:#c2410c;background:#fff7ed">A/B 候选</td>
-      <td>混合信号（trigram + 嵌入）在长尾召回质量上优于纯词法（§15.2）→ L4 已实现混合</td>
-    </tr>
-    <tr>
-      <td>Postgres SKIP LOCKED 任务队列</td>
-      <td class="pill" style="color:#c2410c;background:#fff7ed">陷阱需规避</td>
-      <td>ORDER BY + 高并发可超线性退化；单写者天然低并发（§15.3）</td>
-    </tr>
-    <tr>
-      <td>Git 对象模型（小型 prose Markdown）</td>
-      <td class="pill" style="color:#1f9d57;background:#f0fdf4">当前安全</td>
-      <td>大文件/深历史场景有风险，当前用例不受影响（§15.4）</td>
-    </tr>
-  </tbody>
-</table>
-
-<div class="callout win">
-  <span class="tag">小结</span>
-  <p>Engram 的三条核心不变量不仅在内部逻辑自洽，也被独立的 2026 行业实践所佐证：不可变内容寻址对象 + 强一致 CAS ref 是现代版本化数据湖（lakeFS 等）的共识方案；同一 Postgres 事务入队是消除双写不一致的最简路径。架构当前最大的可优化方向是搜索召回质量（L4 混合搜索已推进）和任务队列在更高并发下的健壮性（M5 River 升级候选）。</p>
-</div>
-
 </main>
-<footer>Engram 深入解析报告 · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
-</body>
-</html>
+<footer>Engram 深入解析 · 手工 SVG/HTML 图表,离线可读 · 基于 main 分支 L1–L5d</footer>
+</body></html>

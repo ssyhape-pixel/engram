@@ -1,95 +1,114 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
+<!DOCTYPE html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Engram · 搜索与索引</title>
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
-</head>
-<body>
+</head><body>
 <nav class="topnav">
   <span class="brand">Engram</span>
-  <a href="index.html">总览索引</a>
-  <a href="01-architecture-overview.html">① 架构总览</a>
-  <a href="02-request-path.html">② 请求路径</a>
-  <a href="03-storage-consistency.html">③ 存储与一致性</a>
-  <a href="04-search-index.html" class="active">④ 搜索与索引</a>
-  <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>
-  <a href="06-build-journey.html">⑥ 构建历程</a>
+  <a href="index.html">索引</a>
+  <a href="01-architecture-overview.html">架构总览</a>
+  <a href="02-request-path.html">请求路径</a>
+  <a href="03-storage-consistency.html">存储与一致性</a>
+  <a href="04-search-index.html" class="active">搜索与索引</a>
+  <a href="05-maintenance-pipeline.html">维护管线</a>
+  <a href="06-build-journey.html">构建历程</a>
 </nav>
 <main>
 
 <p class="meta">L4 · L4b · hybrid search · embedding persistence · incremental reindex</p>
-<h1>④ 搜索与索引</h1>
-<p class="lead">Trigram 倒排索引 × 语义向量检索，通过 RRF 融合；embedding 持久化让增量 reindex 免费获得。</p>
+<h1>搜索与索引</h1>
+<p class="lead">两种互补的找法（三字片段倒排 + 段落语义向量）经 RRF 融合成一条结果；
+向量算一次就持久存下来，后续调用透明复用——无论会话重启、Pod 换节点还是后台预热，都共享同一份向量库。</p>
 
-<!-- ────────────────────────────────────────────── §1 设计立场 -->
-<h2 id="s1">1. 设计立场：记忆是主动的，不是 RAG</h2>
+<!-- ────────────────────────────────────────────── §1 立场 -->
+<h2 id="s1">1. 立场：记忆是主动翻找的，不是开口前倒进去的</h2>
 
 <p>
-Engram 的 recall 是一个<strong>中循环工具调用</strong>，由模型在推理过程中按需发起，不是预推理阶段的 top-k 填充。
+Engram 的 recall 是一个<strong>中循环工具调用</strong>——模型在推理过程中按需发起，
+不是预推理阶段把所有相关片段一股脑检索进来的"RAG 前置"。
+</p>
+<p>
 推理开始时只加载两类内容：
 </p>
 <ul>
-  <li><strong><code>system/</code> 常驻文件</strong>——直接进入系统提示，由 L3 SHA 读缓存加速（见 §5）；</li>
-  <li><strong>树索引（文件名 + description 字段）</strong>——让模型知道长尾记忆的存在。</li>
+  <li><strong><code>system/</code> 常驻文件</strong>——直接进入系统提示，由 L3 SHA 读缓存加速（详见报告 <a href="02-request-path.html">② 请求路径</a>）；</li>
+  <li><strong>树索引（文件名 + description 字段）</strong>——让模型知道长尾记忆的存在，但不把内容拉进来。</li>
 </ul>
 <p>
-只有当模型判断某段长尾记忆与当前任务相关时，才调用 <code>recall(query, k)</code> 拉取精确的行范围，
-类似"按需分页"而非"提前倒入"。
+只有当模型判断某段长尾记忆与当前任务相关时，才显式调用 <code>recall(query, k)</code>，
+拿回精确的行范围和片段。这类似"按需分页"而不是"提前整批倒入"。
 </p>
 
-<p><strong>搜索变体 A（默认）</strong>：Trigram 索引直接存储文件行的文本内容，查询时零对象存储访问。
-整个索引在 Session 打开时于内存中从已物化的工作目录重建，随 Session 关闭而丢弃——它是可再生的派生视图，
-不是权威存储（符合核心不变量 ③）。
+<p>
+<strong>搜索本地化（Variant A，默认）：</strong>
+Trigram 索引和语义索引在 Session 开启时于内存中从已物化的工作目录重建，
+查询时零对象存储访问。索引随 Session 关闭而丢弃——它是可再生的派生视图，不是权威存储。
 </p>
 
 <div class="callout invariant">
   <span class="tag">不变量</span>
-  索引（trigram + semantic）是派生的、可丢弃的视图。真相永远在 object store 的 content-addressed 对象 + Postgres ref 里。
-  缓存崩溃、索引丢失，均可从对象重建，不影响正确性。
+  <p>索引（trigram + semantic）是派生的、可丢弃的视图。真相永远在 object store 的 content-addressed 对象 + Postgres ref 里。缓存崩溃、索引丢失均可从对象重建，不影响正确性（核心不变量 ③）。</p>
 </div>
 
-<h3>Recall 查询流</h3>
+<h3>Recall 查询链路</h3>
 
-<pre class="mermaid">
-sequenceDiagram
-  participant M as 模型
-  participant T as RecallTool
-  participant H as HybridSearch
-  participant TRI as TrigramIndex
-  participant SEM as SemanticIndex
-  participant EMB as Embedder
-
-  M->>T: recall("project goals", k=5)
-  T->>H: Recall(ctx, agentID, query, 5)
-  H->>TRI: Search(query, n=10)
-  TRI-->>H: lexical hits 按路径排序
-  H->>SEM: Search(ctx, query, n=10)
-  SEM->>EMB: Embed(ctx, query)
-  EMB-->>SEM: query vector
-  SEM-->>H: semantic hits 按余弦排序
-  H->>H: rrf(lists, k=5)
-  H-->>T: top-5 Hit 行范围
-  T-->>M: snippet + lineStart/lineEnd
-</pre>
-
-<p class="fileref">search.go:8–21 · hybrid.go:30–48</p>
-
-<!-- ────────────────────────────────────────────── §2 Trigram -->
-<h2 id="s2">2. Trigram 倒排索引</h2>
+<div class="figure">
+<!-- 召回链路：水平流 -->
+<div class="flow">
+  <div class="node accent">
+    <span class="t">模型</span>
+    <span class="s">recall("query", k=5)</span>
+  </div>
+  <div class="arrow"></div>
+  <div class="node accent">
+    <span class="t">RecallTool</span>
+    <span class="s">HybridSearch.Recall</span>
+  </div>
+  <div class="arrow"></div>
+  <div class="node">
+    <span class="t">TrigramIndex</span>
+    <span class="s">Search(query, n=10)</span>
+  </div>
+  <div class="arrow lbl"><span class="al">并行</span></div>
+  <div class="node">
+    <span class="t">SemanticIndex</span>
+    <span class="s">Search(ctx, query, n=10)</span>
+  </div>
+  <div class="arrow"></div>
+  <div class="node accent">
+    <span class="t">rrf(lists, k=5)</span>
+    <span class="s">RRF 融合 → top-5 Hit</span>
+  </div>
+</div>
+<p class="figcap">
+  <code>search.go:8–21</code> · <code>hybrid.go:30–48</code> ·
+  RecallTool 把 Hit 的 Path + LineStart/LineEnd + Snippet 返回给模型
+</p>
+</div>
 
 <p>
-<code>TrigramIndex</code>（<span class="fileref">trigram.go</span>）是一个<strong>行级倒排索引</strong>，
-以 3-rune 小写 shingle 为键，存储 <code>(path, line)</code> 的 posting 列表。
-关键设计点：它保留行的原始文本（<code>lines map[string][]string</code>），
-因此查询时无需访问任何外部存储——纯内存 CPU 操作，零 I/O。
+语义检索需要先对 query 做一次向量化（<code>Embed</code>）；如果 Embed 失败，
+该分支被静默丢弃，只用 trigram 结果继续——模型始终能拿到答案（见 §4）。
 </p>
 
-<h3>核心实现</h3>
+<!-- ────────────────────────────────────────────── §2 Trigram -->
+<h2 id="s2">2. 关键词找法：三字片段倒排索引</h2>
 
-<pre><code>// trigram.go:21–37
+<p>
+白话解释什么是"三字片段倒排"：
+把每一行文字拆成三个字符一组的滑动窗口（shingle），建一张反查表——
+给定任意三字片段，能立刻查到"哪些行含有它"。
+找"project goals"这个词时，先用 <code>pro</code>、<code>roj</code>、<code>oje</code>…把候选行圈出来，
+再精确验证哪些行真正包含完整字串。
+</p>
+
+<p>
+这套索引是纯 CPU、零 I/O 的。Session 开启时与物化树同步重建，轻量到可以随时丢弃再来。
+</p>
+
+<h3>Trigram 提取</h3>
+
+<pre><code><span class="cm">// trigram.go:21–37</span>
 func trigrams(s string) []string {
     r := []rune(strings.ToLower(s))
     if len(r) &lt; 3 { return nil }
@@ -97,36 +116,32 @@ func trigrams(s string) []string {
     out := make([]string, 0, len(r)-2)
     for i := 0; i+3 &lt;= len(r); i++ {
         t := string(r[i : i+3])
-        if _, ok := seen[t]; ok { continue }
+        if _, ok := seen[t]; ok { continue }   <span class="cm">// 同行重复 trigram 只记一次</span>
         seen[t] = struct{}{}
         out = append(out, t)
     }
     return out
-}
-</code></pre>
+}</code></pre>
 
 <p>
 去重是关键：同一个 trigram 在一行中出现多次只记一次，避免 posting 列表膨胀。
+索引和查询均 lowercase，返回的 snippet 保留原始大小写。
 </p>
 
-<h3>候选集求交</h3>
+<h3>候选集求交 → 精确验证</h3>
 
 <p>
-<code>candidates(query)</code>（<span class="fileref">trigram.go:65–102</span>）：
+<code>candidates(query)</code>（<code>trigram.go:65–102</code>）的逻辑分两步：
 </p>
-<ol>
-  <li>将查询拆成 trigram 集合；</li>
-  <li>每个 trigram 的 posting 列表转为 <code>map[posting]struct{}</code>；</li>
-  <li>从最小的集合开始做<strong>交集</strong>（减少无效遍历）；</li>
-  <li>对于少于 3 个字符的查询（无 trigram），退化为全量扫描。</li>
+
+<ol class="steps">
+  <li><span class="st">切 trigram，查 posting 列表。</span><span class="sd">查询串的每个三字片段各自取出"含有它的行"集合；若某 trigram 在整个索引里找不到，立即返回空集（早退）。</span></li>
+  <li><span class="st">从最小集合开始做交集。</span><span class="sd">按 posting 集合大小升序排列，从最小的那个开始逐一过滤，最小化无效遍历。</span></li>
+  <li><span class="st">精确子串验证。</span><span class="sd"><code>strings.Contains(lowercase(lineText), lowercase(query))</code> 是最终判据——trigram 交集是<strong>预过滤器</strong>（可能有假阳性），substring 检查移除它们。不漏报也不错报。</span></li>
+  <li><span class="st">短查询退化为全量扫描。</span><span class="sd">长度小于 3 个 rune 时无 trigram 可用，对所有行做一次 grep（退化为线性扫描）。</span></li>
 </ol>
 
-<p>
-最终 <code>Search</code> 做了双重过滤：trigram 交集是<strong>预过滤器</strong>（可能有假阳性），
-<code>strings.Contains</code> 子字符串检查是<strong>精确谓词</strong>。
-</p>
-
-<pre><code>// trigram.go:107–135 (Search)
+<pre><code><span class="cm">// trigram.go:107–135 (Search)</span>
 func (t *TrigramIndex) Search(query string, k int) []Hit {
     q := strings.ToLower(query)
     var matches []posting
@@ -135,63 +150,61 @@ func (t *TrigramIndex) Search(query string, k int) []Hit {
             matches = append(matches, p)
         }
     }
-    // 按 path, line 排序保证输出稳定
-    sort.Slice(matches, func(i, j int) bool { ... })
+    sort.Slice(matches, func(i, j int) bool { <span class="cm">/* path asc, line asc */</span> })
+    <span class="cm">// 截取 top-k，每条命中 LineStart == LineEnd（单行）</span>
     ...
-}
-</code></pre>
+}</code></pre>
 
 <table>
   <thead><tr><th>特性</th><th>说明</th></tr></thead>
   <tbody>
-    <tr><td>粒度</td><td>行级 posting，返回单行 Hit（LineStart == LineEnd）</td></tr>
-    <tr><td>大小写</td><td>索引和查询均 lowercase，snippet 保留原始大小写</td></tr>
-    <tr><td>重建成本</td><td>纯 CPU，Session 打开时与物化树同步完成</td></tr>
+    <tr><td>粒度</td><td>行级 posting；返回 Hit，LineStart == LineEnd（单行）</td></tr>
+    <tr><td>大小写</td><td>索引和查询均 lowercase；snippet 保留原始大小写</td></tr>
+    <tr><td>重建成本</td><td>纯 CPU；Session 开启时与物化树同步完成</td></tr>
     <tr><td>假阳性</td><td>trigram 交集后有 substring 精确验证，不漏报也不错报</td></tr>
-    <tr><td>短查询</td><td>长度小于 3 时全量扫描（退化为 grep）</td></tr>
+    <tr><td>短查询（&lt;3 rune）</td><td>退化为全量线性扫描</td></tr>
+    <tr><td>I/O</td><td>零——行文本已存在 <code>lines map[string][]string</code> 里</td></tr>
   </tbody>
 </table>
 
-<!-- ────────────────────────────────────────────── §3 语义检索 -->
-<h2 id="s3">3. 语义检索</h2>
+<p class="fileref">trigram.go · BuildTrigram:40 · candidates:65 · Search:107</p>
+
+<!-- ────────────────────────────────────────────── §3 语义 -->
+<h2 id="s3">3. 语义找法：段落向量索引</h2>
 
 <p>
-语义索引（<span class="fileref">semantic.go</span>）将文件按 Markdown 一级标题分段（<em>sectionize</em>），
-对每一段计算 embedding 向量，查询时用余弦相似度排名。
-与 trigram 不同，语义检索的匹配单元是<strong>段落</strong>而非行，
-因此能捕捉跨行、跨表达方式的语义相关性。
+白话解释：把一段文字"变成一串数字"，意思相近的文字对应的数字串也相近（余弦相似度高）。
+关键词找法要求查询词和文档里的词一模一样；语义找法则能捕捉"项目目标"和"project goals"
+这类跨语言/近义的关联，以及跨行分布的含义。
 </p>
 
 <h3>分段逻辑</h3>
 
 <p>
-<code>sectionize</code>（<span class="fileref">semantic.go:40–52</span>）：
-逐行扫描，遇到以 <code>#</code> 开头的行（即任意级别标题）就划出一个段落边界。
-第一个标题前的内容作为独立段落，文件无标题则整个文件为一段。
-返回的 <code>section</code> 携带 1-based 行范围，用于 Hit 定位。
+<code>sectionize</code>（<code>semantic.go:40–52</code>）以 Markdown 任意级标题行（<code>#</code> 开头）为边界，
+把文件切成若干<strong>段落</strong>。第一个标题前的内容自成一段；无标题则整个文件为一段。
+每段携带 1-based 行范围，用于 Hit 定位。
 </p>
 
-<h3>Embedding 键设计</h3>
+<h3>Embedding key 设计——内容寻址</h3>
 
-<p>
-内容寻址是语义持久化的核心。每个段落的 embedding key：
-</p>
-
-<pre><code>// semantic.go:63–66
+<pre><code><span class="cm">// semantic.go:63–66</span>
 func embKey(model, text string) string {
     sum := sha256.Sum256([]byte(text))
     return "emb:" + model + ":" + base64.RawStdEncoding.EncodeToString(sum[:])
-}
-</code></pre>
+}</code></pre>
 
 <p>
-<code>model</code> 前缀确保不同 embedding 模型的向量不会混用（如从 <code>fake</code> 切换到 <code>voyage-3</code>）。
-<code>sha256(text)</code> 确保内容相同的段落复用缓存，内容变化则生成新 key。
+两段信息共同构成 key：
 </p>
+<ul>
+  <li><strong><code>model</code> 前缀</strong>——不同嵌入模型的向量维度/语义空间不同，混用会让相似度计算失效；</li>
+  <li><strong><code>sha256(text)</code></strong>——相同内容在任何时间、任何 worker 上对应同一个 key；内容一旦变化则 key 随之变化，天然内容寻址。</li>
+</ul>
 
 <h3>BuildSemantic：缓存命中 → 复用，缺失 → 批量 Embed → Put</h3>
 
-<pre><code>// semantic.go:107–156 (BuildSemantic，核心逻辑)
+<pre><code><span class="cm">// semantic.go:107–156（核心逻辑）</span>
 for _, p := range paths {
     for _, sec := range sectionize(string(files[p])) {
         ci := len(si.chunks)
@@ -200,35 +213,24 @@ for _, p := range paths {
         if c != nil {
             if enc, ok := c.Get(key); ok {
                 si.chunks[ci].vec = decodeVec(enc)
-                continue              // 缓存命中：直接复用，不调用 Embed
+                continue              <span class="cm">// 缓存命中：直接复用，不调用 Embed</span>
             }
         }
         pend = append(pend, pending{ci: ci, text: sec.text, key: key})
     }
 }
 if len(pend) &gt; 0 {
-    vecs, err := emb.Embed(ctx, texts)   // 批量调用一次
+    vecs, err := emb.Embed(ctx, texts)   <span class="cm">// 所有缺失段落一次批量调用</span>
     ...
     for i, pp := range pend {
         si.chunks[pp.ci].vec = vecs[i]
-        if c != nil {
-            c.Put(pp.key, encodeVec(vecs[i]))  // 写入缓存
-        }
+        if c != nil { c.Put(pp.key, encodeVec(vecs[i])) }   <span class="cm">// 写入缓存</span>
     }
-}
-</code></pre>
+}</code></pre>
 
 <p>
-所有缺失的段落汇总后<strong>一次批量调用</strong> <code>Embed</code>，最小化 API 往返。
-写入缓存（<code>c.Put</code>）在拿到向量后立即执行。
-如果 <code>c == nil</code>（未注入缓存），则跳过所有缓存逻辑，退化为纯内存模式。
-</p>
-
-<h3>向量编解码</h3>
-
-<p>
-向量存为 base64 编码的 little-endian float32 字节串（<span class="fileref">semantic.go:68–86</span>），
-与 <code>cache.Cache</code> 的 string 接口直接兼容，无需额外序列化层。
+向量存为 little-endian float32 字节串的 base64 编码（<code>semantic.go:68–86</code>），
+与 <code>cache.Cache</code> 的 <code>string</code> 接口直接兼容，无需额外序列化层。
 </p>
 
 <h3>Embedder 接口与实现</h3>
@@ -240,35 +242,37 @@ if len(pend) &gt; 0 {
       <td><code>FakeEmbedder</code></td>
       <td>测试 / 开发</td>
       <td><code>"fake"</code></td>
-      <td>确定性 FNV bag-of-words，共享词汇的文本获得更高余弦相似度</td>
+      <td>确定性 FNV bag-of-words；共享词汇的文本余弦相似度更高；无网络调用</td>
     </tr>
     <tr>
       <td><code>VoyageEmbedder</code></td>
       <td>生产</td>
-      <td><code>"voyage-3"</code>（可配置）</td>
-      <td>调用 <code>https://api.voyageai.com/v1/embeddings</code>，JSON POST</td>
+      <td><code>"voyage-3"</code>（可覆盖）</td>
+      <td>JSON POST 至 <code>https://api.voyageai.com/v1/embeddings</code>；批量输入；HTTP 错误包装后返回</td>
     </tr>
   </tbody>
 </table>
 
-<p class="fileref">embedder.go:10–54 · voyage.go:1–93</p>
+<p class="fileref">embedder.go:10–54 · voyage.go:33–92</p>
 
 <!-- ────────────────────────────────────────────── §4 RRF -->
-<h2 id="s4">4. RRF 融合</h2>
+<h2 id="s4">4. 两种找法揉一起：RRF 融合</h2>
 
 <p>
-<code>HybridSearch.Recall</code> 调用 trigram + semantic 各取 <code>max(k, 10)</code> 条，
-再通过 Reciprocal Rank Fusion 合并为最终 top-k 列表。
+白话解释 RRF（Reciprocal Rank Fusion）：
+给每条候选结果在各自列表里的<strong>名次</strong>打分——名次越靠前，分越高；
+两边都靠前的，总分最高。公式是 <code>1 / (60 + rank + 1)</code>，
+常数 60 平滑了头部排名差异（标准超参数），使得第 1 名和第 2 名的分差不那么悬殊。
+同一条结果出现在多个列表时，得分累加。
 </p>
 
 <h3>RRF 实现</h3>
 
-<pre><code>// hybrid.go:56–85
+<pre><code><span class="cm">// hybrid.go:56–85</span>
 func rrf(lists [][]Hit, k int) []Hit {
     const rrfK = 60
-    type agg struct { hit Hit; score float64 }
     scores := map[string]*agg{}
-    var order []string
+    var order []string   <span class="cm">// 首次出现顺序，保证同分时稳定 tie-break</span>
     for _, list := range lists {
         for rank, hit := range list {
             id := fmt.Sprintf("%s:%d-%d", hit.Path, hit.LineStart, hit.LineEnd)
@@ -278,302 +282,412 @@ func rrf(lists [][]Hit, k int) []Hit {
                 scores[id] = a
                 order = append(order, id)
             }
-            a.score += 1.0 / float64(rrfK+rank+1)
+            a.score += 1.0 / float64(rrfK+rank+1)   <span class="cm">// 累加贡献</span>
         }
     }
     sort.SliceStable(order, func(i, j int) bool {
         return scores[order[i]].score &gt; scores[order[j]].score
     })
-    ...
-}
-</code></pre>
+    <span class="cm">// 取 top-k</span>
+}</code></pre>
 
 <p>
-RRF 公式：每条结果在某列表中排名 <em>r</em>（0-based）对融合得分的贡献为
-<code>1 / (60 + r + 1)</code>。常数 60 平滑了头部排名差异，是 RRF 的标准超参数。
-命中 ID 以 <code>path:lineStart-lineEnd</code> 标识，出现在多个列表中的结果得分累加。
-<code>SliceStable</code> + <code>order</code>（首次出现顺序）保证同分时稳定 tie-break。
+命中 ID 以 <code>path:lineStart-lineEnd</code> 标识；行级和段落级 Hit 的 ID 格式相同，
+因此同一行恰好也是一个段落时，两边的分数会合并。
 </p>
 
 <h3>降级策略</h3>
 
 <p>
-<code>NewHybrid</code>（<span class="fileref">hybrid.go:22–28</span>）在构建时 best-effort 构建语义索引——
+<code>NewHybrid</code>（<code>hybrid.go:22–28</code>）在构建时 best-effort 构建语义索引——
 若 <code>BuildSemantic</code> 报错（如 embedding 服务不可用），<code>h.sem</code> 保持 <code>nil</code>，
-Recall 仅使用 trigram 列表，不报错。查询时 semantic 失败也同样静默降级：
+Recall 仅使用 trigram 列表，不向调用方报错。查询时 semantic 失败也同样静默降级：
 </p>
 
-<pre><code>// hybrid.go:41–47
+<pre><code><span class="cm">// hybrid.go:41–47</span>
 if h.sem != nil {
     if semHits, err := h.sem.Search(ctx, query, n); err == nil {
         lists = append(lists, semHits)
     }
-    // 查询时 embedding 失败：丢弃语义，保留 trigram（降级）
-}
-</code></pre>
+    <span class="cm">// 查询时 embedding 失败：丢弃语义，保留 trigram（降级）</span>
+}</code></pre>
 
 <div class="callout invariant">
   <span class="tag">不变量</span>
-  Recall 永远不因 embedding 服务故障而报错。最差情况退化为纯 trigram 检索，
-  覆盖精确词汇匹配场景。见测试 <code>TestHybridDegradesWhenEmbeddingFails</code>。
+  <p>Recall 永远不因 embedding 服务故障而报错。最差情况退化为纯 trigram 检索，
+  覆盖精确词汇匹配场景。见测试 <code>TestHybridDegradesWhenEmbeddingFails</code>（<code>hybrid_test.go</code>）。</p>
 </div>
 
-<h3>Trigram vs Semantic：互补的盲区</h3>
+<h3>两种找法的互补盲区</h3>
+
+<div class="cmp">
+  <div class="col good">
+    <h4>Trigram 强在哪</h4>
+    <ul>
+      <li>精确 token（如 <code>xq7z9</code>、API key 片段）</li>
+      <li>无 embedding 服务时仍工作</li>
+      <li>短文件、精确拼写场景</li>
+      <li>零额外延迟（纯内存）</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Semantic 强在哪</h4>
+    <ul>
+      <li>跨行分布的短语（词在三行里各一个）</li>
+      <li>同义词 / 近义描述（"目标" ≈ "goals"）</li>
+      <li>跨语言语义相关</li>
+      <li>模糊提问，不记得原文措辞</li>
+    </ul>
+  </div>
+</div>
 
 <table>
   <thead><tr><th>查询类型</th><th>Trigram</th><th>Semantic</th></tr></thead>
   <tbody>
-    <tr><td>精确 token（如 <code>xq7z9</code>）</td><td>强（精确子串）</td><td>弱（稀有词 embedding 不稳定）</td></tr>
-    <tr><td>跨行语义短语（如 "alpha beta gamma" 分三行）</td><td>不命中</td><td>强（段落向量捕捉词汇分布）</td></tr>
+    <tr><td>精确 token（如 <code>xq7z9</code>）</td><td>强（精确子串）</td><td>弱（稀有词向量不稳定）</td></tr>
+    <tr><td>跨行语义短语（词分散在多行）</td><td>不命中</td><td>强（段落向量捕捉词汇分布）</td></tr>
     <tr><td>同义词 / 近义描述</td><td>不命中</td><td>强</td></tr>
     <tr><td>无 embedding 服务</td><td>正常工作</td><td>降级（被忽略）</td></tr>
   </tbody>
 </table>
 
-<!-- ────────────────────────────────────────────── §5 L3 SHA 读缓存 -->
-<h2 id="s5">5. L3 SHA 读缓存</h2>
+<!-- ────────────────────────────────────────────── §5 SHA 读缓存 -->
+<h2 id="s5">5. 按内容指纹的读缓存</h2>
 
 <p>
-<code>cache.Cache</code>（<span class="fileref">cache.go:13–16</span>）是一个极简的字符串 KV 接口：
+<code>cache.Cache</code>（<code>cache.go:13–16</code>）是一个极简的字符串 KV 接口：
 </p>
 
 <pre><code>type Cache interface {
     Get(key string) (string, bool)
     Put(key, val string)
-}
-</code></pre>
+}</code></pre>
 
 <p>
-所有 key 都是内容哈希，因此<strong>命中 = 等价于重新计算</strong>，不存在失效问题。
-"失效"的唯一形式是 LRU 淘汰（空间压力），不影响正确性，只影响缓存率。
+Engram 的所有缓存 key 都是内容哈希，因此<strong>命中 = 等价于重新计算</strong>，
+不存在"旧值失效"的问题。"失效"的唯一形式是 LRU 淘汰（空间压力），不影响正确性，只影响缓存率。
 </p>
 
 <p>
-<code>LRU</code>（<span class="fileref">cache.go:23–69</span>）：
+<code>LRU</code>（<code>cache.go:23–69</code>）：
 </p>
 <ul>
   <li>单 <code>sync.Mutex</code> 保护所有操作——<code>Get</code> 需要修改 recency list（<code>MoveToFront</code>），无法用 RWMutex；</li>
-  <li>容量上限为 entry 数量（默认 1024），超出时淘汰最旧项；</li>
-  <li>同一 key 重复 <code>Put</code> 会刷新 recency，不增加 entry 数。</li>
+  <li>容量上限为 entry 数量；超出时淘汰最旧项；</li>
+  <li>同一 key 重复 <code>Put</code> 刷新 recency，不增加 entry 数。</li>
 </ul>
 
 <p>
-L3 缓存在 Session 层有两个独立实例：
+Session 层有两个独立的缓存实例（见 <code>router.go:40</code> 注释：<em>"they MUST be different instances"</em>）：
 </p>
 <ul>
-  <li><code>sysCache</code>（<code>cache.NewLRU(1024)</code>）——缓存 <code>system/</code> 内容的组装结果，详见报告 ②；</li>
-  <li><code>embCache</code>（Tiered LRU + ObjCache）——缓存 embedding 向量，详见 §6。</li>
+  <li><strong><code>sysCache</code></strong>——<code>cache.NewLRU(1024)</code>，缓存 <code>system/</code> 内容的组装结果，详见报告 <a href="02-request-path.html">②</a>；</li>
+  <li><strong><code>embCache</code></strong>——<code>cache.NewTiered(LRU, ObjCache)</code>，缓存 embedding 向量，详见 §6。</li>
 </ul>
 
 <div class="callout invariant">
   <span class="tag">不变量</span>
-  <code>sysCache</code> 与 <code>embCache</code> 是不同实例，且指向不同的后端 ObjStore 目录。
-  system 内容不会写入 embedding 存储，embedding 向量不会污染 system 缓存。
-  见 <code>NewRouter</code> 注释：<em>"they MUST be different instances"</em>（<span class="fileref">router.go:39</span>）。
+  <p><code>sysCache</code> 与 <code>embCache</code> 是不同实例，且指向不同的后端 ObjStore 目录。
+  system 内容不会写入 embedding 存储，embedding 向量不会污染 system 缓存。</p>
 </div>
 
 <!-- ────────────────────────────────────────────── §6 Embedding 持久化 -->
-<h2 id="s6">6. Embedding 持久化（L4b）</h2>
+<h2 id="s6">6. 把昂贵的向量存下来（L4b）</h2>
 
 <p>
-Voyage API 调用昂贵（时延 + 费用），而段落内容一旦写入就不可变（content-addressed）——
-同一段落的 embedding 在任何时间、任何 worker 上的结果都相同。
-L4b 将 embedding 向量持久化到独立的 content-addressed ObjStore，
-使"昂贵的 Voyage 调用"退化为"廉价的对象存储读"。
+Voyage API 调用有延迟也有费用，而段落内容一旦写入就不可变（content-addressed）——
+同一段落在任何时间、任何 worker 上算出的向量完全相同。
+L4b 把 embedding 向量持久化到独立的 content-addressed ObjStore，
+让"昂贵的联网算向量"退化为"廉价的磁盘/S3 读"。
 </p>
 
-<h3>ObjCache：ObjStore 上的 Cache</h3>
+<p>
+设计的关键妙处在于：<strong>算向量那段代码（<code>BuildSemantic</code>）一行没改</strong>，
+持久化纯靠"换个缓存注进去"——依赖注入，零侵入。
+</p>
 
-<pre><code>// objcache.go:21–24
+<h3>ObjCache：持久化层</h3>
+
+<pre><code><span class="cm">// objcache.go:21–36</span>
 func safeKey(key string) string {
     sum := sha256.Sum256([]byte(key))
-    return hex.EncodeToString(sum[:])
+    return hex.EncodeToString(sum[:])   <span class="cm">// 纯十六进制，文件路径/S3 key 均安全</span>
 }
-</code></pre>
 
-<p>
-<code>embKey</code>（来自 <code>semantic.go</code>）已经是 base64 字符串，但可能含 <code>:</code> 等字符，
-不安全用于文件路径或 S3 键。<code>safeKey</code> 再次 sha256 + hex 编码，得到纯十六进制的 flat key。
-这意味着对象键是键的哈希而非值的哈希，但唯一性由 <code>embKey</code> 的 sha256(text) 保证。
-</p>
-
-<p>
-<code>ObjCache</code> 的所有错误都<strong>降级为 miss / no-op</strong>：
-</p>
-
-<pre><code>// objcache.go:26–38
 func (o *ObjCache) Get(key string) (string, bool) {
     data, err := o.objs.Get(context.Background(), safeKey(key))
-    if err != nil { return "", false }   // error = miss
+    if err != nil { return "", false }   <span class="cm">// 错误 = miss，best-effort</span>
     return string(data), true
 }
 
 func (o *ObjCache) Put(key, val string) {
-    _ = o.objs.Put(context.Background(), safeKey(key), []byte(val))   // ignore error
-}
-</code></pre>
+    _ = o.objs.Put(context.Background(), safeKey(key), []byte(val))   <span class="cm">// 忽略错误</span>
+}</code></pre>
 
-<h3>Tiered：LRU 前 + ObjCache 后</h3>
+<p>
+<code>embKey</code> 已经是 base64 字串（含 <code>:</code>），直接用于文件路径不安全，
+<code>safeKey</code> 再次 sha256 + hex 编码。key 是"key 的哈希"而非"值的哈希"，
+但唯一性由 <code>embKey</code> 内部的 <code>sha256(model+text)</code> 保证。
+</p>
 
-<pre><code>// tiered.go:11–25
+<h3>Tiered：内存层在前，持久层在后</h3>
+
+<pre><code><span class="cm">// tiered.go:11–25</span>
 func (t *Tiered) Get(key string) (string, bool) {
-    if v, ok := t.front.Get(key); ok { return v, true }
+    if v, ok := t.front.Get(key); ok { return v, true }   <span class="cm">// 先查 LRU</span>
     if v, ok := t.back.Get(key); ok {
-        t.front.Put(key, v)    // 从持久层提升到内存层
+        t.front.Put(key, v)   <span class="cm">// 从磁盘提升到内存</span>
         return v, true
     }
     return "", false
 }
 
 func (t *Tiered) Put(key, val string) {
-    t.front.Put(key, val)
-    t.back.Put(key, val)    // 双写：LRU + ObjStore
-}
-</code></pre>
+    t.front.Put(key, val)   <span class="cm">// 同步双写</span>
+    t.back.Put(key, val)
+}</code></pre>
 
 <p>
-读取时先查 LRU（快），LRU miss 再查 ObjCache（磁盘/S3），命中则<strong>提升</strong>到 LRU。
-写入<strong>同步双写</strong>，保证持久化与内存缓存一致。
+读取时先查 LRU（快），LRU miss 再查 ObjCache（磁盘/S3），命中则提升到 LRU 以备下次热读。
+写入同步双写，保证持久化与内存缓存一致。
 </p>
+
+<h3>两层缓存结构</h3>
+
+<div class="figure">
+<svg viewBox="0 0 580 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <!-- BuildSemantic 调用方 -->
+  <rect x="10" y="80" width="110" height="60" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="65" y="105" text-anchor="middle" font-weight="600" fill="#201e18">BuildSemantic</text>
+  <text x="65" y="122" text-anchor="middle" fill="#7c766c" font-size="11">cache.Cache</text>
+
+  <!-- Tiered 层 -->
+  <rect x="160" y="60" width="130" height="100" rx="12" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="225" y="88" text-anchor="middle" font-weight="650" fill="#9d4a2d" font-size="13.5">Tiered</text>
+  <!-- 内层 LRU -->
+  <rect x="173" y="96" width="104" height="28" rx="7" fill="#fff" stroke="#e9e3d6" stroke-width="1"/>
+  <text x="225" y="115" text-anchor="middle" fill="#46413a" font-size="12">LRU (4096)</text>
+  <!-- 内层 ObjCache -->
+  <rect x="173" y="130" width="104" height="22" rx="7" fill="#fff" stroke="#e9e3d6" stroke-width="1"/>
+  <text x="225" y="146" text-anchor="middle" fill="#46413a" font-size="12">ObjCache</text>
+
+  <!-- ObjStore -->
+  <rect x="340" y="80" width="120" height="60" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="400" y="104" text-anchor="middle" font-weight="600" fill="#201e18">ObjStore</text>
+  <text x="400" y="122" text-anchor="middle" fill="#7c766c" font-size="11">Local / S3</text>
+
+  <!-- Voyage API -->
+  <rect x="480" y="80" width="90" height="60" rx="10" fill="#faf8f3" stroke="#e9e3d6" stroke-width="1.5"/>
+  <text x="525" y="104" text-anchor="middle" font-weight="600" fill="#201e18">Voyage</text>
+  <text x="525" y="122" text-anchor="middle" fill="#7c766c" font-size="11">API</text>
+
+  <!-- 箭头：BuildSemantic → Tiered -->
+  <line x1="120" y1="110" x2="158" y2="110" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 箭头：ObjCache ↔ ObjStore -->
+  <line x1="277" y1="141" x2="338" y2="115" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- 箭头：miss → Voyage -->
+  <line x1="460" y1="110" x2="478" y2="110" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arry)"/>
+
+  <!-- 标注：miss 路径 -->
+  <text x="390" y="76" text-anchor="middle" fill="#a9741f" font-size="11">cache miss → Embed</text>
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="arry" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#a9741f"/>
+    </marker>
+  </defs>
+</svg>
+<p class="figcap">
+  <code>cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))</code><br>
+  <code>cmd/api/main.go:84</code> · <code>cmd/maintenance/main.go:136</code>
+</p>
+</div>
 
 <h3>注入方式：BuildSemantic 不感知持久化</h3>
 
-<pre><code>// cmd/api/main.go:80–84
+<pre><code><span class="cm">// cmd/api/main.go:80–85</span>
 embObjRoot := env("ENGRAM_EMB_OBJ", "./engram-embeddings")
 if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
-    log.Fatalf("ENGRAM_EMB_OBJ and ENGRAM_OBJ must be different directories")
+    log.Fatalf("ENGRAM_EMB_OBJ and ENGRAM_OBJ must be different directories (got %q)", embObjRoot)
 }
 embCache := cache.NewTiered(cache.NewLRU(4096), cache.NewObjCache(objstore.NewLocal(embObjRoot)))
-</code></pre>
+router := agent.NewRouter(store, prov, os.TempDir(), cache.NewLRU(1024), embCache, emb)</code></pre>
 
 <p>
 <code>BuildSemantic</code> 接受 <code>cache.Cache</code> 接口，不知道背后是 LRU、ObjCache 还是 Tiered。
-持久化完全通过<strong>依赖注入</strong>实现，<code>semantic.go</code> 零代码改动。
+<code>semantic.go</code> 零改动，持久化完全通过依赖注入实现。
 </p>
 
 <div class="callout win">
   <span class="tag">收益</span>
-  Session 首次打开时的 BuildSemantic 调用，若 reindex worker 已预热，
-  所有段落均命中 ObjCache，Voyage API 调用数为零。
-  跨 Session 重启、跨 pod、跨进程，embedding 持久化透明生效。
+  <p>Session 首次开启时，若 reindex worker 已预热，所有段落均命中 ObjCache，Voyage API 调用数为零。
+  跨 Session 重启、跨 Pod、跨进程，embedding 持久化透明生效——<code>BuildSemantic</code> 的行为没有任何变化。</p>
 </div>
 
-<!-- ────────────────────────────────────────────── §7 增量 Reindex -->
-<h2 id="s7">7. 增量 Reindex</h2>
+<!-- ────────────────────────────────────────────── §7 增量补算 -->
+<h2 id="s7">7. 增量补算：后台预热，前台零联网</h2>
 
 <p>
-<code>maintenance.Reindex</code>（<span class="fileref">reindex.go:23–46</span>）是 L4b 的维护端：
-它物化 agent HEAD 的完整树，调用 <code>BuildSemantic</code>，
-<strong>主要目的不是返回索引，而是触发 BuildSemantic 的 Put 副作用</strong>——
-将所有段落的 embedding 写入持久化 <code>embCache</code>。
+<code>maintenance.Reindex</code>（<code>reindex.go:23–46</code>）是 L4b 的维护端：
+它物化 agent HEAD 的<strong>完整树</strong>（不只是 <code>system/</code>，search 要索引所有文件），
+调用 <code>BuildSemantic</code>，主要目的是触发 Put 副作用——
+把所有段落的 embedding 写入持久化 <code>embCache</code>。
 返回的 <code>*SemanticIndex</code> 被丢弃。
 </p>
 
-<pre><code>// reindex.go:41–44
-// BuildSemantic persists missing embeddings into embCache as a side-effect.
+<pre><code><span class="cm">// reindex.go:41–44</span>
+<span class="cm">// BuildSemantic persists missing embeddings into embCache as a side-effect.</span>
 if _, err := search.BuildSemantic(ctx, emb, embCache, files); err != nil {
     return fmt.Errorf("maintenance: reindex build semantic: %w", err)
-}
-</code></pre>
+}</code></pre>
 
 <h3>为什么不需要 diff？</h3>
 
 <p>
-内容寻址使增量天然免费：
+内容寻址使增量天然免费，不需要任何 diff 计算：
 </p>
-<ol>
-  <li><code>BuildSemantic</code> 对每个段落计算 <code>embKey(model, text)</code>；</li>
-  <li><code>c.Get(key)</code>——持久化 embCache 已有的段落直接命中，跳过 <code>Embed</code>；</li>
-  <li>只有<strong>新增或修改</strong>的段落（key 不存在）才会调用 Voyage API；</li>
-  <li>第二次 reindex 对同一 HEAD 调用 Voyage 次数为零（所有段落已持久化）。</li>
+
+<ol class="steps">
+  <li><span class="st">计算每段落的 embKey。</span><span class="sd"><code>embKey(model, text)</code> = sha256(model+text)；内容相同则 key 相同。</span></li>
+  <li><span class="st">查 embCache。</span><span class="sd">已持久化的段落直接命中，跳过 <code>Embed</code> 调用。</span></li>
+  <li><span class="st">只有新增或修改的段落才联网。</span><span class="sd">key 不存在（段落是新的或内容有变）才会调用 Voyage API。</span></li>
+  <li><span class="st">第二遍 reindex 零联网。</span><span class="sd">对同一 HEAD 所有段落已持久化，Embed 调用次数为零。</span></li>
 </ol>
 
 <p>
-这一行为通过 <code>countingEmbedder</code> 测试精确验证：
+这一行为通过 <code>countingEmbedder</code> 精确验证：
 </p>
 
-<pre><code>// reindex_test.go:46–52
-// Second reindex: every chunk's embedding is already persisted → 0 new embeds.
+<pre><code><span class="cm">// reindex_test.go:46–52</span>
+<span class="cm">// Second reindex: every chunk's embedding is already persisted → 0 new embeds.</span>
 if err := Reindex(ctx, store, ce, embCache, agentID); err != nil { ... }
 if ce.calls != first {
-    t.Fatalf("second reindex embedded %d more texts, want 0 (incremental persistence broken)", ce.calls-first)
-}
-</code></pre>
+    t.Fatalf("second reindex embedded %d more texts, want 0 (incremental persistence broken)",
+        ce.calls-first)
+}</code></pre>
 
-<h3>Reindex 与 Session 共享 embCache 的前提</h3>
+<h3>前台 Session 和后台 worker 共享同一份向量库</h3>
 
 <p>
-<code>cmd/api</code> 的 <code>ENGRAM_EMBEDDER</code> 和 <code>cmd/maintenance</code> 的 <code>ENGRAM_EMBEDDER</code>
-必须使用同一 embedding 模型（默认均为 <code>"fake"</code>，生产均为 <code>"voyage-3"</code>）。
-两者的 <code>embKey</code> 都携带 <code>model</code> 前缀，模型不同则 key 不同，缓存无法共享。
+两端（<code>cmd/api</code> 和 <code>cmd/maintenance</code>）各自构建一个指向<strong>同一目录</strong>（<code>ENGRAM_EMB_OBJ</code>）的 ObjStore，
+再各自包一层 Tiered(LRU + ObjCache)。
+LRU 是进程内的，不共享；ObjStore 是磁盘/S3，天然共享。
 </p>
 
 <div class="callout gotcha">
   <span class="tag">潜在问题</span>
-  若 <code>ENGRAM_PROVIDER=anthropic</code>（LLM 提供商）与 <code>ENGRAM_EMBEDDER=fake</code>（embedding 模型）配置不一致，
-  Session 和 maintenance worker 使用不同 embedder model，embKey 前缀不同，
-  reindex 预热的 embedding 对 Session 完全无效，退化为每次 Session 均重新调用 Voyage。
-  生产部署应确保两端 <code>ENGRAM_EMBEDDER</code> 配置一致。
+  <p>
+  两端必须使用<strong>同一个 embedding 模型</strong>（<code>ENGRAM_EMBEDDER</code> 环境变量）。
+  <code>embKey</code> 携带 <code>model</code> 前缀，模型不同则 key 不同，向量库白存——
+  maintenance 预热的 embedding 对 Session 完全无效，退化为每次 Session 都重新调用 Voyage。
+  </p>
+  <p>
+  <code>ENGRAM_PROVIDER</code>（LLM 推理提供商）和 <code>ENGRAM_EMBEDDER</code>（向量模型）是两个独立变量，
+  配置时不要混淆。生产部署应在两端固定设为 <code>voyage</code>。
+  </p>
 </div>
 
-<h3>Reindex 序列图：worker 预热，Session 复用</h3>
+<h3>后台预热 → 会话零联网时序</h3>
 
-<pre class="mermaid">
-sequenceDiagram
-  participant W as Maintenance Worker
-  participant EC as embCache(Tiered)
-  participant OC as ObjCache(disk)
-  participant V as Voyage API
-  participant S as Session(Router.Open)
+<div class="figure">
+<svg viewBox="0 0 640 290" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <!-- 生命线 -->
+  <text x="80"  y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">Maintenance</text>
+  <text x="240" y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">embCache (Tiered)</text>
+  <text x="400" y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">Voyage API</text>
+  <text x="550" y="30" text-anchor="middle" font-weight="600" fill="#201e18" font-size="12">Session (Open)</text>
 
-  W->>W: Reindex: materialize HEAD tree
-  W->>EC: BuildSemantic(files)
-  EC->>OC: Get(embKey) miss
-  EC->>V: Embed(chunks) 批量
-  V-->>EC: vectors
-  EC->>OC: Put(embKey, vec) 持久化
-  W->>W: 丢弃 SemanticIndex
+  <line x1="80"  y1="35" x2="80"  y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="240" y1="35" x2="240" y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="400" y1="35" x2="400" y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <line x1="550" y1="35" x2="550" y2="280" stroke="#e9e3d6" stroke-width="1.5" stroke-dasharray="4 3"/>
 
-  S->>EC: BuildSemantic(same files)
-  EC->>OC: Get(embKey) 命中
-  OC-->>EC: vec(from disk)
-  EC-->>S: SemanticIndex 完整向量(零 Voyage 调用)
-</pre>
+  <!-- Phase 1: 后台预热 -->
+  <text x="10" y="60" fill="#7c766c" font-size="11">后台预热</text>
+
+  <!-- Maintenance → embCache: BuildSemantic (miss) -->
+  <line x1="80" y1="70" x2="235" y2="70" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#a4)"/>
+  <text x="155" y="65" text-anchor="middle" fill="#bf5e3c" font-size="11">BuildSemantic(files)</text>
+
+  <!-- embCache → Voyage: Embed(chunks) miss -->
+  <line x1="240" y1="90" x2="395" y2="90" stroke="#a9741f" stroke-width="1.5" marker-end="url(#a4y)"/>
+  <text x="318" y="85" text-anchor="middle" fill="#a9741f" font-size="11">Embed(chunks) cache miss</text>
+
+  <!-- Voyage → embCache: vectors -->
+  <line x1="400" y1="110" x2="245" y2="110" stroke="#a9741f" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#a4y)"/>
+  <text x="318" y="105" text-anchor="middle" fill="#a9741f" font-size="11">vectors</text>
+
+  <!-- embCache 持久化 -->
+  <rect x="200" y="120" width="80" height="20" rx="5" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1"/>
+  <text x="240" y="133" text-anchor="middle" fill="#9d4a2d" font-size="11">Put → disk/S3</text>
+
+  <!-- Maintenance 丢弃索引 -->
+  <text x="80" y="155" text-anchor="middle" fill="#7c766c" font-size="10">丢弃 SemanticIndex</text>
+
+  <!-- 分隔线 -->
+  <line x1="20" y1="170" x2="620" y2="170" stroke="#e9e3d6" stroke-width="1" stroke-dasharray="2 4"/>
+  <text x="10" y="185" fill="#7c766c" font-size="11">前台会话</text>
+
+  <!-- Session → embCache: BuildSemantic -->
+  <line x1="550" y1="195" x2="245" y2="195" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#a4g)"/>
+  <text x="398" y="190" text-anchor="middle" fill="#5f7a4e" font-size="11">BuildSemantic(same files)</text>
+
+  <!-- embCache: Get → disk hit -->
+  <rect x="200" y="205" width="80" height="20" rx="5" fill="#eef2e6" stroke="#c2d5b0" stroke-width="1"/>
+  <text x="240" y="218" text-anchor="middle" fill="#5f7a4e" font-size="11">Get → disk hit</text>
+
+  <!-- embCache → Session: SemanticIndex -->
+  <line x1="240" y1="230" x2="545" y2="230" stroke="#5f7a4e" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#a4g)"/>
+  <text x="393" y="225" text-anchor="middle" fill="#5f7a4e" font-size="11">SemanticIndex（零 Voyage 调用）</text>
+
+  <defs>
+    <marker id="a4"  markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#bf5e3c"/></marker>
+    <marker id="a4y" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#a9741f"/></marker>
+    <marker id="a4g" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#5f7a4e"/></marker>
+  </defs>
+</svg>
+<p class="figcap">
+  后台 worker 首次为每个段落联网算向量并持久化；之后的 Session 开启时所有向量均从磁盘命中，Voyage API 调用次数为零。
+</p>
+</div>
 
 <!-- ────────────────────────────────────────────── §8 GC 隔离 -->
-<h2 id="s8">8. GC 隔离</h2>
+<h2 id="s8">8. 和 GC 隔离</h2>
 
 <p>
-Engram 的 GC（L5a，<span class="fileref">maintenance/gc.go</span>）通过可达性分析清除无引用的 git 对象。
-GC 操作的是 <strong>git object store</strong>（<code>ENGRAM_OBJ</code>），
+Engram 的 GC（L5a，<code>maintenance/gc.go</code>）通过可达性分析清除无引用的 git 对象。
+GC 操作的是 <strong>git object store</strong>（<code>ENGRAM_OBJ</code>）；
 embedding 向量存储在<strong>独立的目录</strong>（<code>ENGRAM_EMB_OBJ</code>，默认 <code>./engram-embeddings</code>）。
-两者是不同的 <code>objstore.NewLocal</code> 实例，GC 的 <code>reachable</code> 集合计算完全不涉及 embedding store。
+两者是不同的 <code>objstore.NewLocal</code> 实例，GC 的可达性集合计算完全不涉及 embedding store。
 </p>
 
 <p>
 两个 cmd 均在启动时强制检查目录分离：
 </p>
 
-<pre><code>// cmd/api/main.go:81–83
+<pre><code><span class="cm">// cmd/api/main.go:81–83</span>
 if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
     log.Fatalf("ENGRAM_EMB_OBJ and ENGRAM_OBJ must be different directories (got %q)", embObjRoot)
 }
 
-// cmd/maintenance/main.go:133–135
+<span class="cm">// cmd/maintenance/main.go:133–135</span>
 if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
     log.Fatal("ENGRAM_EMB_OBJ must differ from ENGRAM_OBJ (GC must never sweep the embedding store)")
-}
-</code></pre>
+}</code></pre>
 
 <div class="callout invariant">
   <span class="tag">不变量</span>
-  GC 永远不会清除 embedding 向量。embedding store 是只增长的内容寻址存储：
-  旧段落的向量不会被引用，但也不会被 GC，因为它们不在 git object store 里。
-  embedding 的"过期"管理（若需要）是独立于 git GC 的问题，目前未实现（可接受：记忆体量小）。
+  <p>GC 永远不会清除 embedding 向量。embedding store 是只增长的内容寻址存储：
+  旧段落的向量不被当前 HEAD 引用，但也不在 git object store 里，所以 GC 扫不到它们。
+  启动时路径相等的硬校验是双重防呆。</p>
+  <p>embedding 的"过期"管理（若需要）是独立于 git GC 的问题，目前未实现（可接受：记忆体量小，向量累积速度慢）。</p>
 </div>
 
 <p>
-关于 git GC 的完整分析见报告 <a href="03-storage-consistency.html">③ 存储与一致性</a>。
+git GC 的完整分析见报告 <a href="03-storage-consistency.html">③ 存储与一致性</a>。
 </p>
 
 <!-- ────────────────────────────────────────────── 总结 -->
@@ -583,22 +697,22 @@ if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
   <div class="card">
     <div class="num">L4 核心</div>
     <h3>Hybrid = Trigram + Semantic</h3>
-    <p>词汇精确性 + 语义模糊性，RRF(k=60) 融合；embedding 失败时静默降级为纯 trigram。</p>
+    <p>词汇精确性 + 语义模糊性，RRF(k=60) 融合；embedding 失败时静默降级为纯 trigram，Recall 永不报错。</p>
   </div>
   <div class="card">
     <div class="num">L4b 收益</div>
     <h3>Embedding 持久化</h3>
-    <p>Tiered(LRU + ObjCache) 注入 BuildSemantic；逻辑零改动，Voyage 调用大幅减少。</p>
+    <p>Tiered(LRU + ObjCache) 注入 <code>BuildSemantic</code>；<code>semantic.go</code> 零改动，Voyage 调用大幅减少。</p>
   </div>
   <div class="card">
     <div class="num">增量免费</div>
     <h3>Content-addressed Keys</h3>
-    <p>embKey = sha256(model+text)；已持久化的段落天然命中缓存，无需 diff。</p>
+    <p><code>embKey = sha256(model + text)</code>；已持久化的段落天然命中缓存，无需 diff，第二遍 reindex 零联网（有计数测试为证）。</p>
   </div>
   <div class="card">
     <div class="num">安全隔离</div>
     <h3>GC 不碰 Embedding Store</h3>
-    <p>独立 ObjStore 根目录 + 启动时路径相等检查，双重保障。</p>
+    <p>独立 ObjStore 根目录 + 启动时路径相等硬校验，双重保障。</p>
   </div>
 </div>
 
@@ -608,12 +722,12 @@ if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
   <thead><tr><th>文件</th><th>职责</th><th>关键符号</th></tr></thead>
   <tbody>
     <tr><td><code>internal/search/search.go</code></td><td>接口定义</td><td><code>Hit</code>, <code>Search</code></td></tr>
-    <tr><td><code>internal/search/grep.go</code></td><td>L2 stub（子串扫描）</td><td><code>GrepSearch</code></td></tr>
-    <tr><td><code>internal/search/trigram.go</code></td><td>Trigram 倒排索引</td><td><code>trigrams</code>, <code>BuildTrigram</code>, <code>candidates</code></td></tr>
-    <tr><td><code>internal/search/semantic.go</code></td><td>段落向量索引</td><td><code>sectionize</code>, <code>embKey</code>, <code>BuildSemantic</code></td></tr>
+    <tr><td><code>internal/search/grep.go</code></td><td>L2 stub（目录遍历子串扫描）</td><td><code>GrepSearch</code></td></tr>
+    <tr><td><code>internal/search/trigram.go</code></td><td>行级三字片段倒排索引</td><td><code>trigrams</code>, <code>BuildTrigram</code>, <code>candidates</code>, <code>Search</code></td></tr>
+    <tr><td><code>internal/search/semantic.go</code></td><td>段落向量索引</td><td><code>sectionize</code>, <code>embKey</code>, <code>BuildSemantic</code>, <code>cosine</code></td></tr>
     <tr><td><code>internal/search/hybrid.go</code></td><td>RRF 融合 + 降级</td><td><code>NewHybrid</code>, <code>Recall</code>, <code>rrf</code></td></tr>
-    <tr><td><code>internal/search/embedder.go</code></td><td>Embedder 接口 + Fake</td><td><code>Embedder</code>, <code>FakeEmbedder</code></td></tr>
-    <tr><td><code>internal/search/voyage.go</code></td><td>Voyage AI 适配器</td><td><code>VoyageEmbedder</code></td></tr>
+    <tr><td><code>internal/search/embedder.go</code></td><td>Embedder 接口 + FakeEmbedder</td><td><code>Embedder</code>, <code>FakeEmbedder</code></td></tr>
+    <tr><td><code>internal/search/voyage.go</code></td><td>Voyage AI 适配器</td><td><code>VoyageEmbedder</code>, <code>NewVoyage</code></td></tr>
     <tr><td><code>internal/cache/cache.go</code></td><td>Cache 接口 + LRU</td><td><code>Cache</code>, <code>LRU</code></td></tr>
     <tr><td><code>internal/cache/objcache.go</code></td><td>持久化 Cache over ObjStore</td><td><code>ObjCache</code>, <code>safeKey</code></td></tr>
     <tr><td><code>internal/cache/tiered.go</code></td><td>两级缓存组合</td><td><code>Tiered</code></td></tr>
@@ -625,6 +739,5 @@ if filepath.Clean(embObjRoot) == filepath.Clean(objRoot) {
 </table>
 
 </main>
-<footer>Engram 深入解析报告 · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
-</body>
-</html>
+<footer>Engram 深入解析 · 手工 SVG/HTML 图表,离线可读 · 基于 main 分支 L1–L5d</footer>
+</body></html>

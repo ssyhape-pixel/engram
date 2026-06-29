@@ -1,194 +1,314 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
+<!DOCTYPE html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Engram · 存储与一致性</title>
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
-</head>
-<body>
+</head><body>
 <nav class="topnav">
   <span class="brand">Engram</span>
-  <a href="index.html">总览索引</a>
-  <a href="01-architecture-overview.html">① 架构总览</a>
-  <a href="02-request-path.html">② 请求路径</a>
-  <a href="03-storage-consistency.html" class="active">③ 存储与一致性</a>
-  <a href="04-search-index.html">④ 搜索与索引</a>
-  <a href="05-maintenance-pipeline.html">⑤ 维护管线</a>
-  <a href="06-build-journey.html">⑥ 构建历程</a>
+  <a href="index.html">索引</a>
+  <a href="01-architecture-overview.html">架构总览</a>
+  <a href="02-request-path.html">请求路径</a>
+  <a href="03-storage-consistency.html" class="active">存储与一致性</a>
+  <a href="04-search-index.html">搜索与索引</a>
+  <a href="05-maintenance-pipeline.html">维护管线</a>
+  <a href="06-build-journey.html">构建历程</a>
 </nav>
 <main>
 
-<h1>③ 存储与一致性</h1>
-<p class="lead">内容寻址对象 · gitfs · refs CAS · GC — Engram 持久层的核心机制</p>
+<h1>存储与一致性</h1>
+<p class="lead">不可变对象 · gitfs · refs CAS · 任务队列 · advisory lock · GC · 迁移 — Engram 持久层从头到尾</p>
 <p class="meta">覆盖层级：L1 MemStore core · L2 agent loop · L3 SHA read cache · L5a GC · L5b maintenance jobs</p>
 
 <p>
-Engram 的持久层由三个协作部分构成：一个纯粹不可变的<strong>内容寻址对象存储</strong>（objstore）、
-一个将 git 作为工作格式的<strong>自定义 Storer</strong>（gitfs），以及存储在 Postgres 中的<strong>唯一可变指针</strong>（refs）。
-三者共同保证了：对象不可变、历史可重放、并发写入不会产生裂变。
+Engram 的持久层由三个协作部件构成：以哈希为键的<strong>不可变对象存储</strong>（ObjStore）、
+把 git 当格式用的<strong>自定义 Storer</strong>（gitfs），以及存在 Postgres 里的<strong>唯一可变指针</strong>（refs）。
+三者合力保证：对象不可变、历史可重放、并发写入不产生撕裂状态。
 </p>
-
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="obj-model">1 · 内容寻址对象模型</h2>
 
 <p>
-每一个存储单元——blob（文件内容）、tree（目录快照）、commit（版本快照）——都以其自身内容的 SHA-1 哈希作为键。
-这个性质带来三个直接收益：
+核心接口是 <code>MemStore</code>（<span class="fileref">internal/memstore/memstore.go:33–38</span>）——
+四个方法：<code>ResolveHead</code>、<code>Materialize</code>、<code>CommitWithCAS</code>、<code>TreeKeys</code>。
+下面逐层解剖每个方法背后的存储机制。
 </p>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="obj-model"><span class="n">1 ·</span> 按指纹存的不可变对象</h2>
+
+<p>
+每一个存储单元——blob（文件内容）、tree（目录快照）、commit（版本节点）——都以其自身内容的
+SHA-1 哈希字符串作为键。"内容相同"和"键相同"是一回事，因此：
+</p>
+
 <ul>
-  <li><strong>按 SHA 缓存</strong>：相同的哈希永远对应相同的字节。缓存命中无需失效逻辑。</li>
-  <li><strong>写入天然去重</strong>：两个 agent 的 <code>system/persona.md</code> 若内容相同，存储中只保留一份 blob。</li>
-  <li><strong>GC 可推导</strong>：从所有 agent HEAD 出发做可达性遍历，未被引用的对象即为垃圾，可安全回收。</li>
+  <li><strong>按 SHA 缓存，无需失效逻辑。</strong> 相同的哈希永远对应相同的字节；缓存命中时无需检查是否过期。</li>
+  <li><strong>写入天然去重。</strong> 两个 agent 若有完全相同的 <code>system/persona.md</code>，存储中只保留一个 blob。</li>
+  <li><strong>GC 可用可达性推导。</strong> 从所有 agent HEAD 出发遍历对象图，未被引用的即是垃圾，可安全回收。</li>
 </ul>
 
 <h3>ObjStore 接口</h3>
+
 <p>
-接口定义于 <span class="fileref">internal/memstore/objstore/objstore.go:16</span>，只有六个方法：
+接口定义于 <span class="fileref">internal/memstore/objstore/objstore.go:16–26</span>，六个方法：
 </p>
+
 <pre><code>type ObjStore interface {
     Has(ctx context.Context, key string) (bool, error)
     Get(ctx context.Context, key string) ([]byte, error)
     Put(ctx context.Context, key string, data []byte) error // idempotent
     Iter(ctx context.Context, fn func(key string) error) error
-    Stat(ctx context.Context, key string) (time.Time, error)
-    Delete(ctx context.Context, key string) error
+    Stat(ctx context.Context, key string) (time.Time, error) // 返回对象创建时间，GC 用
+    Delete(ctx context.Context, key string) error             // 缺失键不报错（幂等）
 }</code></pre>
 
 <p>
-<code>key</code> 是对象的十六进制哈希字符串。<code>Put</code> 被显式标记为幂等：相同的 key 意味着完全相同的字节，
-重复写入是无害的空操作。
+<code>key</code> 是十六进制哈希字符串。<code>Put</code> 注释明确写着 <code>idempotent</code>：
+相同的 key 意味着完全相同的字节，重复写入安全无害。<code>Stat</code> 返回对象的
+最后修改时间——对不可变对象而言等于创建时间——GC 用这个值做宽限期判断。
 </p>
 
-<h3>Local 后端</h3>
+<h3>Local 后端：原子写入</h3>
+
 <p>
-开发/测试环境使用本地文件系统后端 <span class="fileref">internal/memstore/objstore/local.go</span>。
-对象按 <code>&lt;root&gt;/objects/&lt;key[:2]&gt;/&lt;key&gt;</code> 路径组织（两字符前缀分片，避免单目录过大，
-与 <code>.git/objects/</code> 布局一致）。
-</p>
-<p>
-<code>Put</code> 使用先写临时文件再 <code>os.Rename</code> 的原子可见性模式
-（<span class="fileref">local.go:53–80</span>）：
-</p>
-<pre><code>tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
-// ... write data ...
-if err := os.Rename(tmpName, p); err != nil { ... }
-</code></pre>
-<p>
-这保证了并发写同一对象时，观察者只会看到完整的字节，永远不会读到半写状态。
-由于对象不可变，最后一次 rename 胜出，结果始终正确。
+开发/测试环境使用本地文件系统后端（<span class="fileref">internal/memstore/objstore/local.go</span>）。
+对象按 <code>&lt;root&gt;/objects/&lt;key[:2]&gt;/&lt;key&gt;</code> 路径存放——两字符前缀分片，
+与 <code>.git/objects/</code> 布局完全一致，避免单目录条目过多。
 </p>
 
-<h3>对象图</h3>
-<pre class="mermaid">
-graph TD
-    C1["commit C1<br/>SHA: a1b2c3"] --> T1["tree root<br/>SHA: d4e5f6"]
-    C1 --> C0["commit C0<br/>parent"]
-    T1 --> B1["blob: system/persona.md<br/>SHA: 1a2b3c"]
-    T1 --> TS["tree: system/<br/>SHA: 7f8e9d"]
-    T1 --> B2["blob: notes.md<br/>SHA: 4d5e6f"]
-    TS --> B1
-    TS --> B3["blob: system/tools.md<br/>SHA: 9a8b7c"]
-    C0 --> T0["tree root C0<br/>SHA: aabbcc"]
-</pre>
+<p>
+<code>Put</code> 实现了"先写临时文件再 <code>os.Rename</code>"的原子可见性模式
+（<span class="fileref">local.go:53–79</span>）：
+</p>
+
+<pre><code>func (l *Local) Put(ctx context.Context, key string, data []byte) error {
+    p := l.path(key)
+    if _, err := os.Stat(p); err == nil {
+        return nil  // 已存在，幂等返回
+    }
+    os.MkdirAll(filepath.Dir(p), 0o755)
+    tmp, _ := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+    tmpName := tmp.Name()
+    defer os.Remove(tmpName)
+    tmp.Write(data)
+    tmp.Close()
+    os.Rename(tmpName, p)  // 原子可见：观察者只见完整字节
+}</code></pre>
+
+<p>
+<code>os.Rename</code> 在同一文件系统内是原子操作：任何读者要么看不到这个文件，
+要么看到完整的字节。由于对象不可变，若并发写入同一 key，最后一次 rename 胜出——结果始终正确。
+</p>
+
+<h3>对象图：commit → tree → blob + 父链</h3>
+
+<!-- SVG: object graph -->
+<div class="figure">
+<svg viewBox="0 0 660 340" width="660" height="340" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="arr-dim" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#7c766c"/>
+    </marker>
+  </defs>
+
+  <!-- C0 commit (parent) -->
+  <rect x="10" y="130" width="130" height="56" rx="10" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="75" y="151" text-anchor="middle" font-weight="600" fill="#201e18">commit C0</text>
+  <text x="75" y="169" text-anchor="middle" font-size="11" fill="#7c766c" font-family="monospace">a1b2…</text>
+  <text x="75" y="182" text-anchor="middle" font-size="11" fill="#7c766c">parent: ∅</text>
+
+  <!-- C1 commit -->
+  <rect x="200" y="50" width="130" height="56" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="265" y="71" text-anchor="middle" font-weight="600" fill="#9d4a2d">commit C1</text>
+  <text x="265" y="89" text-anchor="middle" font-size="11" fill="#7c766c" font-family="monospace">d4e5…</text>
+  <text x="265" y="102" text-anchor="middle" font-size="11" fill="#7c766c">parent: C0</text>
+
+  <!-- arrow C1 → C0 (parent link) -->
+  <line x1="200" y1="78" x2="142" y2="150" stroke="#7c766c" stroke-width="1.5" marker-end="url(#arr-dim)" stroke-dasharray="4,3"/>
+  <text x="155" y="110" font-size="11" fill="#7c766c">parent</text>
+
+  <!-- T1 root tree -->
+  <rect x="390" y="30" width="130" height="56" rx="10" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="455" y="51" text-anchor="middle" font-weight="600" fill="#201e18">tree root</text>
+  <text x="455" y="69" text-anchor="middle" font-size="11" fill="#7c766c" font-family="monospace">7f8e…</text>
+  <text x="455" y="82" text-anchor="middle" font-size="11" fill="#7c766c">entries: 3</text>
+
+  <!-- arrow C1 → T1 -->
+  <line x1="330" y1="68" x2="388" y2="58" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="352" y="54" font-size="11" fill="#bf5e3c">tree</text>
+
+  <!-- system/ subtree -->
+  <rect x="390" y="140" width="130" height="52" rx="10" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="455" y="161" text-anchor="middle" font-weight="600" fill="#201e18">tree system/</text>
+  <text x="455" y="179" text-anchor="middle" font-size="11" fill="#7c766c" font-family="monospace">2c3d…</text>
+
+  <!-- arrow T1 → system/ -->
+  <line x1="455" y1="86" x2="455" y2="138" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="460" y="117" font-size="11" fill="#7c766c">Dir</text>
+
+  <!-- blob: notes.md -->
+  <rect x="540" y="30" width="115" height="52" rx="10" fill="#eef2e6" stroke="#c8d9b8" stroke-width="1.5"/>
+  <text x="597" y="51" text-anchor="middle" font-weight="600" fill="#5f7a4e">blob</text>
+  <text x="597" y="66" text-anchor="middle" font-size="11" fill="#5f7a4e">notes.md</text>
+  <text x="597" y="79" text-anchor="middle" font-size="11" fill="#7c766c" font-family="monospace">9a8b…</text>
+
+  <!-- arrow T1 → notes.md blob -->
+  <line x1="520" y1="52" x2="540" y2="52" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- blob: persona.md -->
+  <rect x="540" y="140" width="115" height="52" rx="10" fill="#eef2e6" stroke="#c8d9b8" stroke-width="1.5"/>
+  <text x="597" y="161" text-anchor="middle" font-weight="600" fill="#5f7a4e">blob</text>
+  <text x="597" y="176" text-anchor="middle" font-size="11" fill="#5f7a4e">persona.md</text>
+  <text x="597" y="189" text-anchor="middle" font-size="11" fill="#7c766c" font-family="monospace">1a2b…</text>
+
+  <!-- arrow system/ → persona.md -->
+  <line x1="520" y1="165" x2="540" y2="165" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- blob: tools.md -->
+  <rect x="540" y="210" width="115" height="52" rx="10" fill="#eef2e6" stroke="#c8d9b8" stroke-width="1.5"/>
+  <text x="597" y="231" text-anchor="middle" font-weight="600" fill="#5f7a4e">blob</text>
+  <text x="597" y="246" text-anchor="middle" font-size="11" fill="#5f7a4e">tools.md</text>
+  <text x="597" y="259" text-anchor="middle" font-size="11" fill="#7c766c" font-family="monospace">4d5e…</text>
+
+  <!-- arrow system/ → tools.md -->
+  <line x1="520" y1="174" x2="540" y2="228" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- legend -->
+  <rect x="10" y="280" width="200" height="52" rx="8" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1"/>
+  <text x="22" y="298" font-size="11.5" fill="#7c766c">橙色箭头 = 对象引用（content hash）</text>
+  <text x="22" y="314" font-size="11.5" fill="#7c766c">虚灰箭头 = 历史 parent 链</text>
+  <text x="22" y="330" font-size="11.5" fill="#7c766c">绿色 = blob；灰 = tree；橙底 = HEAD commit</text>
+</svg>
+<p class="figcap">图 1 · 对象图：commit→tree→blob + parent 父链。改一个文件 = 新 blob + 新受影响 tree + 新 commit；C0 及其所有对象原样保留。</p>
+</div>
 
 <div class="callout invariant">
   <span class="tag">不变量</span>
-  <strong>对象永远不可变。</strong>改变一个文件 = 新 blob + 新 tree（含受影响的所有父 tree）+ 新 commit。
-  旧对象保留在存储中，直至 GC 扫描时判定其不可达且超出宽限期。
+  <strong>对象永远不可变。</strong>
+  改变一个文件 = 新 blob + 新 tree（及所有受影响的父 tree）+ 新 commit。
+  旧对象保留至 GC 判定不可达且超过宽限期。绝不原地覆写。
 </div>
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="gitfs">2 · gitfs：go-git Storer over ObjStore</h2>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="gitfs"><span class="n">2 ·</span> gitfs：把 git 当工作格式用</h2>
 
 <p>
-Engram 使用 git <em>作为工作格式</em>——利用 git 的 blob/tree/commit 数据结构来表达内存快照——
-但从不 shell out 到 <code>git</code> 二进制，也不依赖 <code>.git/</code> 目录文件。
-所有 git I/O 都通过 <a href="https://github.com/go-git/go-git">go-git</a> 完成，
-并以自定义的 <code>Storage</code> 替换其默认的文件系统后端。
+Engram 使用 git 的 blob/tree/commit 数据结构来表达内存版本，但从不 shell out 到
+<code>git</code> 二进制，也不依赖 <code>.git/</code> 目录。所有 git I/O 都通过
+<a href="https://github.com/go-git/go-git">go-git</a> 完成，配以自定义的
+<code>Storage</code> 替换其默认的文件系统后端。
 </p>
 
 <h3>Storage：go-git 的自定义 Storer</h3>
+
 <p>
 <span class="fileref">internal/memstore/gitfs/storage.go</span> 实现了 go-git 的
-<code>storage.Storer</code> 接口，将对象层桥接到 ObjStore。
+<code>storage.Storer</code> 接口，将对象层桥接到 ObjStore。它内嵌一个
+<code>memory.Storage</code>，非对象数据（refs、config、index）委托给它——这些是
+per-session 临时的，权威引用始终在 Postgres。
 </p>
 
 <p>
-存储格式采用 git 的 loose-object 帧格式（<span class="fileref">storage.go:42–59</span>）：
-</p>
-<pre><code>// frame encodes: "&lt;type&gt; &lt;size&gt;\x00&lt;content&gt;"
-// sha1(frame(o)) == o.Hash()  ← 这正是 git 的哈希定义
-func frame(o plumbing.EncodedObject) ([]byte, error) { ... }</code></pre>
-
-<p>
-<code>SetEncodedObject</code> 计算哈希、帧化对象，然后调用 <code>objs.Put</code>
-（<span class="fileref">storage.go:77–93</span>）；
-<code>EncodedObject</code> 则反向执行：<code>objs.Get</code> → <code>unframe</code> → 返回 <code>MemoryObject</code>。
-引用、配置、index 等非对象数据仍委托给内嵌的 <code>memory.Storage</code>，它们是每 session 临时的，
-权威引用始终在 Postgres refs 表中。
+存储格式用 git loose-object 帧编码（<span class="fileref">storage.go:42–59</span>）：
 </p>
 
-<h3>Materialize：将提交检出到目录</h3>
+<pre><code>// frame 编码: "&lt;type&gt; &lt;size&gt;\x00&lt;content&gt;"
+// sha1(frame(o)) == o.Hash() — 这正是 git 的哈希定义
+func frame(o plumbing.EncodedObject) ([]byte, error) {
+    content, _ := io.ReadAll(r)
+    buf.WriteString(o.Type().String())  // e.g. "blob"
+    buf.WriteByte(' ')
+    buf.WriteString(strconv.FormatInt(o.Size(), 10))
+    buf.WriteByte(0)   // \x00 分隔符
+    buf.Write(content)
+    return buf.Bytes(), nil
+}</code></pre>
+
 <p>
-<span class="fileref">internal/memstore/gitfs/repo.go:39–58</span>：
+因为用了 git 原生的 loose-object 编码，<strong>Engram 对象的 key 与真实 git 仓库的哈希完全一致</strong>——
+相同内容在任何 git 实现里得到同一个 SHA。这让未来可以用标准 git 工具直接验证或导出对象。
 </p>
+
+<p>
+<code>SetEncodedObject</code>（<span class="fileref">storage.go:77–93</span>）：
+计算 hash → frame → <code>objs.Put(h.String(), data)</code>。
+<code>EncodedObject</code> 反向：<code>objs.Get</code> → <code>unframe</code> → 返回 <code>MemoryObject</code>。
+</p>
+
+<h3>Materialize：将某个 commit 检出到目录</h3>
+
+<p>
+<span class="fileref">internal/memstore/gitfs/repo.go:37–59</span>：
+</p>
+
 <pre><code>func Materialize(ctx context.Context, objs objstore.ObjStore, at string, dir string) error {
     st := NewStorage(ctx, objs)
-    seedRefs(st, at)                                    // 在内存中伪造 branch ref
+    seedRefs(st, at)                     // 在 in-memory Storage 中伪造 refs/heads/main 和 HEAD
     repo, _ := git.Open(st, osfs.New(dir))
     wt, _ := repo.Worktree()
     wt.Checkout(&amp;git.CheckoutOptions{Hash: plumbing.NewHash(at), Force: true})
 }</code></pre>
+
 <p>
-<code>seedRefs</code> 在 in-memory Storage 上设置一个临时 <code>refs/heads/main</code> 指向目标 commit，
-使 go-git 能够正常打开仓库。整个过程不接触磁盘上的 <code>.git</code> 目录。
+<code>seedRefs</code> 在内存 Storage 上设置一个临时 <code>refs/heads/main</code> 指向目标 commit，
+让 go-git 能正常打开仓库，整个过程完全不接触磁盘 <code>.git</code> 目录。
 </p>
 
 <h3>Commit：将目录快照写入 ObjStore</h3>
+
 <p>
-<span class="fileref">internal/memstore/gitfs/repo.go:63–96</span>：
+<span class="fileref">repo.go:63–96</span>：
 </p>
+
 <pre><code>func Commit(ctx context.Context, objs objstore.ObjStore, parent string, dir string, msg string) (string, error) {
     st := NewStorage(ctx, objs)
-    // init (首次) 或 open (有 parent)
+    // parent == "" → git.Init（首次 commit）；否则 seedRefs + git.Open
     wt.AddWithOptions(&amp;git.AddOptions{All: true})
     h, _ := wt.Commit(msg, &amp;git.CommitOptions{Author: author(), AllowEmptyCommits: true})
-    return h.String(), nil
+    return h.String(), nil  // 十六进制 commit SHA
 }</code></pre>
+
 <p>
-go-git 在 <code>wt.Commit</code> 内部调用 <code>st.SetEncodedObject</code>，
-对每个新 blob、tree、commit 对象执行一次 <code>objs.Put</code>。
-返回的十六进制 SHA 就是新 commit 的哈希，随后由 <code>CommitWithCAS</code> 用于 Postgres CAS。
+go-git 在 <code>wt.Commit</code> 内部为每个新 blob、tree、commit 调用
+<code>st.SetEncodedObject</code>，最终通过 <code>objs.Put</code> 落盘。
+返回值就是新 commit 的 SHA，随后被 <code>CommitWithCAS</code> 送进 Postgres CAS。
 </p>
 
-<h3>TreeKeys：从对象中读取缓存键</h3>
+<h3>TreeKeys：给 L3 缓存提取不可变 key</h3>
+
 <p>
-<span class="fileref">repo.go:98–123</span> 实现 <code>TreeKeys</code>，直接解析 ObjStore 中的
-commit 对象，提取 rootTree 哈希与 <code>system/</code> 子树哈希，无需查询 Postgres。
-这两个值被 L3 缓存层用作不可变缓存键（详见报告 ②）。
+<span class="fileref">repo.go:98–123</span> 实现 <code>TreeKeys</code>：
+直接解析 ObjStore 中的 commit 对象，提取 <code>rootTree</code> 哈希与
+<code>system/</code> 子树哈希，无需查询 Postgres。
+这两个 SHA 是纯粹不可变的——任何文件变化都会产生新的 rootTree；
+<code>system/</code> 子树 SHA 只在 <code>system/</code> 目录内容变化时才变——
+L3 缓存用它们作为永不过期的缓存键（详见<a href="02-request-path.html">② 请求路径</a>）。
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="refs-cas">3 · refs：唯一可变指针 + CAS</h2>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="refs-cas"><span class="n">3 ·</span> 唯一可变指针 + compare-and-swap</h2>
 
 <p>
-在整个系统中，唯一被允许变化的指针是 Postgres 中的 <code>agent_id → HEAD</code> 映射。
-所有并发控制都收敛于对这个指针的一次原子 CAS。
+整个系统中唯一被允许改变的指针是 Postgres 中的 <code>agent_id → HEAD</code> 行。
+所有并发控制都收敛到对这个指针的一次原子 CAS。
 </p>
 
 <h3>agent_refs 表</h3>
-<pre><code>CREATE TABLE agent_refs (
+
+<pre><code>-- 000001_init.up.sql
+CREATE TABLE agent_refs (
   agent_id   text PRIMARY KEY,
   head       text NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );</code></pre>
 
-<h3>CommitRef 的 CAS SQL</h3>
+<h3>CommitRef：CAS 的 SQL 是什么</h3>
+
 <p>
-<span class="fileref">internal/memstore/refs/refs.go:259–267</span>：
+<span class="fileref">internal/memstore/refs/refs.go:259–265</span>：
 </p>
+
 <pre><code>ct, err := tx.Exec(ctx,
     `UPDATE agent_refs SET head=$1, updated_at=now()
      WHERE agent_id=$2 AND head=$3`,
@@ -198,102 +318,164 @@ if ct.RowsAffected() == 0 {
 }</code></pre>
 
 <p>
-<code>WHERE head=$3</code> 是 compare 步骤：只有当 Postgres 中存储的 HEAD 与调用方持有的 <code>parent</code> 一致时，
-UPDATE 才会命中一行（<code>RowsAffected() == 1</code>）。如果另一个写者已先行提交，
-HEAD 已变更，<code>RowsAffected() == 0</code>，返回 <code>ErrCASConflict</code>，
-调用方需重新读取最新 HEAD 后重试。
+<code>WHERE head=$3</code> 是 compare 步骤：只有当数据库里存储的 HEAD 与调用方持有的
+<code>parent</code> 一致，UPDATE 才命中一行（<code>RowsAffected() == 1</code>）。
+如果另一个写者已先行提交，HEAD 已变更，<code>RowsAffected() == 0</code>，
+函数返回 <code>ErrCASConflict</code>，调用方需重新读取最新 HEAD 后重试。
 </p>
 
 <div class="callout invariant">
   <span class="tag">不变量</span>
   <strong>所有并发控制收敛于这一个 CAS。</strong>
-  系统无乐观多写者合并、无分布式锁、无 CRDT。单写者路由（Session Router）在上游确保同一个 agent
-  同时只有一个写者，CAS 作为最后一道防线捕获任何意外的竞争。
+  系统没有乐观多写者合并、没有分布式锁、没有 CRDT。
+  Session Router 在上游确保同一 agent 同时只有一个写者；
+  CAS 是最后一道防线，捕获任何意外竞争。
+  不存在的 agent 调用 <code>CommitRef</code> 也返回 <code>ErrCASConflict</code>（0 行更新），
+  因此调用方必须先 <code>Bootstrap</code>。
 </div>
 
 <h3>ResolveHead 与 Bootstrap</h3>
+
 <p>
-<code>ResolveHead</code>（<span class="fileref">refs.go:36–46</span>）直接 <code>SELECT head FROM agent_refs WHERE agent_id=$1</code>；
-<code>Bootstrap</code>（<span class="fileref">refs.go:49–57</span>）使用
-<code>INSERT ... ON CONFLICT (agent_id) DO NOTHING</code>，幂等地设置初始 HEAD。
-一个不存在的 agent 传给 <code>CommitRef</code> 时同样会因 0 rows affected 而返回
-<code>ErrCASConflict</code>——调用方必须先 <code>Bootstrap</code>。
+<code>ResolveHead</code>（<span class="fileref">refs.go:36–46</span>）：
+<code>SELECT head FROM agent_refs WHERE agent_id=$1</code>，缺失行返回 <code>ErrAgentNotFound</code>。
+</p>
+<p>
+<code>Bootstrap</code>（<span class="fileref">refs.go:49–57</span>）：
+<code>INSERT … ON CONFLICT (agent_id) DO NOTHING</code>，幂等设置初始 HEAD。
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="atomic-commit">4 · 提交即一个 Postgres 事务</h2>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="atomic-commit"><span class="n">4 ·</span> 提交就是一次 Postgres 事务</h2>
 
 <p>
 <code>CommitWithCAS</code>（<span class="fileref">memstore.go:60–69</span>）将写操作分为严格有序的两阶段：
 </p>
 
-<ol>
-  <li><strong>对象优先</strong>：调用 <code>gitfs.Commit</code>，将所有新 blob/tree/commit 对象写入 ObjStore。
-      这一步可重试、幂等，即便崩溃也只留下不可达的孤立对象（GC 会清理）。</li>
-  <li><strong>原子推进 ref</strong>：在<strong>一个</strong> Postgres 事务中执行 CAS 并入队维护任务。
-      要么整体成功，要么整体回滚——不存在"ref 已更新但任务未入队"的中间态。</li>
+<ol class="steps">
+  <li>
+    <span class="st">对象优先（写 ObjStore）</span>
+    <span class="sd">调用 <code>gitfs.Commit</code>，把所有新 blob/tree/commit 对象写进 ObjStore。
+    写入幂等，可安全重试。崩溃只留下不可达的孤立对象，GC 宽限期后自动清理。</span>
+  </li>
+  <li>
+    <span class="st">原子推进 ref（写 Postgres）</span>
+    <span class="sd">在<strong>一个</strong> Postgres 事务内执行 CAS <code>UPDATE agent_refs</code> 并
+    <code>INSERT INTO memory_jobs</code>（reindex、reflect）。
+    要么整体成功，要么整体回滚——不存在"ref 已更新但任务未入队"的半提交状态。</span>
+  </li>
 </ol>
-
-<h3>写入序列（时序图）</h3>
-<pre class="mermaid">
-sequenceDiagram
-    participant AW as AgentWorker
-    participant OBJ as ObjStore
-    participant PG as Postgres
-
-    AW->>OBJ: Put blob 1
-    AW->>OBJ: Put blob 2
-    AW->>OBJ: Put tree root
-    AW->>OBJ: Put commit C_new
-    Note over AW,OBJ: 对象写入完成，幂等可重试
-
-    AW->>PG: BEGIN
-    AW->>PG: UPDATE agent_refs SET head=C_new WHERE head=C_old
-    AW->>PG: INSERT INTO memory_jobs (reindex)
-    AW->>PG: INSERT INTO memory_jobs (reflect)
-    AW->>PG: COMMIT
-    Note over AW,PG: 原子提交，任务入队 iff ref 推进成功
-</pre>
 
 <div class="callout win">
   <span class="tag">设计亮点</span>
   <strong>同-tx 入队替代了 Kafka + outbox 模式。</strong>
-  任务入队与 ref 推进在同一个 Postgres 事务中，天然保证了"任务已入队 当且仅当 commit 已提交"，
-  无需额外的事务性消息队列，也无需 outbox 轮询。
+  任务入队与 ref 推进在同一个 Postgres 事务中，天然保证"任务入队 当且仅当 commit 已提交"，
+  无需独立的消息中间件，也无需 outbox 轮询。
 </div>
 
-<h3>崩溃安全性</h3>
+<h3>写入时序</h3>
+
+<!-- SVG: commit sequence -->
+<div class="figure">
+<svg viewBox="0 0 640 310" width="640" height="310" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <defs>
+    <marker id="sa" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#bf5e3c"/>
+    </marker>
+  </defs>
+
+  <!-- lifelines -->
+  <text x="80" y="30" text-anchor="middle" font-weight="700" fill="#201e18">AgentWorker</text>
+  <line x1="80" y1="38" x2="80" y2="300" stroke="#e9e3d6" stroke-width="2" stroke-dasharray="4,3"/>
+
+  <text x="310" y="30" text-anchor="middle" font-weight="700" fill="#201e18">ObjStore</text>
+  <line x1="310" y1="38" x2="310" y2="300" stroke="#e9e3d6" stroke-width="2" stroke-dasharray="4,3"/>
+
+  <text x="530" y="30" text-anchor="middle" font-weight="700" fill="#201e18">Postgres</text>
+  <line x1="530" y1="38" x2="530" y2="300" stroke="#e9e3d6" stroke-width="2" stroke-dasharray="4,3"/>
+
+  <!-- messages -->
+  <!-- Put blob 1 -->
+  <line x1="80" y1="65" x2="303" y2="65" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#sa)"/>
+  <text x="185" y="59" text-anchor="middle" font-size="12" fill="#9d4a2d">Put blob 1</text>
+
+  <!-- Put blob 2 -->
+  <line x1="80" y1="90" x2="303" y2="90" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#sa)"/>
+  <text x="185" y="84" text-anchor="middle" font-size="12" fill="#9d4a2d">Put blob 2</text>
+
+  <!-- Put tree -->
+  <line x1="80" y1="115" x2="303" y2="115" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#sa)"/>
+  <text x="185" y="109" text-anchor="middle" font-size="12" fill="#9d4a2d">Put tree root</text>
+
+  <!-- Put commit -->
+  <line x1="80" y1="140" x2="303" y2="140" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#sa)"/>
+  <text x="185" y="134" text-anchor="middle" font-size="12" fill="#9d4a2d">Put commit C_new</text>
+
+  <!-- note: objects done -->
+  <rect x="90" y="148" width="210" height="20" rx="4" fill="#f4e6dd"/>
+  <text x="195" y="162" text-anchor="middle" font-size="11" fill="#9d4a2d">对象写完，幂等可重试</text>
+
+  <!-- BEGIN -->
+  <line x1="80" y1="185" x2="523" y2="185" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#sa)"/>
+  <text x="305" y="179" text-anchor="middle" font-size="12" fill="#5f7a4e">BEGIN</text>
+
+  <!-- CAS UPDATE -->
+  <line x1="80" y1="210" x2="523" y2="210" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#sa)"/>
+  <text x="305" y="204" text-anchor="middle" font-size="12" fill="#5f7a4e">UPDATE agent_refs SET head=C_new WHERE head=C_old</text>
+
+  <!-- INSERT jobs -->
+  <line x1="80" y1="235" x2="523" y2="235" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#sa)"/>
+  <text x="305" y="229" text-anchor="middle" font-size="12" fill="#5f7a4e">INSERT memory_jobs (reindex, reflect) ON CONFLICT DO NOTHING</text>
+
+  <!-- COMMIT -->
+  <line x1="80" y1="260" x2="523" y2="260" stroke="#5f7a4e" stroke-width="2" marker-end="url(#sa)"/>
+  <text x="305" y="254" text-anchor="middle" font-size="12" font-weight="700" fill="#5f7a4e">COMMIT</text>
+
+  <!-- note: atomic -->
+  <rect x="330" y="268" width="200" height="20" rx="4" fill="#eef2e6"/>
+  <text x="430" y="282" text-anchor="middle" font-size="11" fill="#5f7a4e">原子：任务入队 iff ref 推进</text>
+</svg>
+<p class="figcap">图 2 · 提交时序。橙色 = 写 ObjStore（幂等，阶段一）；绿色 = Postgres 事务（原子，阶段二）。</p>
+</div>
+
+<h3>崩溃安全矩阵</h3>
+
 <table>
   <thead><tr><th>崩溃时机</th><th>后果</th><th>修复</th></tr></thead>
   <tbody>
     <tr>
       <td>写对象期间崩溃</td>
-      <td>部分对象孤悬于 ObjStore，ref 未更新</td>
-      <td>GC 宽限期后自动回收（不影响任何 agent 状态）</td>
+      <td>部分对象孤悬于 ObjStore，ref 未更新，任务未入队</td>
+      <td>GC 宽限期后自动回收孤立对象；agent 状态不受影响</td>
     </tr>
     <tr>
       <td>BEGIN 后、COMMIT 前崩溃</td>
-      <td>Postgres 自动回滚；ref 未变更，任务未入队</td>
+      <td>Postgres 自动回滚；ref 和任务队列均未变</td>
       <td>调用方收到错误，重试整个 commit</td>
     </tr>
     <tr>
       <td>COMMIT 后崩溃</td>
       <td>ref 已推进，任务已入队，新对象可达</td>
-      <td>无需修复；维护任务将正常被消费</td>
+      <td>无需修复；维护任务由 worker 正常消费</td>
     </tr>
   </tbody>
 </table>
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="job-queue">5 · memory_jobs 队列表 + 同-tx 入队</h2>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="job-queue"><span class="n">5 ·</span> memory_jobs 队列表</h2>
 
-<h3>表结构</h3>
+<p>
+<code>memory_jobs</code> 是一张 Postgres 表，充当 Engram 的维护任务队列——省掉了独立消息中间件。
+</p>
+
+<h3>表结构与关键设计</h3>
+
 <pre><code>-- 000001_init.up.sql
 CREATE TABLE memory_jobs (
   id         bigserial PRIMARY KEY,
   agent_id   text NOT NULL,
-  kind       text NOT NULL,         -- "reindex" | "reflect" | "defrag" | "gc"
-  from_sha   text,                  -- 触发该任务的 commit SHA
+  kind       text NOT NULL,     -- "reindex" | "reflect" | "defrag" | "gc"
+  from_sha   text,              -- 触发该任务的 commit SHA（用于增量处理）
   state      text NOT NULL DEFAULT 'pending',  -- pending | running | failed
   attempts   int  NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -303,61 +485,123 @@ CREATE TABLE memory_jobs (
 CREATE UNIQUE INDEX memory_jobs_pending_uniq
   ON memory_jobs (agent_id, kind) WHERE state = 'pending';
 
--- 000002_claimed_at.up.sql
+-- 000002_claimed_at.up.sql  （第二次迁移）
 ALTER TABLE memory_jobs ADD COLUMN claimed_at timestamptz;</code></pre>
 
+<p>
+三个关键字段：
+</p>
+<ul>
+  <li><strong>partial unique index</strong>（<code>WHERE state = 'pending'</code>）：
+    同一 agent 同一 kind 最多一条待处理行。commit 重试时重复 INSERT 变成幂等空操作。</li>
+  <li><strong><code>attempts</code></strong>：重试计数。<code>RetryJob</code> 在每次失败时递增；
+    达到 <code>maxAttempts</code> 时将 state 置为 <code>'failed'</code>，防止毒药任务循环崩溃 worker。</li>
+  <li><strong><code>claimed_at</code></strong>（第二次迁移加入）：worker 认领时记录时间戳。
+    <code>ReapStaleJobs</code> 以此判断 worker 崩溃——凡 <code>state='running'</code>
+    且 <code>claimed_at &lt; before</code> 的行，说明执行者已消失，安全地归还到队列。</li>
+</ul>
+
 <h3>CommitRef 的入队逻辑</h3>
+
 <p>
 <span class="fileref">refs.go:268–275</span>，在 CAS 成功后的同一事务中：
 </p>
+
 <pre><code>for _, j := range jobs {
     tx.Exec(ctx,
         `INSERT INTO memory_jobs (agent_id, kind, from_sha) VALUES ($1,$2,$3)
          ON CONFLICT DO NOTHING`,
         agentID, j.Kind, next)
 }</code></pre>
+
 <p>
-<code>ON CONFLICT DO NOTHING</code> 与 partial unique index 配合，使重复入队（如 commit 重试）成为幂等空操作。
-典型的 <code>jobs</code> 切片包含 <code>{Kind: "reindex"}</code> 与 <code>{Kind: "reflect"}</code>。
+典型的 <code>jobs</code> 切片含 <code>{Kind:"reindex"}</code> 与 <code>{Kind:"reflect"}</code> 两条。
 </p>
 
+<h3>job 状态机</h3>
+
+<!-- SVG: job state machine -->
+<div class="figure">
+<svg viewBox="0 0 560 220" width="560" height="220" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <defs>
+    <marker id="ja" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#bf5e3c"/>
+    </marker>
+  </defs>
+
+  <!-- states -->
+  <!-- pending -->
+  <rect x="30" y="85" width="100" height="40" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="80" y="110" text-anchor="middle" font-weight="700" fill="#9d4a2d">pending</text>
+
+  <!-- running -->
+  <rect x="220" y="85" width="100" height="40" rx="10" fill="#f8efda" stroke="#e4c97a" stroke-width="1.5"/>
+  <text x="270" y="110" text-anchor="middle" font-weight="700" fill="#a9741f">running</text>
+
+  <!-- done (deleted) -->
+  <rect x="410" y="55" width="115" height="40" rx="10" fill="#eef2e6" stroke="#c8d9b8" stroke-width="1.5"/>
+  <text x="467" y="79" text-anchor="middle" font-weight="700" fill="#5f7a4e">完成（DELETE）</text>
+
+  <!-- failed -->
+  <rect x="410" y="130" width="100" height="40" rx="10" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="460" y="155" text-anchor="middle" font-weight="700" fill="#7c766c">failed</text>
+
+  <!-- INSERT on commit -->
+  <line x1="80" y1="40" x2="80" y2="83" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ja)"/>
+  <text x="15" y="20" font-size="11.5" fill="#9d4a2d">INSERT on commit</text>
+  <text x="15" y="36" font-size="11.5" fill="#9d4a2d">ON CONFLICT DO NOTHING</text>
+
+  <!-- pending → running -->
+  <line x1="130" y1="105" x2="218" y2="105" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ja)"/>
+  <text x="170" y="99" text-anchor="middle" font-size="11" fill="#7c766c">ClaimJob</text>
+  <text x="170" y="115" text-anchor="middle" font-size="10" fill="#7c766c">FOR UPDATE SKIP LOCKED</text>
+
+  <!-- running → done -->
+  <line x1="320" y1="98" x2="408" y2="78" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#ja)"/>
+  <text x="370" y="82" font-size="11" fill="#5f7a4e">CompleteJob</text>
+
+  <!-- running → failed -->
+  <line x1="320" y1="118" x2="408" y2="142" stroke="#a9741f" stroke-width="1.5" marker-end="url(#ja)"/>
+  <text x="352" y="147" font-size="11" fill="#a9741f">RetryJob ≥ max</text>
+
+  <!-- running → pending (retry) -->
+  <path d="M270,85 Q270,30 80,80" fill="none" stroke="#bf5e3c" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#ja)"/>
+  <text x="160" y="48" text-anchor="middle" font-size="11" fill="#9d4a2d">RetryJob &lt; max</text>
+
+  <!-- running → pending (reap) -->
+  <path d="M270,125 Q320,175 130,130" fill="none" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#ja)"/>
+  <text x="230" y="185" text-anchor="middle" font-size="11" fill="#a9741f">ReapStaleJobs（worker 崩溃）</text>
+</svg>
+<p class="figcap">图 3 · memory_jobs 状态机。实线 = 正常路径；虚线 = 重试/reap 路径。</p>
+</div>
+
 <p>
-任务的消费逻辑（<code>ClaimJob</code>、<code>CompleteJob</code>、<code>RetryJob</code>）
-以及 drain 主循环详见<a href="05-maintenance-pipeline.html">⑤ 维护管线</a>。
+任务的消费逻辑（<code>ClaimJob</code>、<code>CompleteJob</code>、<code>RetryJob</code>、<code>ReapStaleJobs</code>）
+及 drain 主循环详见<a href="05-maintenance-pipeline.html">⑤ 维护管线</a>。
 </p>
 
-<h3>状态机</h3>
-<pre class="mermaid">
-stateDiagram-v2
-    [*] --> pending : INSERT on commit
-    pending --> running : ClaimJob FOR UPDATE SKIP LOCKED
-    running --> [*] : CompleteJob DELETE
-    running --> pending : RetryJob attempts 小于 max
-    running --> failed : RetryJob attempts 大于等于 max
-    running --> pending : ReapStaleJobs claimed_at 超时
-</pre>
-
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="advisory-lock">6 · WithGlobalLock：advisory lock</h2>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="advisory-lock"><span class="n">6 ·</span> WithGlobalLock：Postgres advisory lock</h2>
 
 <p>
-部分维护任务（尤其是全局 GC）需要在全集群范围内只有一个 worker 同时执行。
-Engram 通过 Postgres advisory lock 实现这一点，
-无需独立的分布式锁服务。
+部分维护任务（全局 GC、per-agent 单例保证）需要确保同一时刻只有一个 worker 在执行。
+Engram 通过 Postgres session-level advisory lock 实现，无需独立的分布式锁服务。
 </p>
 
 <h3>实现</h3>
+
 <p>
-<span class="fileref">refs.go:84–109</span>：
+<span class="fileref">internal/memstore/refs/refs.go:84–109</span>：
 </p>
+
 <pre><code>func (r *Refs) WithGlobalLock(ctx context.Context, key int64, fn func(context.Context) error) (bool, error) {
-    conn, err := r.pool.Acquire(ctx)   // 从连接池取出一个连接并持有
+    conn, err := r.pool.Acquire(ctx)  // 从连接池取出一个连接并持有
     defer conn.Release()
 
     var got bool
     conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&amp;got)
     if !got {
-        return false, nil              // 锁已被其他 session 持有，跳过
+        return false, nil  // 锁已被其他 session 持有 → 跳过本轮
     }
 
     // 解锁必须用 context.Background()，不能用请求 ctx
@@ -372,191 +616,374 @@ Engram 通过 Postgres advisory lock 实现这一点，
   <span class="tag">坑点（真实 Bug）</span>
   <strong>解锁必须使用 <code>context.Background()</code>，而不是传入的请求 <code>ctx</code>。</strong>
   <br><br>
-  Advisory lock 是 <em>session 级</em>的：它绑定在连接上，而连接在 <code>conn.Release()</code> 后
-  归还连接池，可被下一个请求复用。若解锁语句使用了已取消的请求 ctx，
-  <code>pg_advisory_unlock</code> 将不会执行，锁泄漏到连接池的复用连接上，
-  导致此后所有尝试获取同一 key 的请求永远返回 <code>ran=false</code>——直到该连接被池回收。
-  这是代码审查阶段捕获的真实 Bug。
+  Advisory lock 是 <em>session 级</em>的：它绑定在连接上，连接在 <code>conn.Release()</code> 后
+  归还连接池可被下一个请求复用。若解锁语句使用了已取消的请求 ctx，
+  <code>pg_advisory_unlock</code> 不会执行，锁泄漏在连接上。
+  之后所有用同一 <code>key</code> 的 <code>pg_try_advisory_lock</code> 永远返回 <code>false</code>，
+  直到该连接被连接池回收。这是代码审查阶段捕获的真实 bug，已修复。
 </div>
 
 <p>
-<code>WithGlobalLock</code> 当前被两处调用：
+当前两处调用：
 </p>
 <ul>
-  <li>全局 GC 扫描：保证同一时刻只有一个 worker 在执行 mark-sweep。</li>
-  <li>per-agent 维护（reflection、reindex）也可借助此机制实现 singleton 保证（传入不同的 <code>key</code>）。</li>
+  <li><strong>全局 GC</strong>：保证同一时刻只有一个 worker 在执行 mark-sweep（key 固定）。</li>
+  <li><strong>per-agent 维护</strong>（reflection、reindex）：传入不同的 <code>key</code>，实现 per-agent 单例。</li>
 </ul>
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="gc">7 · GC：可达性 mark-sweep + 龄期宽限</h2>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="gc"><span class="n">7 ·</span> GC：可达性 mark-sweep + 宽限期</h2>
 
 <p>
-GC 是一个纯函数（<span class="fileref">internal/maintenance/gc.go</span>），
-接受 ObjStore、一个预计算的可达集合 <code>map[string]struct{}</code>、宽限期 <code>grace</code>、
-以及当前时间 <code>now</code>，不依赖任何全局状态，因此完全可用 in-memory store 单元测试。
+GC 是一个纯函数（<span class="fileref">internal/maintenance/gc.go</span>），签名：
 </p>
 
-<h3>可达对象计算（ReachableObjects）</h3>
+<pre><code>func GC(ctx context.Context, objs objstore.ObjStore,
+        reachable map[string]struct{}, grace time.Duration, now time.Time) (Stats, error)</code></pre>
+
 <p>
-<span class="fileref">internal/memstore/gitfs/reach.go:18–53</span> 实现从所有 agent HEAD
-出发的迭代式 BFS/DFS 遍历：
+它不查 Postgres、不看 refs——调用方负责预先算好 <code>reachable</code> 集合并传入。
+这个设计让 GC 完全可以用 in-memory ObjStore 单元测试。
 </p>
+
+<h3>第一步：计算可达闭包（ReachableObjects）</h3>
+
+<p>
+<span class="fileref">internal/memstore/gitfs/reach.go:18–53</span> 从所有 agent HEAD
+出发做迭代 DFS，三个去重 map 防止重复遍历：
+</p>
+
 <pre><code>func ReachableObjects(ctx context.Context, objs objstore.ObjStore, heads []string) (map[string]struct{}, error) {
-    // seenCommits 防止重复遍历历史分支中的公共祖先
-    // seenTrees   防止跨 commit 重复展开同一棵子树
+    seenCommits := map[string]struct{}{}
+    seenTrees   := map[string]struct{}{}
     stack := append([]string{}, heads...)
+
     for len(stack) > 0 {
         h := stack[len(stack)-1]; stack = stack[:len(stack)-1]
-        // ... 取出 commit → 加入 reachable
-        // ... 展开 tree (addTree，递归子树，seenTrees 去重)
-        // ... 将 parentHashes 推入 stack (保留完整历史)
+        if _, ok := seenCommits[h]; ok { continue }
+        seenCommits[h] = struct{}{}
+
+        c, err := object.GetCommit(st, plumbing.NewHash(h))
+        if err != nil {
+            return nil, fmt.Errorf("gitfs: reach commit %s: %w", h, err) // 失败 → nil
+        }
+        reachable[h] = struct{}{}
+        addTree(reachable, seenTrees, st, tree)    // 展开整棵 tree
+        for _, p := range c.ParentHashes {
+            stack = append(stack, p.String())       // 保留完整历史
+        }
     }
-    return reachable, nil  // 错误时返回 nil — 调用方 MUST NOT sweep
+    return reachable, nil
 }</code></pre>
 
 <p>
-<code>addTree</code>（<span class="fileref">reach.go:57–77</span>）递归展开 tree 的所有 entries，
-对 <code>filemode.Dir</code> 类型的 entry 继续递归。<code>seenTrees</code> 去重确保多个 commit 共享同一子树时
-只遍历一次，这在大量小文件变更（只有少数 blob 不同）的场景下节省大量遍历开销。
+<code>seenTrees</code> 的作用：多个 commit 共享同一子树（常见于小改动）时，
+子树只被展开一次，大幅减少遍历量。遇到任何错误都返回 <code>nil, err</code>——
+调用方（GC runner）必须检测并中止，绝不能用不完整的 <code>nil</code> map 去 sweep。
 </p>
 
-<h3>sweep 阶段</h3>
+<h3>第二步：sweep（按 key 逐一判定）</h3>
+
 <p>
-<span class="fileref">gc.go:32–68</span>，删除条件为 <strong>不可达 AND 超过宽限期</strong>：
+<span class="fileref">gc.go:32–68</span>，删除条件：<strong>不可达 AND 超过宽限期</strong>：
 </p>
-<pre><code>func GC(..., reachable map[string]struct{}, grace time.Duration, now time.Time) (Stats, error) {
-    // 快照 keys（删除期间不能边遍历边修改）
-    objs.Iter(ctx, func(k string) error { keys = append(keys, k); return nil })
 
-    for _, k := range keys {
-        if _, ok := reachable[k]; ok { s.Kept++; continue }  // 可达，保留
-        mt, err := objs.Stat(ctx, k)
-        if now.Sub(mt) &gt; grace {
-            objs.Delete(ctx, k)   // 不可达 且 超龄 → 删除
-            s.Swept++
-        } else {
-            s.Kept++              // 不可达 但 在宽限期内 → 保留（可能是 in-flight 写入）
+<pre><code>// 先快照 keys，再遍历（删除期间不能边 Iter 边 Delete）
+objs.Iter(ctx, func(k string) error { keys = append(keys, k); return nil })
+
+for _, k := range keys {
+    if _, ok := reachable[k]; ok { s.Kept++; continue }  // 可达 → 跳过
+
+    mt, err := objs.Stat(ctx, k)
+    if errors.Is(err, objstore.ErrNotFound) { continue }  // 并发删除，跳过
+    if err != nil { s.StatErrors++; continue }             // Stat 失败 → 保守保留
+
+    if now.Sub(mt) > grace {
+        if err := objs.Delete(ctx, k); err != nil {
+            s.DelErrors++; continue   // Delete 失败 → 最佳努力，不中止
         }
+        s.Swept++
+    } else {
+        s.Kept++  // 不可达但在宽限期内 → 保留（in-flight 写入保护）
     }
 }</code></pre>
 
 <h3>宽限期的作用</h3>
+
 <p>
-回顾提交的两阶段：对象先写入 ObjStore，然后才在 Postgres 中推进 ref。
-存在一个短暂的时间窗口：对象已存在于 ObjStore，但 ref 尚未更新，
-因此从所有 HEAD 出发的可达性遍历<em>看不到</em>这些新对象。
-若 GC 在此窗口内运行，宽限期（默认 1 小时）确保这些"年轻"对象不会被误删。
+回顾两阶段提交：对象先写 ObjStore，然后才在 Postgres 推进 ref。
+存在短暂时间窗口：对象已在 ObjStore，但 ref 尚未更新，
+因此 <code>ReachableObjects</code>（从所有 HEAD 出发）<em>看不到</em>这些新对象。
+宽限期（默认 1 小时）确保"年轻"对象不会被误删——它们很快就会被 ref 引用到。
 </p>
 
-<h3>GC 流程</h3>
-<pre class="mermaid">
-graph LR
-    A["AllHeads<br/>读取所有 agent HEAD"] --> B["ReachableObjects<br/>遍历所有对象图"]
-    B -->|"遍历失败"| E["中止 GC<br/>不 sweep"]
-    B -->|"遍历成功"| C["Iter ObjStore<br/>快照所有 key"]
-    C --> D{"对每个 key"}
-    D -->|"在 reachable 中"| K["Kept<br/>跳过"]
-    D -->|"不可达"| S{"Stat 获取<br/>对象龄期"}
-    S -->|"龄期 大于 grace"| SW["Delete<br/>Swept"]
-    S -->|"龄期 小于等于 grace"| K2["Kept<br/>in-flight 保护"]
-</pre>
+<h3>GC 流程图</h3>
+
+<!-- SVG: GC flow -->
+<div class="figure">
+<svg viewBox="0 0 640 340" width="640" height="340" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <defs>
+    <marker id="ga" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#bf5e3c"/>
+    </marker>
+    <marker id="ga-r" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#a9741f"/>
+    </marker>
+    <marker id="ga-g" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#5f7a4e"/>
+    </marker>
+  </defs>
+
+  <!-- Step 1: AllHeads -->
+  <rect x="10" y="20" width="140" height="50" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="80" y="42" text-anchor="middle" font-weight="700" fill="#9d4a2d">AllHeads</text>
+  <text x="80" y="60" text-anchor="middle" font-size="11" fill="#7c766c">所有 agent HEAD</text>
+
+  <!-- arrow → ReachableObjects -->
+  <line x1="150" y1="45" x2="188" y2="45" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ga)"/>
+
+  <!-- Step 2: ReachableObjects -->
+  <rect x="190" y="20" width="160" height="50" rx="10" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="270" y="42" text-anchor="middle" font-weight="700" fill="#9d4a2d">ReachableObjects</text>
+  <text x="270" y="60" text-anchor="middle" font-size="11" fill="#7c766c">DFS 遍历对象图</text>
+
+  <!-- error branch -->
+  <line x1="270" y1="70" x2="270" y2="110" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ga-r)"/>
+  <text x="276" y="95" font-size="11" fill="#a9741f">失败</text>
+
+  <rect x="190" y="112" width="160" height="40" rx="10" fill="#f8efda" stroke="#e4c97a" stroke-width="1.5"/>
+  <text x="270" y="129" text-anchor="middle" font-weight="700" fill="#a9741f">中止 GC</text>
+  <text x="270" y="147" text-anchor="middle" font-size="11" fill="#a9741f">绝不 sweep</text>
+
+  <!-- success branch -->
+  <line x1="350" y1="45" x2="388" y2="45" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#ga-g)"/>
+  <text x="363" y="39" font-size="11" fill="#5f7a4e">成功</text>
+
+  <!-- Step 3: Iter ObjStore -->
+  <rect x="390" y="20" width="150" height="50" rx="10" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="465" y="42" text-anchor="middle" font-weight="700" fill="#201e18">Iter ObjStore</text>
+  <text x="465" y="60" text-anchor="middle" font-size="11" fill="#7c766c">快照所有 key</text>
+
+  <!-- arrow down to decision -->
+  <line x1="465" y1="70" x2="465" y2="135" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ga)"/>
+
+  <!-- Decision diamond -->
+  <polygon points="465,140 530,175 465,210 400,175" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="465" y="169" text-anchor="middle" font-size="12" fill="#201e18">对每个 key</text>
+  <text x="465" y="185" text-anchor="middle" font-size="12" fill="#201e18">可达？</text>
+
+  <!-- yes → Kept -->
+  <line x1="400" y1="175" x2="310" y2="175" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#ga-g)"/>
+  <text x="355" y="169" font-size="11" fill="#5f7a4e">是</text>
+  <rect x="200" y="155" width="105" height="40" rx="8" fill="#eef2e6" stroke="#c8d9b8" stroke-width="1.5"/>
+  <text x="252" y="179" text-anchor="middle" font-weight="700" fill="#5f7a4e">Kept</text>
+
+  <!-- no → Stat -->
+  <line x1="465" y1="210" x2="465" y2="250" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ga)"/>
+  <text x="472" y="235" font-size="11" fill="#7c766c">否</text>
+
+  <!-- Stat node -->
+  <rect x="390" y="252" width="150" height="40" rx="10" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="465" y="272" text-anchor="middle" font-weight="700" fill="#201e18">Stat 获取龄期</text>
+  <text x="465" y="288" text-anchor="middle" font-size="11" fill="#7c766c">objstore.Stat(key)</text>
+
+  <!-- age > grace → Delete/Swept -->
+  <line x1="540" y1="272" x2="600" y2="272" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ga)"/>
+  <text x="565" y="266" font-size="11" fill="#9d4a2d">超龄</text>
+  <rect x="575" y="252" width="60" height="40" rx="8" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="1.5"/>
+  <text x="605" y="276" text-anchor="middle" font-weight="700" fill="#9d4a2d">Delete</text>
+
+  <!-- age ≤ grace → Kept (in-flight) -->
+  <line x1="390" y1="272" x2="310" y2="272" stroke="#5f7a4e" stroke-width="1.5" marker-end="url(#ga-g)"/>
+  <text x="345" y="266" font-size="11" fill="#5f7a4e">宽限期内</text>
+  <rect x="200" y="252" width="105" height="40" rx="8" fill="#eef2e6" stroke="#c8d9b8" stroke-width="1.5"/>
+  <text x="252" y="272" text-anchor="middle" font-weight="700" fill="#5f7a4e">Kept</text>
+  <text x="252" y="288" text-anchor="middle" font-size="10" fill="#5f7a4e">in-flight 保护</text>
+</svg>
+<p class="figcap">图 4 · GC 流程。可达集计算失败时直接中止，不进入 sweep；宽限期内的不可达对象保守保留。</p>
+</div>
 
 <div class="callout invariant">
   <span class="tag">不变量</span>
-  <strong>永远不要对部分计算的可达集合执行 sweep。</strong>
-  <code>ReachableObjects</code> 遇到任何错误（包括对象读取失败）都返回 <code>nil, err</code>，
-  调用方（GC runner）检测到非 nil error 后必须中止，不得调用 <code>GC()</code>。
-  这防止了因遍历中断导致的"误判为垃圾"而删除存活对象的灾难性错误。
+  <strong>永远不要对不完整的可达集合执行 sweep。</strong>
+  <code>ReachableObjects</code> 遇到任何错误都返回 <code>nil, err</code>。
+  GC runner 检测到 err 非 nil 时必须中止，不得调用 <code>GC()</code>。
+  这防止了"遍历中断→误判为垃圾→删除存活对象"的灾难。
 </div>
 
 <div class="callout win">
-  <span class="tag">设计说明</span>
-  <strong>GC 只作用于 git 对象存储，从不触及 embedding 存储。</strong>
-  搜索索引（L4）有独立的生命周期管理（详见<a href="04-search-index.html">④ 搜索与索引</a>）。
-  两者解耦，避免了跨存储的可达性判断复杂度。
+  <span class="tag">边界</span>
+  <strong>GC 只作用于 git 对象存储，从不触及搜索索引（embedding 存储）。</strong>
+  搜索索引有独立的生命周期管理（详见<a href="04-search-index.html">④ 搜索与索引</a>）。
+  两者解耦，避免跨存储的可达性判断复杂度。
 </div>
 
 <h3>Stats 结构</h3>
+
 <pre><code>type Stats struct {
-    Scanned    int
-    Swept      int
-    Kept       int      // 可达 或 在宽限期内
-    StatErrors int      // Stat 失败 → 保守保留
-    DelErrors  int      // Delete 失败 → 最佳努力保留
+    Scanned    int  // Iter 快照的 key 总数
+    Swept      int  // 成功删除的不可达超龄对象数
+    Kept       int  // 可达 或 宽限期内（保守保留）
+    StatErrors int  // Stat 失败 → 保守保留，不计入 Kept
+    DelErrors  int  // Delete 失败 → 最佳努力保留，不中止整个 GC
 }</code></pre>
+
 <p>
-单个对象的 Delete 失败不会中止整个 GC（best-effort），但会记入 <code>DelErrors</code>
-供 worker 日志/告警使用。GC 仅在 <code>Iter</code> 失败时才返回顶层 error。
+单个对象的 <code>Delete</code> 失败不会中止整个 GC（best-effort），记入 <code>DelErrors</code>
+供 worker 日志/告警。GC 仅在 <code>Iter</code> 本身失败时返回顶层 error。
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="migrations">8 · 迁移：golang-migrate + embed</h2>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="migrations"><span class="n">8 ·</span> 迁移：expand-contract + 编译期内嵌</h2>
 
 <p>
 数据库 schema 通过 <a href="https://github.com/golang-migrate/migrate">golang-migrate</a>
-管理，迁移文件内嵌进二进制（<span class="fileref">refs/migrate.go:14</span>）：
+管理，迁移文件以 <code>//go:embed</code> 内嵌进二进制
+（<span class="fileref">refs/migrate.go:14</span>）：
 </p>
+
 <pre><code>//go:embed all:migrations
 var migrationsFS embed.FS</code></pre>
 
 <p>
 <code>Migrate(dsn string)</code> 幂等——多次调用安全，生产启动时可直接调用。
-expand-contract 原则确保每一步迁移都是向前兼容的（先加新列/索引，再删旧结构）。
+expand-contract 原则确保每步迁移向前兼容（先加新列/索引，再删旧结构）。
 </p>
 
 <table>
-  <thead><tr><th>迁移版本</th><th>变更内容</th><th>文件</th></tr></thead>
+  <thead><tr><th>版本</th><th>变更内容</th><th>文件</th></tr></thead>
   <tbody>
     <tr>
       <td>000001_init</td>
-      <td>创建 <code>agent_refs</code>、<code>memory_jobs</code>（含 partial unique index）、
-          <code>maintenance_cursor</code></td>
+      <td>创建 <code>agent_refs</code>（HEAD 指针）、<code>memory_jobs</code>
+          （含 partial unique index <code>memory_jobs_pending_uniq</code>）、
+          <code>maintenance_cursor</code>（维护进度游标）</td>
       <td><span class="fileref">migrations/000001_init.up.sql</span></td>
     </tr>
     <tr>
       <td>000002_claimed_at</td>
-      <td>向 <code>memory_jobs</code> 添加 <code>claimed_at timestamptz</code>，
-          支持 <code>ReapStaleJobs</code> 的超时判断</td>
+      <td>向 <code>memory_jobs</code> 添加 <code>claimed_at timestamptz</code>——
+          worker 认领时间戳，供 <code>ReapStaleJobs</code>（<span class="fileref">refs.go:181–193</span>）
+          判断是否超时并归还任务</td>
       <td><span class="fileref">migrations/000002_claimed_at.up.sql</span></td>
     </tr>
   </tbody>
 </table>
 
-<p>
-<code>claimed_at</code> 字段是 <code>ReapStaleJobs</code>（<span class="fileref">refs.go:181–193</span>）
-的依据：凡 <code>state='running'</code> 且 <code>claimed_at &lt; before</code>（或 IS NULL）的行，
-说明其 worker 已经崩溃，安全地将其 attempts 加一、state 归 pending（或 failed），以便重新消费。
-</p>
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2 id="summary"><span class="n">·</span> 层间关系总览</h2>
 
-<!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="summary">层间关系总结</h2>
+<!-- SVG: component relationship -->
+<div class="figure">
+<svg viewBox="0 0 640 320" width="640" height="320" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+  <defs>
+    <marker id="ca" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5z" fill="#bf5e3c"/>
+    </marker>
+  </defs>
 
-<pre class="mermaid">
-graph TD
-    MS["MemStore<br/>memstore.go"] --> OBJ["ObjStore interface<br/>objstore.go"]
-    MS --> REFS["Refs<br/>refs.go"]
-    MS --> GFS["gitfs<br/>repo.go + storage.go"]
-    GFS --> OBJ
-    OBJ --> LOCAL["Local backend<br/>local.go"]
-    REFS --> PG["Postgres<br/>agent_refs + memory_jobs"]
-    GC_pkg["GC<br/>maintenance/gc.go"] --> OBJ
-    GC_pkg --> REACH["ReachableObjects<br/>reach.go"]
-    REACH --> GFS
-    REFS --> LOCK["WithGlobalLock<br/>pg_try_advisory_lock"]
-</pre>
+  <!-- MemStore -->
+  <rect x="240" y="20" width="160" height="50" rx="12" fill="#f4e6dd" stroke="#e7c9ba" stroke-width="2"/>
+  <text x="320" y="42" text-anchor="middle" font-weight="700" fill="#9d4a2d">MemStore</text>
+  <text x="320" y="60" text-anchor="middle" font-size="11" fill="#7c766c">memstore.go</text>
+
+  <!-- ObjStore interface -->
+  <rect x="80" y="130" width="140" height="50" rx="12" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="150" y="152" text-anchor="middle" font-weight="700" fill="#201e18">ObjStore</text>
+  <text x="150" y="169" text-anchor="middle" font-size="11" fill="#7c766c">interface (objstore.go)</text>
+
+  <!-- Refs -->
+  <rect x="420" y="130" width="120" height="50" rx="12" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="480" y="152" text-anchor="middle" font-weight="700" fill="#201e18">Refs</text>
+  <text x="480" y="169" text-anchor="middle" font-size="11" fill="#7c766c">refs.go</text>
+
+  <!-- gitfs -->
+  <rect x="240" y="130" width="140" height="50" rx="12" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="310" y="152" text-anchor="middle" font-weight="700" fill="#201e18">gitfs</text>
+  <text x="310" y="169" text-anchor="middle" font-size="11" fill="#7c766c">storage.go + repo.go</text>
+
+  <!-- Local backend -->
+  <rect x="10" y="240" width="130" height="50" rx="12" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="75" y="262" text-anchor="middle" font-weight="700" fill="#201e18">Local</text>
+  <text x="75" y="279" text-anchor="middle" font-size="11" fill="#7c766c">local.go</text>
+
+  <!-- Postgres -->
+  <rect x="420" y="240" width="140" height="50" rx="12" fill="#eef2e6" stroke="#c8d9b8" stroke-width="1.5"/>
+  <text x="490" y="262" text-anchor="middle" font-weight="700" fill="#5f7a4e">Postgres</text>
+  <text x="490" y="279" text-anchor="middle" font-size="11" fill="#7c766c">agent_refs + memory_jobs</text>
+
+  <!-- GC -->
+  <rect x="150" y="240" width="130" height="50" rx="12" fill="#f8efda" stroke="#e4c97a" stroke-width="1.5"/>
+  <text x="215" y="262" text-anchor="middle" font-weight="700" fill="#a9741f">GC</text>
+  <text x="215" y="279" text-anchor="middle" font-size="11" fill="#7c766c">maintenance/gc.go</text>
+
+  <!-- reach.go -->
+  <rect x="290" y="240" width="120" height="50" rx="12" fill="#faf8f3" stroke="#ddd5c5" stroke-width="1.5"/>
+  <text x="350" y="262" text-anchor="middle" font-weight="700" fill="#201e18">ReachableObjects</text>
+  <text x="350" y="279" text-anchor="middle" font-size="11" fill="#7c766c">reach.go</text>
+
+  <!-- advisory lock note -->
+  <rect x="540" y="145" width="95" height="40" rx="8" fill="#f8efda" stroke="#e4c97a" stroke-width="1"/>
+  <text x="587" y="161" text-anchor="middle" font-size="11" fill="#a9741f">WithGlobalLock</text>
+  <text x="587" y="178" text-anchor="middle" font-size="10" fill="#7c766c">pg_try_advisory_lock</text>
+  <line x1="540" y1="163" x2="482" y2="163" stroke="#a9741f" stroke-width="1" stroke-dasharray="3,2"/>
+
+  <!-- arrows -->
+  <line x1="280" y1="70" x2="200" y2="128" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="320" y1="70" x2="310" y2="128" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="360" y1="70" x2="440" y2="128" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="310" y1="180" x2="190" y2="238" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="150" y1="180" x2="105" y2="238" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="480" y1="180" x2="490" y2="238" stroke="#bf5e3c" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="215" y1="240" x2="190" y2="190" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ca)"/>
+  <line x1="280" y1="265" x2="220" y2="237" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ca)"/>
+  <line x1="350" y1="240" x2="340" y2="182" stroke="#a9741f" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ca)"/>
+</svg>
+<p class="figcap">图 5 · 组件依赖关系。橙实线 = 调用关系；橙虚线 = GC/reach 对 gitfs/ObjStore 的使用。</p>
+</div>
 
 <table>
-  <thead><tr><th>组件</th><th>可变性</th><th>来源</th><th>作用</th></tr></thead>
+  <thead><tr><th>组件</th><th>可变性</th><th>权威来源</th><th>作用</th></tr></thead>
   <tbody>
-    <tr><td>ObjStore 对象</td><td>不可变</td><td>content hash</td><td>持久化 blob/tree/commit</td></tr>
-    <tr><td>agent_refs.head</td><td>唯一可变指针</td><td>Postgres CAS</td><td>定义当前内存版本</td></tr>
-    <tr><td>memory_jobs 行</td><td>状态转换</td><td>Postgres</td><td>驱动维护任务</td></tr>
-    <tr><td>gitfs Storage</td><td>per-session 临时</td><td>in-memory</td><td>go-git 工作时使用</td></tr>
-    <tr><td>GC reachable set</td><td>derived / 可重计算</td><td>从 AllHeads 推导</td><td>决定哪些对象可删除</td></tr>
+    <tr>
+      <td>ObjStore 对象</td>
+      <td>不可变（append-only）</td>
+      <td>content hash</td>
+      <td>持久化 blob / tree / commit</td>
+    </tr>
+    <tr>
+      <td><code>agent_refs.head</code></td>
+      <td>唯一可变指针</td>
+      <td>Postgres CAS</td>
+      <td>定义当前内存版本</td>
+    </tr>
+    <tr>
+      <td><code>memory_jobs</code> 行</td>
+      <td>状态转换（pending→running→done/failed）</td>
+      <td>Postgres</td>
+      <td>驱动维护任务</td>
+    </tr>
+    <tr>
+      <td>gitfs Storage</td>
+      <td>per-session 临时</td>
+      <td>in-memory + ObjStore</td>
+      <td>go-git 工作时的对象读写层</td>
+    </tr>
+    <tr>
+      <td>GC reachable set</td>
+      <td>每次 GC 新算，可重计算</td>
+      <td>从 AllHeads 推导</td>
+      <td>mark 阶段的判定集合</td>
+    </tr>
+    <tr>
+      <td>advisory lock</td>
+      <td>session 级，conn 持有期间有效</td>
+      <td>Postgres session</td>
+      <td>GC / per-agent 单例保证</td>
+    </tr>
   </tbody>
 </table>
 
 </main>
-<footer>Engram 深入解析报告 · 基于 main 分支 L1–L5d · 生成于 2026-06</footer>
-</body>
-</html>
+<footer>Engram 深入解析 · 手工 SVG/HTML 图表，离线可读 · 基于 main 分支 L1–L5d</footer>
+</body></html>
